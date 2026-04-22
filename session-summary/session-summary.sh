@@ -33,7 +33,14 @@ if [[ "${1:-}" == "rotate" ]]; then
         FIRST_DATE=$(date -d "7 days ago" +%Y-%m-%d)
         LAST_DATE=$(date -d "yesterday" +%Y-%m-%d)
         ARCHIVE_NAME="summary-${FIRST_DATE}_${LAST_DATE}.md"
-        mv "$SUMMARY_FILE" "${ARCHIVE_DIR}/${ARCHIVE_NAME}"
+        TARGET="${ARCHIVE_DIR}/${ARCHIVE_NAME}"
+        # 동명 아카이브가 이미 있으면 타임스탬프 suffix로 충돌 회피 (데이터 손실 방지)
+        if [[ -e "$TARGET" ]]; then
+            ARCHIVE_NAME="summary-${FIRST_DATE}_${LAST_DATE}-$(date +%H%M%S).md"
+            TARGET="${ARCHIVE_DIR}/${ARCHIVE_NAME}"
+            echo "[$DATE] 주의: 동명 아카이브 존재, 새 이름 사용: ${ARCHIVE_NAME}" >> "$LOGFILE"
+        fi
+        mv "$SUMMARY_FILE" "$TARGET"
         echo "[$DATE] 아카이브 완료: ${ARCHIVE_NAME}" >> "$LOGFILE"
     else
         echo "[$DATE] 로테이트 대상 없음 (파일 비어있거나 없음)" >> "$LOGFILE"
