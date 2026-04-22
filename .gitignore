@@ -1,0 +1,18 @@
+# 로그 (모듈별 logs/ 디렉터리)
+**/logs/
+
+# 이메일 브리핑 출력물 (18MB, 재생성 가능)
+email-briefing/output/
+
+# 세션 요약 아카이브의 휴지통
+session-summary/archive/.trash/
+
+# 일반
+*.tmp
+*.swp
+.DS_Store
+
+# 도구 상태 잔재 (아카이브에 섞여 들어오면 안 됨)
+**/.omc/
+**/.bkit/
+**/.claude/
