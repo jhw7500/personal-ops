@@ -4,7 +4,8 @@
 # 이메일 브리핑 출력물 (18MB, 재생성 가능)
 email-briefing/output/
 
-# 세션 요약 아카이브의 휴지통
+# 세션 요약 아카이브 (자동 생성 산출물 — git 미추적)
+session-summary/archive/*.md
 session-summary/archive/.trash/
 
 # 일반
