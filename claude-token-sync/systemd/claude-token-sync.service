@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude OAuth Token → GitHub Secrets Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-token-sync.sh
+Restart=on-failure
+RestartSec=30
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin:%h/go/bin
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Claude OAuth Token Sync - Healthcheck Backstop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-token-sync-health.sh
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin:%h/go/bin
