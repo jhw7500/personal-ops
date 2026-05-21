@@ -7,7 +7,7 @@
 | 모듈 | 목적 | 실행 방식 |
 |------|------|-----------|
 | [`cli-init/`](./cli-init/) | Claude/Codex CLI 워밍업 (5시간 세션 창 트리거) | crontab (매일 06/11/16시) |
-| [`session-summary/`](./session-summary/) | Claude 세션 요약 자동화 | crontab (평일 00:10, 수요일 00:05 로테이트) |
+| [`session-summary/`](./session-summary/) | Claude 세션 요약 자동화 (Claude Code + opencode) | crontab (매일 00:10, 수요일 00:05 로테이트) |
 | [`email-briefing/`](./email-briefing/) | 이메일 브리핑 + 회의 준비 자료 | 수동 실행 |
 
 ## 크론 엔트리 (현재 등록)
@@ -23,8 +23,8 @@ TZ=Asia/Seoul
 0 11 * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/codex-init.sh
 0 16 * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/codex-init.sh
 
-# 세션 요약 (평일 요약, 수 로테이트)
-10 0 * * 1-5 /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh
+# 세션 요약 (매일 요약, 수 로테이트)
+10 0 * * *   /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh
 05 0 * * 3   /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh rotate
 ```
 
