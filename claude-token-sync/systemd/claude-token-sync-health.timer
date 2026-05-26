@@ -2,8 +2,10 @@
 Description=Claude OAuth Token Sync Healthcheck Timer (10min)
 
 [Timer]
+# OnCalendar는 timer 자체 시각만 보고 발화 — restart/enable로 트리거 베이스가
+# 사라지는 OnUnitActiveSec/OnBootSec 단독 조합의 NEXT=n/a 함정을 피한다.
+OnCalendar=*:0/10
 OnBootSec=2min
-OnUnitActiveSec=10min
 Persistent=true
 
 [Install]

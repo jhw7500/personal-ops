@@ -61,15 +61,23 @@ sync_repos() {
     log "[SYNC] completed (${#REPOS[@]} repos, $fail failures)"
 }
 
+# Claude Code가 credentials를 atomic rename(tempfile→rename)으로 갱신하면 inode가
+# 바뀌어 단일 파일 watch가 끊긴다(2026-05 무음 정지 사례). 디렉터리를 watch하고
+# .credentials.json 이벤트만 필터해서 atomic rename도 잡는다.
+CRED_DIR_WATCH="$(dirname "$CRED_FILE")"
+CRED_NAME="$(basename "$CRED_FILE")"
+
 while true; do
-    # inotifywait가 실패하면 (파일 삭제 등) polling fallback
-    if ! inotifywait -qq -e modify -t 300 "$CRED_FILE" 2>/dev/null; then
-        # 타임아웃 또는 에러 — 파일 존재 확인 후 재시도
-        if [ ! -f "$CRED_FILE" ]; then
-            log "[WARN] $CRED_FILE disappeared, waiting..."
-            while [ ! -f "$CRED_FILE" ]; do sleep "$WAIT_INTERVAL"; done
-            log "[RECOVERED] $CRED_FILE found again"
-        fi
+    # close_write: 일반 write, moved_to: atomic rename으로 들어옴, create: 새로 생성.
+    # -t 600: 타임아웃이어도 다음 루프에서 토큰 sha 비교로 변경 판정(놓친 케이스 안전망).
+    inotifywait -qq --include "^${CRED_NAME}$" \
+        -e close_write,moved_to,create -t 600 \
+        "$CRED_DIR_WATCH" 2>/dev/null || true
+
+    if [ ! -f "$CRED_FILE" ]; then
+        log "[WARN] $CRED_FILE disappeared, waiting..."
+        while [ ! -f "$CRED_FILE" ]; do sleep "$WAIT_INTERVAL"; done
+        log "[RECOVERED] $CRED_FILE found again"
         continue
     fi
 
