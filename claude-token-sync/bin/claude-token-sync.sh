@@ -1,7 +1,7 @@
 #!/bin/bash
 # Claude OAuth accessToken → GitHub 레포 시크릿 자동 동기화 데몬
 # credentials 파일이 없으면 60초 간격으로 대기 후 재시도
-# 파일 존재 시 inotifywait로 변경 감지하여 즉시 동기화
+# 파일 존재 시 30초마다 stat 폴링으로 토큰 변경 감지 (inotify는 신뢰 불가)
 
 # Fine-grained PAT 대신 gh auth hosts.yml 토큰(repo/workflow scope) 사용
 unset GITHUB_TOKEN
@@ -61,18 +61,14 @@ sync_repos() {
     log "[SYNC] completed (${#REPOS[@]} repos, $fail failures)"
 }
 
-# Claude Code가 credentials를 atomic rename(tempfile→rename)으로 갱신하면 inode가
-# 바뀌어 단일 파일 watch가 끊긴다(2026-05 무음 정지 사례). 디렉터리를 watch하고
-# .credentials.json 이벤트만 필터해서 atomic rename도 잡는다.
-CRED_DIR_WATCH="$(dirname "$CRED_FILE")"
-CRED_NAME="$(basename "$CRED_FILE")"
+# Claude Code의 credentials atomic rename이 inotify 이벤트로 안정적으로 도착하지
+# 않아(2026-05 측정: --include + create/close_write/moved_to/modify 다 걸어도 0건),
+# stat 폴링으로 단순화. inode/mtime 변화는 항상 잡힌다.
+# 30초 폴링 → 헬스(10분 백스톱) 대비 20배 빠르고 즉시성도 충분.
+POLL_INTERVAL=30
 
 while true; do
-    # close_write: 일반 write, moved_to: atomic rename으로 들어옴, create: 새로 생성.
-    # -t 600: 타임아웃이어도 다음 루프에서 토큰 sha 비교로 변경 판정(놓친 케이스 안전망).
-    inotifywait -qq --include "^${CRED_NAME}$" \
-        -e close_write,moved_to,create -t 600 \
-        "$CRED_DIR_WATCH" 2>/dev/null || true
+    sleep "$POLL_INTERVAL"
 
     if [ ! -f "$CRED_FILE" ]; then
         log "[WARN] $CRED_FILE disappeared, waiting..."
@@ -81,7 +77,6 @@ while true; do
         continue
     fi
 
-    sleep 0.5
     CUR_TOKEN=$(jq -r '.claudeAiOauth.accessToken // empty' "$CRED_FILE" 2>/dev/null) || continue
     if [ -n "$CUR_TOKEN" ] && [ "$CUR_TOKEN" != "$PREV_TOKEN" ]; then
         EXPIRES=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CRED_FILE" 2>/dev/null)

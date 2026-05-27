@@ -9,7 +9,7 @@ Claude Code가 토큰을 갱신(만료 ~4.5분 전 자동)하면, 그 새 토큰
 
 | 경로 | 역할 |
 |---|---|
-| `bin/claude-token-sync.sh` | **데몬**. `~/.claude/.credentials.json`을 `inotifywait`로 감시, 토큰 변경 시 즉시 동기화 (빠른 경로) |
+| `bin/claude-token-sync.sh` | **데몬**. `~/.claude/.credentials.json`을 30초 주기로 stat 폴링, 토큰 변경 시 즉시 동기화 (빠른 경로) |
 | `bin/claude-token-sync-health.sh` | **헬스체크 백스톱**. 10분 주기로 ①데몬 생존 확인→죽었으면 재시작 ②토큰이 마지막 동기화분과 다르면 강제 동기화 |
 | `systemd/claude-token-sync.service` | 데몬 user 서비스 (`Restart=on-failure`) |
 | `systemd/claude-token-sync-health.service` | 헬스체크 oneshot 서비스 |
@@ -61,8 +61,11 @@ tail -f ~/.claude/token_sync.log                          # 로그
 
 ## 이중화 설계 메모
 
-- **데몬(inotify)** = 빠른 경로지만, credentials가 atomic rename으로 교체되면 inotify watch가
-  끊겨 변경을 못 잡는 무음 정지가 발생할 수 있다(2026-05 실제 발생).
-- **헬스체크(타이머)** = 프로세스 생존 + 토큰 sha 비교를 외부에서 직접 수행하는 백스톱.
-  데몬이 살아있어도 동기화를 못 하는 실패 모드를 잡는다. (systemd `WatchdogSec`는 프로세스가
-  살아 ping을 보내면 이 케이스를 못 잡으므로 타이머 방식 채택.)
+- **데몬(stat 폴링 30초)** = 빠른 경로. credentials를 30초마다 `stat`로 inode/mtime을
+  비교해 토큰 변경 시 즉시 동기화. 초기 설계는 `inotifywait`였으나 Claude Code의
+  credentials 갱신이 inotify 이벤트로 안정적으로 도착하지 않음을 측정(2026-05:
+  `--include` 필터 + `create/close_write/moved_to/modify` 다 걸어도 0건 캡처,
+  그러나 stat는 inode 변화 100% 포착). 그래서 폴링으로 전환.
+- **헬스체크(타이머 10분)** = 프로세스 생존 + 토큰 sha 비교 백스톱. 데몬이 죽거나
+  sync에 부분 실패한 경우를 잡는다. (systemd `WatchdogSec`는 프로세스가 살아 ping을
+  보내면 이 케이스를 못 잡으므로 타이머 방식 채택.)
