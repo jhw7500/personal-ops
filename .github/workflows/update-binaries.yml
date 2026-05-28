@@ -1,0 +1,87 @@
+name: Update Binaries
+
+on:
+  repository_dispatch:
+    types: [binary-update]
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Source repo name (max9296, gstApp, sc16is7xx)'
+        required: true
+        type: choice
+        options:
+          - max9296
+          - gstApp
+          - sc16is7xx
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    name: Update Binary from Source
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine source
+        id: source
+        run: |
+          SOURCE="${{ github.event.client_payload.source || inputs.source }}"
+          TAG="${{ github.event.client_payload.tag || 'latest' }}"
+          echo "name=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          case "$SOURCE" in
+            max9296|sc16is7xx)
+              echo "pattern=*.ko" >> "$GITHUB_OUTPUT"
+              echo "dest=dist/modules/" >> "$GITHUB_OUTPUT"
+              ;;
+            gstApp)
+              echo "pattern=gstApp*" >> "$GITHUB_OUTPUT"
+              echo "dest=dist/bin/" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unknown source: $SOURCE"
+              exit 1
+              ;;
+          esac
+
+      - name: Download binary
+        env:
+          GH_TOKEN: ${{ secrets.PIM_PACKAGE_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          SOURCE="${{ steps.source.outputs.name }}"
+          PATTERN="${{ steps.source.outputs.pattern }}"
+          DEST="${{ steps.source.outputs.dest }}"
+          TAG="${{ steps.source.outputs.tag }}"
+
+          mkdir -p "$DEST"
+
+          if [ "$TAG" = "latest" ]; then
+            gh release download --repo "jhw7500/$SOURCE" -p "$PATTERN" -D "$DEST" --clobber
+          else
+            gh release download "$TAG" --repo "jhw7500/$SOURCE" -p "$PATTERN" -D "$DEST" --clobber
+          fi
+
+          echo "Downloaded $PATTERN from jhw7500/$SOURCE ($TAG) to $DEST"
+          ls -la "$DEST"
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.PIM_PACKAGE_PAT || github.token }}
+          title: 'chore: ${{ steps.source.outputs.name }} 바이너리 업데이트 (${{ steps.source.outputs.tag }})'
+          body: |
+            소스: `jhw7500/${{ steps.source.outputs.name }}`
+            태그: `${{ steps.source.outputs.tag }}`
+            대상: `${{ steps.source.outputs.dest }}`
+
+            자동 생성된 PR입니다.
+          branch: 'auto/binary-update-${{ steps.source.outputs.name }}'
+          commit-message: 'chore: ${{ steps.source.outputs.name }} 바이너리 업데이트 (${{ steps.source.outputs.tag }})'
+          delete-branch: true

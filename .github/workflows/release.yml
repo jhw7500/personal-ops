@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get tag name
+        id: tag
+        run: echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create archive
+        run: |
+          set -euo pipefail
+          tar czf "pim-package-${{ steps.tag.outputs.name }}.tar.gz" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='docs' \
+            --exclude='test' \
+            --exclude='tmp' \
+            --exclude='docker' \
+            dist/ build.sh ord/ vcm/ vsd/ patch/ upgrade_file/ tools/ release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pim-package-*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+
+      - name: Summary
+        run: |
+          echo "## Release ${{ steps.tag.outputs.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Package: pim-package-${{ steps.tag.outputs.name }}.tar.gz" >> $GITHUB_STEP_SUMMARY
+          ls -lh pim-package-*.tar.gz >> $GITHUB_STEP_SUMMARY
