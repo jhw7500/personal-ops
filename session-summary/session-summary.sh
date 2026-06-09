@@ -10,6 +10,7 @@
 #   - 기본: 어제 1일치 세션을 episodic-memory + opencode SQLite에서 검색 → 요약을 logs/session-summary.md에 누적
 #   - 빈 결과: 헤더만 기록 (작업 없음 표시)
 #   - rotate: logs/session-summary.md를 archive/로 이동 후 새 파일 시작
+#   - REMOTE_HOSTS가 있으면 SSH로 원격 ~/.claude/projects/ + opencode.db를 rsync해 합쳐 요약
 
 set -euo pipefail
 
@@ -31,8 +32,15 @@ INCLUDE_CC="${INCLUDE_CC:-1}"
 CC_PROJECTS_DIR="/home/jhw/.claude/projects"
 
 # git 커밋 컨텍스트 포함 여부 (1=포함, 0=제외)
-# 세션에서 발견된 cwd들에서 해당 기간 커밋 추출
+# 세션에서 발견된 cwd들에서 해당 기간 커밋 추출 (로컬 경로만 — 원격은 [host] 라벨이라 자동 제외)
 INCLUDE_COMMITS="${INCLUDE_COMMITS:-1}"
+
+# 원격 호스트 (Tailscale MagicDNS 등) — 공백 구분
+# 각 호스트의 ~/.claude/projects/ 와 opencode.db를 rsync로 가져와 합쳐 요약
+# 비어있으면 로컬만 사용 (기존 동작과 동일)
+REMOTE_HOSTS="${REMOTE_HOSTS:-hwjo-1}"
+REMOTE_USER="${REMOTE_USER:-jhw}"
+STAGING_DIR="${MODULE_DIR}/staging"
 
 export PATH="/home/jhw/.nvm/versions/node/$(ls /home/jhw/.nvm/versions/node/ 2>/dev/null | tail -1)/bin:/home/jhw/.local/bin:/usr/bin:/bin"
 export HOME="/home/jhw"
@@ -70,16 +78,59 @@ SEARCH_FROM="$YESTERDAY"
 
 echo "[$DATE] ===== 세션 요약 시작: $(date) =====" >> "$LOGFILE"
 
-# --- opencode 세션 추출 (INCLUDE_OPENCODE=1일 때만) ---
+# --- 원격 호스트 동기화 (REMOTE_HOSTS가 비어있지 않으면) ---
+# 각 호스트의 ~/.claude/projects/ 와 opencode.db를 staging/{host}/ 로 rsync.
+# 실패 시 해당 호스트는 스킵하고 로컬 또는 다른 원격만으로 진행.
+ACTIVE_REMOTES=""
+if [[ -n "$REMOTE_HOSTS" ]]; then
+    mkdir -p "$STAGING_DIR"
+    for host in $REMOTE_HOSTS; do
+        HOST_STG="${STAGING_DIR}/${host}"
+        mkdir -p "${HOST_STG}/projects"
+        set +e
+        rsync -az --timeout=30 --partial \
+            -e "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new" \
+            "${REMOTE_USER}@${host}:.claude/projects/" \
+            "${HOST_STG}/projects/" 2>>"$LOGFILE"
+        RSYNC_PROJ=$?
+        rsync -az --timeout=30 --partial \
+            -e "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new" \
+            "${REMOTE_USER}@${host}:.local/share/opencode/opencode.db" \
+            "${HOST_STG}/opencode.db" 2>>"$LOGFILE"
+        RSYNC_DB=$?
+        set -e
+        if [[ $RSYNC_PROJ -eq 0 || $RSYNC_DB -eq 0 ]]; then
+            ACTIVE_REMOTES+="${host} "
+            echo "[$DATE] 원격 동기화 OK: ${host} (projects=${RSYNC_PROJ}, db=${RSYNC_DB})" >> "$LOGFILE"
+        else
+            echo "[$DATE] 원격 동기화 실패: ${host} (projects=${RSYNC_PROJ}, db=${RSYNC_DB}) - 스킵" >> "$LOGFILE"
+        fi
+    done
+fi
+
+# Python 추출기에 주입할 추가 소스 리터럴 빌드 (호스트별 라벨 부여)
+EXTRA_OC_SOURCES_PY=""
+EXTRA_CC_SOURCES_PY=""
+for h in $ACTIVE_REMOTES; do
+    OC="${STAGING_DIR}/${h}/opencode.db"
+    CC="${STAGING_DIR}/${h}/projects"
+    [[ -f "$OC" ]] && EXTRA_OC_SOURCES_PY+="    (\"${h}\", \"${OC}\"),"$'\n'
+    [[ -d "$CC" ]] && EXTRA_CC_SOURCES_PY+="    (\"${h}\", \"${CC}\"),"$'\n'
+done
+
+# --- opencode 세션 추출 (로컬 + 원격 staging 모두) ---
 # Python 표준 sqlite3로 DB 파일을 read-only 직접 읽음 (opencode 바이너리 미실행)
 OPENCODE_CONTEXT=""
-if [[ "$INCLUDE_OPENCODE" == "1" ]] && [[ -r "$OPENCODE_DB" ]]; then
+if [[ "$INCLUDE_OPENCODE" == "1" ]]; then
     SEARCH_FROM_MS="$(date -d "$SEARCH_FROM 00:00:00" +%s)000"
     SEARCH_TO_MS="$(date -d "today 00:00:00" +%s)000"
 
     OPENCODE_RAW=$(python3 - <<PYEOF 2>>"$LOGFILE" || true
-import sqlite3
-db = sqlite3.connect("file:${OPENCODE_DB}?mode=ro", uri=True)
+import sqlite3, os, sys
+SOURCES = [
+    ("", "${OPENCODE_DB}"),
+${EXTRA_OC_SOURCES_PY}]
+SOURCES = [(lbl, p) for (lbl, p) in SOURCES if os.path.exists(p) and os.access(p, os.R_OK)]
 sql = """
 SELECT
     datetime(s.time_updated/1000,'unixepoch','localtime') AS upd,
@@ -97,10 +148,19 @@ FROM session s
 WHERE s.time_updated >= ? AND s.time_updated < ?
 ORDER BY s.time_updated DESC
 """
-rows = db.execute(sql, (${SEARCH_FROM_MS}, ${SEARCH_TO_MS})).fetchall()
 print("upd\tdirectory\ttitle\tfirst_msg")
-for r in rows:
-    print("\t".join((c or "") for c in r))
+for label, path in SOURCES:
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        rows = db.execute(sql, (${SEARCH_FROM_MS}, ${SEARCH_TO_MS})).fetchall()
+    except Exception as e:
+        print(f"# opencode skip {path}: {e}", file=sys.stderr)
+        continue
+    prefix = f"[{label}] " if label else ""
+    for r in rows:
+        cells = [(c or "") for c in r]
+        cells[1] = (prefix + cells[1]) if cells[1] else prefix.rstrip()
+        print("\t".join(cells))
 PYEOF
 )
 
@@ -111,19 +171,20 @@ PYEOF
     else
         echo "[$DATE] opencode 세션 없음 (기간: $SEARCH_FROM ~ $DATE)" >> "$LOGFILE"
     fi
-elif [[ "$INCLUDE_OPENCODE" == "1" ]]; then
-    echo "[$DATE] opencode 통합 활성이지만 DB 없음: $OPENCODE_DB" >> "$LOGFILE"
 fi
 
-# --- Claude Code 세션 추출 (INCLUDE_CC=1일 때만) ---
-# ~/.claude/projects/*/*.jsonl을 시간 기반으로 직접 스캔 (opencode와 대칭)
+# --- Claude Code 세션 추출 (로컬 + 원격 staging 모두) ---
+# ~/.claude/projects/*/*.jsonl을 시간 기반으로 직접 스캔
 CC_CONTEXT=""
-if [[ "$INCLUDE_CC" == "1" ]] && [[ -d "$CC_PROJECTS_DIR" ]]; then
+if [[ "$INCLUDE_CC" == "1" ]]; then
     CC_RAW=$(python3 - <<PYEOF 2>>"$LOGFILE" || true
 import os, json, glob, re
 from datetime import datetime, timezone, timedelta
 
-PROJECTS = "${CC_PROJECTS_DIR}"
+SOURCES = [
+    ("", "${CC_PROJECTS_DIR}"),
+${EXTRA_CC_SOURCES_PY}]
+SOURCES = [(lbl, p) for (lbl, p) in SOURCES if os.path.isdir(p)]
 SEARCH_FROM = "${SEARCH_FROM}"
 SEARCH_TO   = "${DATE}"
 TZ = timezone(timedelta(hours=9))  # Asia/Seoul
@@ -137,76 +198,80 @@ end_utc   = end_local.astimezone(timezone.utc)
 NOISE = re.compile(r'^<(local-command-caveat|command-(?:name|message|args)|system-reminder|user-prompt-submit-hook)[^>]*>.*?</\1>\s*', re.DOTALL)
 TAG_OPEN = re.compile(r'^<[a-zA-Z][a-zA-Z0-9_-]*[^>]*>\s*')
 
-sessions = {}  # session_id -> {ts, local, cwd, first_msg}
+sessions = {}  # (label, session_id) -> {ts, local, cwd, first_msg}
 mtime_floor = start_utc.timestamp() - 86400  # 하루 여유
 
-for jsonl_path in glob.glob(os.path.join(PROJECTS, '*', '*.jsonl')):
-    try:
-        if os.path.getmtime(jsonl_path) < mtime_floor:
+for label, projects_dir in SOURCES:
+    prefix = f"[{label}] " if label else ""
+    for jsonl_path in glob.glob(os.path.join(projects_dir, '*', '*.jsonl')):
+        try:
+            if os.path.getmtime(jsonl_path) < mtime_floor:
+                continue
+        except OSError:
             continue
-    except OSError:
-        continue
-    try:
-        f = open(jsonl_path, 'r', encoding='utf-8', errors='replace')
-    except OSError:
-        continue
-    with f:
-        for line in f:
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
-            if d.get('type') != 'user' or d.get('isMeta'):
-                continue
-            ts = d.get('timestamp')
-            if not ts:
-                continue
-            try:
-                t = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-            except Exception:
-                continue
-            if not (start_utc <= t < end_utc):
-                continue
-            sid = d.get('sessionId', '')
-            if not sid:
-                continue
-            # 같은 세션의 더 늦은 메시지면 skip (가장 이른 user 메시지 = 시드)
-            if sid in sessions and sessions[sid]['ts'] <= t:
-                continue
-            msg = d.get('message') or {}
-            content = msg.get('content') if isinstance(msg, dict) else None
-            text = ''
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and item.get('type') == 'text':
-                        candidate = item.get('text', '') or ''
-                        if candidate:
-                            text = candidate
-                            break
-            # wrapper 스트립
-            for _ in range(8):
-                m = NOISE.match(text)
-                if not m:
-                    break
-                text = text[m.end():]
-            text = text.strip()
-            if not text:
-                continue
-            preview = re.sub(r'\s+', ' ', text)[:300]
-            cwd = d.get('cwd', '') or ''
-            local_str = t.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')
-            sessions[sid] = {'ts': t, 'local': local_str, 'cwd': cwd, 'first_msg': preview}
+        try:
+            f = open(jsonl_path, 'r', encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get('type') != 'user' or d.get('isMeta'):
+                    continue
+                ts = d.get('timestamp')
+                if not ts:
+                    continue
+                try:
+                    t = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                except Exception:
+                    continue
+                if not (start_utc <= t < end_utc):
+                    continue
+                sid = d.get('sessionId', '')
+                if not sid:
+                    continue
+                key = (label, sid)
+                # 같은 (호스트,세션)의 더 늦은 메시지면 skip (가장 이른 user 메시지 = 시드)
+                if key in sessions and sessions[key]['ts'] <= t:
+                    continue
+                msg = d.get('message') or {}
+                content = msg.get('content') if isinstance(msg, dict) else None
+                text = ''
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get('type') == 'text':
+                            candidate = item.get('text', '') or ''
+                            if candidate:
+                                text = candidate
+                                break
+                # wrapper 스트립
+                for _ in range(8):
+                    m = NOISE.match(text)
+                    if not m:
+                        break
+                    text = text[m.end():]
+                text = text.strip()
+                if not text:
+                    continue
+                preview = re.sub(r'\s+', ' ', text)[:300]
+                cwd = d.get('cwd', '') or ''
+                labeled_cwd = (prefix + cwd) if cwd else prefix.rstrip()
+                local_str = t.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')
+                sessions[key] = {'ts': t, 'local': local_str, 'cwd': labeled_cwd, 'first_msg': preview}
 
 # 중복 시드 메시지 dedup (자동화 봇이 동일 프롬프트로 반복 실행되는 경우 압축)
-# 키: (cwd, first_msg 앞 120자) — 거의 동일한 프롬프트는 1행 + count로 합산
+# 키: (labeled_cwd, first_msg 앞 120자) — 라벨이 다르면 별개 그룹 (호스트 구분 유지)
 groups = {}
-for sid, s in sessions.items():
-    key = (s['cwd'], s['first_msg'][:120])
-    g = groups.get(key)
+for key, s in sessions.items():
+    gkey = (s['cwd'], s['first_msg'][:120])
+    g = groups.get(gkey)
     if g is None or s['ts'] < g['ts']:
-        groups[key] = {**s, 'sid': sid, 'count': (g['count'] if g else 0) + 1}
+        groups[gkey] = {**s, 'sid': key[1], 'count': (g['count'] if g else 0) + 1}
     else:
         g['count'] += 1
 
@@ -224,12 +289,11 @@ PYEOF
     else
         echo "[$DATE] Claude Code 세션 없음 (기간: $SEARCH_FROM ~ $DATE)" >> "$LOGFILE"
     fi
-elif [[ "$INCLUDE_CC" == "1" ]]; then
-    echo "[$DATE] Claude Code 통합 활성이지만 디렉토리 없음: $CC_PROJECTS_DIR" >> "$LOGFILE"
 fi
 
 # --- git 커밋 컨텍스트 (INCLUDE_COMMITS=1일 때만) ---
-# 두 세션 컨텍스트에서 발견된 distinct cwd들에 한해 커밋 조회 (절대 경로만)
+# 두 세션 컨텍스트에서 발견된 distinct cwd들에 한해 커밋 조회 (로컬 절대 경로만)
+# 원격 cwd는 `[host] /path` 형태라 `/`로 시작 안 함 → awk 필터에서 자동 제외
 COMMIT_CONTEXT=""
 if [[ "$INCLUDE_COMMITS" == "1" ]]; then
     DIRS=$( { printf '%s\n' "$OPENCODE_CONTEXT"; printf '%s\n' "$CC_CONTEXT"; } \
@@ -266,6 +330,7 @@ PROMPT=$(cat <<PROMPT_END
 ### A. Claude Code 세션 (이미 추출됨)
 컬럼: 시작시각 / 작업디렉토리 / count(동일시드프롬프트반복횟수) / 세션ID(8자) / 첫_user_메시지(300자)
 count가 \`x2\` 이상이면 같은 프롬프트로 반복 실행된 자동화 세션. 작업 단위로는 1건으로 보세요.
+디렉토리에 \`[hostname] \` 접두어가 있으면 다른 PC에서 한 작업입니다. 같은 프로젝트(리포)면 통합하되 호스트 차이는 짧게 명시하세요 (예: "(hwjo-1에서도 작업)").
 \`\`\`
 ${CC_CONTEXT:-(Claude Code 세션 없음 또는 비활성)}
 \`\`\`
@@ -273,19 +338,22 @@ ${CC_CONTEXT:-(Claude Code 세션 없음 또는 비활성)}
 ### B. opencode 세션 (이미 추출됨)
 컬럼: 갱신시각 / 작업디렉토리 / 자동요약제목 / 첫_user_메시지(300자)
 title은 LLM 자동 요약이라 정확도 한계가 있으니 first_msg를 함께 보고 판단하세요.
+디렉토리에 \`[hostname] \` 접두어가 있으면 다른 PC 작업입니다 (위와 동일 규칙).
 \`\`\`
 ${OPENCODE_CONTEXT:-(opencode 세션 없음 또는 비활성)}
 \`\`\`
 
-### C. git 커밋 (해당 기간, 세션이 발생한 디렉토리 한정)
+### C. git 커밋 (해당 기간, 세션이 발생한 로컬 디렉토리 한정)
 디렉토리별로 그룹화. 각 줄: \`  HH:MM 해시 메시지\`
 \`결과물\` 항목은 추측하지 말고 이 블록의 실제 커밋 해시/메시지만 인용하세요.
+원격 PC 커밋은 여기 포함되지 않습니다.
 \`\`\`
 ${COMMIT_CONTEXT:-(커밋 없음 또는 비활성)}
 \`\`\`
 
 ## 요약 작성 규칙
 - A·B를 종합해 같은 프로젝트(=같은 디렉토리/주제)는 한 항목으로 통합. 도구 구분이 필요하면 \`[cc]\`/\`[oc]\` 태그를 붙이세요.
+- 같은 git repo를 두 PC에서 작업했으면 한 항목으로 통합하고 호스트 차이만 짧게 메모.
 - A·B·C 모두 비어있으면 아무 출력도 하지 마세요 (빈 출력).
 - 중요: 구분선(---)부터 바로 시작. 다른 설명/인사/상태 보고 없이 형식만 출력.
 

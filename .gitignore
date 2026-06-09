@@ -8,6 +8,9 @@ email-briefing/output/
 session-summary/archive/*.md
 session-summary/archive/.trash/
 
+# 원격 호스트 raw 데이터 staging (rsync 캐시 — git 미추적)
+session-summary/staging/
+
 # 일반
 *.tmp
 *.swp

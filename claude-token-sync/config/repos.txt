@@ -20,3 +20,4 @@ personal-ops
 cts-email-mcp-server
 cts-ta-mcp-server
 cts-ta-webapp
+claude-config
