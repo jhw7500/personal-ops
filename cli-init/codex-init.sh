@@ -20,6 +20,12 @@ mkdir -p "$LOG_DIR"
 {
   echo "=================================================="
   echo "[$(date '+%F %T')] Codex Start ..."
-  timeout 20s codex exec -C "$WORKDIR" --skip-git-repo-check --sandbox read-only "Reply with OK only."
-  echo "[`date '+%F %T'`] codex exit=$?"
+  timeout 20s codex exec -C "$WORKDIR" --skip-git-repo-check --sandbox read-only -m gpt-5.4-mini "Reply with OK only."
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[$(date '+%F %T')] gpt-5.4-mini 실패 (exit=$rc) — 기본 모델로 폴백"
+    timeout 20s codex exec -C "$WORKDIR" --skip-git-repo-check --sandbox read-only "Reply with OK only."
+    rc=$?
+  fi
+  echo "[`date '+%F %T'`] codex exit=$rc"
 } >> "$LOG_FILE" 2>&1

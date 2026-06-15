@@ -40,8 +40,18 @@ FIRE_TS=$(date +'%Y-%m-%d %H:%M:%S.%3N')
 printf '[%s] precise-fire target=%s:00 lead=%sms\n' \
   "$FIRE_TS" "$TARGET_HOUR" "$LEAD_MS" >> "$LOG"
 
-/usr/bin/timeout 60s "$CLAUDE_BIN" -p 'ok' >> "$LOG" 2>&1
+/usr/bin/timeout 60s "$CLAUDE_BIN" --model haiku -p 'ok' >> "$LOG" 2>&1
 EXIT=$?
+if [ "$EXIT" -ne 0 ]; then
+  printf '[%s] haiku 실패 (exit=%d) — sonnet으로 폴백\n' "$(date '+%F %T')" "$EXIT" >> "$LOG"
+  /usr/bin/timeout 60s "$CLAUDE_BIN" --model sonnet -p 'ok' >> "$LOG" 2>&1
+  EXIT=$?
+fi
+if [ "$EXIT" -ne 0 ]; then
+  printf '[%s] sonnet 실패 (exit=%d) — 기본 모델로 폴백\n' "$(date '+%F %T')" "$EXIT" >> "$LOG"
+  /usr/bin/timeout 60s "$CLAUDE_BIN" -p 'ok' >> "$LOG" 2>&1
+  EXIT=$?
+fi
 
 END_TS=$(date +'%Y-%m-%d %H:%M:%S.%3N')
 printf '[%s] precise-fire done exit=%d\n' "$END_TS" "$EXIT" >> "$LOG"
