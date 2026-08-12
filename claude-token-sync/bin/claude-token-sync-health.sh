@@ -11,12 +11,16 @@ CRED_FILE="$HOME/.claude/.credentials.json"
 LOG_FILE="$HOME/.claude/token_sync.log"
 SHA_FILE="$HOME/.claude/.token_sync_health.sha"
 REPO_FILE="$HOME/.claude/.token_sync_repos"
+LOCK_FILE="$HOME/.claude/.token_sync.lock"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 # shellcheck source=bin/claude-token-sync-common.sh
-source "$(dirname "$SCRIPT_PATH")/claude-token-sync-common.sh"
+if ! source "$(dirname "$SCRIPT_PATH")/claude-token-sync-common.sh"; then
+    log "[ERROR] common helper could not be loaded"
+    exit 1
+fi
 
 # 1) 데몬 생존 확인 — 죽었으면 재시작
 if ! pgrep -f 'claude-token-sync\.sh' >/dev/null 2>&1; then
@@ -24,20 +28,6 @@ if ! pgrep -f 'claude-token-sync\.sh' >/dev/null 2>&1; then
     systemctl --user restart claude-token-sync 2>/dev/null
 fi
 
-# 2) credentials/토큰 존재 확인
+# 2) credentials 존재 확인. Token/repo/marker는 공용 lock 획득 후 다시 읽는다.
 [ -f "$CRED_FILE" ] || { log "[HEALTH] cred file missing, skip"; exit 0; }
-TOK=$(jq -r '.claudeAiOauth.accessToken // empty' "$CRED_FILE" 2>/dev/null)
-[ -n "$TOK" ] || { log "[HEALTH] token empty, skip"; exit 0; }
-
-load_repos || exit 1
-CUR_SHA=$(sync_state_sha "$TOK")
-PREV_SHA=$(cat "$SHA_FILE" 2>/dev/null || echo "")
-
-# 이미 최신이면 조용히 종료 (no-op)
-[ "$CUR_SHA" = "$PREV_SHA" ] && exit 0
-
-EXPIRES=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CRED_FILE" 2>/dev/null)
-EXPIRES_DATE=$(date -d @$((EXPIRES / 1000)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
-log "[HEALTH-SYNC] sync state changed token_id=$(token_id "$TOK") expires=${EXPIRES_DATE}"
-
-sync_repos "$TOK" HEALTH-SYNC
+sync_current_state HEALTH-SYNC true

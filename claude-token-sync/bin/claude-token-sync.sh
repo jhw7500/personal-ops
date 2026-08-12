@@ -10,13 +10,17 @@ CRED_FILE="$HOME/.claude/.credentials.json"
 LOG_FILE="$HOME/.claude/token_sync.log"
 REPO_FILE="$HOME/.claude/.token_sync_repos"
 SHA_FILE="$HOME/.claude/.token_sync_health.sha"
+LOCK_FILE="$HOME/.claude/.token_sync.lock"
 WAIT_INTERVAL=60
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 # shellcheck source=bin/claude-token-sync-common.sh
-source "$(dirname "$SCRIPT_PATH")/claude-token-sync-common.sh"
+if ! source "$(dirname "$SCRIPT_PATH")/claude-token-sync-common.sh"; then
+    log "[ERROR] common helper could not be loaded"
+    exit 1
+fi
 
 log "[START] claude-token-sync daemon (pid=$$)"
 
@@ -41,6 +45,15 @@ EXPIRES=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CRED_FILE" 2>/dev/null)
 EXPIRES_DATE=$(date -d @$((EXPIRES / 1000)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
 log "[READY] token_id=$(token_id "$PREV_TOKEN") expires=${EXPIRES_DATE}"
 
+# Reconcile current token+repo state on startup. This is normally a marker
+# no-op, but makes a daemon restart apply repository-list changes immediately.
+if sync_current_state STARTUP true; then
+    PREV_TOKEN="$SYNCED_TOKEN"
+else
+    PREV_TOKEN=""
+    log "[WARN] startup sync incomplete; retrying on next poll"
+fi
+
 # Claude Code의 credentials atomic rename이 inotify 이벤트로 안정적으로 도착하지
 # 않아(2026-05 측정: --include + create/close_write/moved_to/modify 다 걸어도 0건),
 # 주기적 token 값 비교로 단순화.
@@ -59,11 +72,8 @@ while true; do
 
     CUR_TOKEN=$(jq -r '.claudeAiOauth.accessToken // empty' "$CRED_FILE" 2>/dev/null) || continue
     if [ -n "$CUR_TOKEN" ] && [ "$CUR_TOKEN" != "$PREV_TOKEN" ]; then
-        EXPIRES=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CRED_FILE" 2>/dev/null)
-        EXPIRES_DATE=$(date -d @$((EXPIRES / 1000)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
-        log "[CHANGED] token_id=$(token_id "$CUR_TOKEN") expires=${EXPIRES_DATE}"
-        if sync_repos "$CUR_TOKEN" SYNC; then
-            PREV_TOKEN="$CUR_TOKEN"
+        if sync_current_state SYNC false; then
+            PREV_TOKEN="$SYNCED_TOKEN"
         else
             log "[WARN] sync incomplete; retrying on next poll"
         fi

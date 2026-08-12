@@ -125,6 +125,57 @@ else
     fail 'missing repository config fails closed'
 fi
 
+IFS='|' read -r HOME_D BIN_D < <(make_home startup)
+printf '%s\n' repo-a > "$HOME_D/.claude/.token_sync_repos"
+write_credentials "$HOME_D" 'TEST_TOKEN_E_abcdefghijklmnopqrstuvwxyz'
+HOME="$HOME_D" PATH="$BIN_D:$PATH" /usr/bin/timeout 0.25 \
+    bash "$MODULE_DIR/bin/claude-token-sync.sh" >/dev/null 2>&1 || true
+if grep -q 'jhw7500/repo-a' "$HOME_D/gh.calls" 2>/dev/null; then
+    pass 'daemon startup applies an unsynced current state'
+else
+    fail 'daemon startup applies an unsynced current state'
+fi
+
+IFS='|' read -r HOME_E BIN_E < <(make_home concurrent)
+printf '%s\n' repo-a > "$HOME_E/.claude/.token_sync_repos"
+write_credentials "$HOME_E" 'TEST_TOKEN_F_abcdefghijklmnopqrstuvwxyz'
+cat > "$BIN_E/gh" <<'SH'
+#!/bin/bash
+cat >/dev/null
+if ! mkdir "$HOME/gh.active" 2>/dev/null; then
+    printf 'overlap\n' >> "$HOME/gh.overlap"
+fi
+printf '%s\n' "$*" >> "$HOME/gh.calls"
+/bin/sleep 0.12
+rmdir "$HOME/gh.active" 2>/dev/null || true
+SH
+chmod +x "$BIN_E/gh"
+HOME="$HOME_E" PATH="$BIN_E:$PATH" bash "$MODULE_DIR/bin/claude-token-sync-health.sh" &
+health_one=$!
+HOME="$HOME_E" PATH="$BIN_E:$PATH" bash "$MODULE_DIR/bin/claude-token-sync-health.sh" &
+health_two=$!
+wait "$health_one"; concurrent_one_rc=$?
+wait "$health_two"; concurrent_two_rc=$?
+concurrent_calls=$(wc -l < "$HOME_E/gh.calls" 2>/dev/null || printf 0)
+if [ "$concurrent_one_rc" -eq 0 ] && [ "$concurrent_two_rc" -eq 0 ] && \
+   [ "$concurrent_calls" -eq 1 ] && [ ! -e "$HOME_E/gh.overlap" ]; then
+    pass 'concurrent health runs serialize and recheck state under lock'
+else
+    fail 'concurrent health runs serialize and recheck state under lock'
+fi
+
+missing_helper_dir="$TMP_ROOT/missing-helper"
+mkdir -p "$missing_helper_dir"
+cp "$MODULE_DIR/bin/claude-token-sync.sh" "$missing_helper_dir/daemon.sh"
+HOME="$HOME_D" PATH="$BIN_D:$PATH" /usr/bin/timeout 0.2 \
+    bash "$missing_helper_dir/daemon.sh" >/dev/null 2>&1
+missing_helper_rc=$?
+if [ "$missing_helper_rc" -ne 0 ] && [ "$missing_helper_rc" -ne 124 ]; then
+    pass 'daemon exits when common helper cannot be loaded'
+else
+    fail 'daemon exits when common helper cannot be loaded'
+fi
+
 if [ "$FAILURES" -ne 0 ]; then
     printf 'FAILED %d check(s)\n' "$FAILURES"
     exit 1
