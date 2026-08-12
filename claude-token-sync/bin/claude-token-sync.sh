@@ -8,8 +8,11 @@ unset GITHUB_TOKEN
 
 CRED_FILE="$HOME/.claude/.credentials.json"
 LOG_FILE="$HOME/.claude/token_sync.log"
+# shellcheck disable=SC2034 # consumed by sourced common helper
 REPO_FILE="$HOME/.claude/.token_sync_repos"
+# shellcheck disable=SC2034 # consumed by sourced common helper
 SHA_FILE="$HOME/.claude/.token_sync_health.sha"
+# shellcheck disable=SC2034 # consumed by sourced common helper
 LOCK_FILE="$HOME/.claude/.token_sync.lock"
 WAIT_INTERVAL=60
 
@@ -17,6 +20,7 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 # shellcheck source=bin/claude-token-sync-common.sh
+# shellcheck disable=SC1091 # runtime path is resolved from the installed symlink
 if ! source "$(dirname "$SCRIPT_PATH")/claude-token-sync-common.sh"; then
     log "[ERROR] common helper could not be loaded"
     exit 1
