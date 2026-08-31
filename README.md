@@ -6,8 +6,8 @@
 
 | 모듈 | 목적 | 실행 방식 |
 |------|------|-----------|
-| [`cli-init/`](./cli-init/) | Claude/Codex CLI 워밍업 (5시간 세션 창 트리거) | crontab (매일 06/11/16시) |
-| [`session-summary/`](./session-summary/) | Claude 세션 요약 자동화 (Claude Code + opencode) | crontab (매일 00:10, 수요일 00:05 로테이트) |
+| [`cli-init/`](./cli-init/) | Claude 인증 상태 확인 + Codex CLI 워밍업 | crontab (매일 06/11시) |
+| [`session-summary/`](./session-summary/) | Claude 세션 요약 자동화 (Claude Code + opencode) | crontab (매일 09:00, 수요일 09:10 로테이트) |
 | [`email-briefing/`](./email-briefing/) | 이메일 브리핑 + 회의 준비 자료 | 수동 실행 |
 
 ## 크론 엔트리 (현재 등록)
@@ -15,18 +15,27 @@
 ```cron
 TZ=Asia/Seoul
 
-# CLI 워밍업 (5시간 창 3개)
+# CLI 상태 확인 / 워밍업
 0 6  * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/claude-init.sh
 0 11 * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/claude-init.sh
-0 16 * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/claude-init.sh
+#0 16 * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/claude-init.sh
 0 6  * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/codex-init.sh
 0 11 * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/codex-init.sh
-0 16 * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/codex-init.sh
+#0 16 * * * /home/jhw/ai/opencode/projects/personal-ops/cli-init/codex-init.sh
 
 # 세션 요약 (매일 요약, 수 로테이트)
-10 0 * * *   /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh
-05 0 * * 3   /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh rotate
+0 9 * * *   /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh
+10 9 * * 3  /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh rotate
 ```
+
+Claude 관련 예약 작업의 모델 호출 상한은 다음과 같다.
+
+| 작업 | 실행당 모델 호출 | 하루 최대(현재 cron) | 보호 장치 |
+|---|---:|---:|---|
+| `claude-init.sh` | 0회 | 0회 | 비생성 auth status, flock, 20초 timeout + 5초 후 강제 종료 |
+| `session-summary.sh` | 최대 1회 | 최대 1회 | Haiku/low, 64 KiB 입력, 180초 timeout + 5초 후 강제 종료, quota/auth backoff |
+
+`session-summary.sh rotate`는 파일 이동만 수행하며 모델을 호출하지 않는다.
 
 ## 구조 규칙
 

@@ -11,6 +11,9 @@ session-summary/archive/.trash/
 # 원격 호스트 raw 데이터 staging (rsync 캐시 — git 미추적)
 session-summary/staging/
 
+# Claude quota/auth backoff marker (런타임 상태)
+session-summary/state/
+
 # 일반
 *.tmp
 *.swp

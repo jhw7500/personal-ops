@@ -3,8 +3,8 @@
 # Managed by personal-ops (projects/personal-ops/session-summary/)
 #
 # crontab:
-#   10 0 * * *   /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh
-#   05 0 * * 3   /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh rotate
+#   0 9 * * *    /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh
+#   10 9 * * 3   /home/jhw/ai/opencode/projects/personal-ops/session-summary/session-summary.sh rotate
 #
 # 동작:
 #   - 기본: 어제 1일치 세션을 episodic-memory + opencode SQLite에서 검색 → 요약을 logs/session-summary.md에 누적
@@ -14,10 +14,22 @@
 
 set -euo pipefail
 
-MODULE_DIR="/home/jhw/ai/opencode/projects/personal-ops/session-summary"
+MODULE_DIR="${SESSION_SUMMARY_MODULE_DIR:-/home/jhw/ai/opencode/projects/personal-ops/session-summary}"
 SUMMARY_FILE="${MODULE_DIR}/logs/session-summary.md"
 LOGFILE="${MODULE_DIR}/logs/summary.log"
 ARCHIVE_DIR="${MODULE_DIR}/archive"
+STATE_DIR="${MODULE_DIR}/state"
+BACKOFF_FILE="${STATE_DIR}/claude-backoff"
+LOCK_FILE="${SESSION_SUMMARY_LOCK_FILE:-/tmp/session_summary.lock}"
+CLAUDE_BIN="${CLAUDE_BIN:-/home/jhw/.local/bin/claude}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-/usr/bin/timeout}"
+CLAUDE_MODEL="${SESSION_SUMMARY_MODEL:-haiku}"
+CLAUDE_EFFORT="${SESSION_SUMMARY_EFFORT:-low}"
+MAX_INPUT_BYTES="${SESSION_SUMMARY_MAX_INPUT_BYTES:-65536}"
+TIMEOUT_SECONDS="${SESSION_SUMMARY_TIMEOUT_SECONDS:-180}"
+TIMEOUT_KILL_AFTER_SECONDS="${SESSION_SUMMARY_TIMEOUT_KILL_AFTER_SECONDS:-5}"
+QUOTA_BACKOFF_SECONDS="${SESSION_SUMMARY_QUOTA_BACKOFF_SECONDS:-21600}"
+AUTH_BACKOFF_SECONDS="${SESSION_SUMMARY_AUTH_BACKOFF_SECONDS:-86400}"
 DATE=$(date +%Y-%m-%d)
 YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
 
@@ -38,20 +50,67 @@ INCLUDE_COMMITS="${INCLUDE_COMMITS:-1}"
 # 원격 호스트 (Tailscale MagicDNS 등) — 공백 구분
 # 각 호스트의 ~/.claude/projects/ 와 opencode.db를 rsync로 가져와 합쳐 요약
 # 비어있으면 로컬만 사용 (기존 동작과 동일)
-REMOTE_HOSTS="${REMOTE_HOSTS:-hwjo-1}"
+REMOTE_HOSTS="${REMOTE_HOSTS-hwjo-1}"
 REMOTE_USER="${REMOTE_USER:-jhw}"
 STAGING_DIR="${MODULE_DIR}/staging"
 
 export PATH="/home/jhw/.nvm/versions/node/$(ls /home/jhw/.nvm/versions/node/ 2>/dev/null | tail -1)/bin:/home/jhw/.local/bin:/usr/bin:/bin"
-export HOME="/home/jhw"
 
-mkdir -p "$ARCHIVE_DIR" "$(dirname "$LOGFILE")"
+mkdir -p "$ARCHIVE_DIR" "$STATE_DIR" "$(dirname "$LOGFILE")"
+
+ensure_header() {
+    if [[ ! -f "$SUMMARY_FILE" ]]; then
+        cat > "$SUMMARY_FILE" <<EOF
+# Claude 세션 요약
+
+> 자동 생성 파일. 매주 수요일 09:10 로테이트.
+EOF
+    fi
+}
+
+append_failure_summary() {
+    local failure_class=$1
+    ensure_header
+    cat >> "$SUMMARY_FILE" <<EOF
+
+---
+
+## ${DATE} (${SEARCH_FROM} ~ ${DATE})
+
+_(요약 실패: ${failure_class}, see logs/summary.log)_
+EOF
+}
+
+write_backoff() {
+    local reason=$1
+    local duration_seconds=$2
+    local until_epoch marker_tmp
+    until_epoch=$(( $(date +%s) + duration_seconds ))
+    marker_tmp="${BACKOFF_FILE}.tmp.$$"
+    printf 'reason=%s\nuntil_epoch=%s\n' "$reason" "$until_epoch" > "$marker_tmp"
+    mv "$marker_tmp" "$BACKOFF_FILE"
+}
+
+classify_claude_failure() {
+    local exit_code=$1
+    local error_file=$2
+
+    if [[ $exit_code -eq 124 || $exit_code -eq 137 ]]; then
+        printf 'timeout\n'
+    elif grep -Eqi 'usage limit|hit your ([[:alpha:]]+[[:space:]]+)*limit|rate[_ -]?limit(_error)?|quota|too many requests|credit balance( is)? too low|insufficient (usage )?credits|(^|[^0-9])429([^0-9]|$)' "$error_file"; then
+        printf 'quota\n'
+    elif grep -Eqi 'failed to authenticate|invalid authentication credentials|authentication_error|oauth.*(expired|invalid)|auth(entication|orization)? (failed|required)|not logged in|please (run )?/login|please (log in|login)|unauthorized|invalid api key|(^|[^0-9])401([^0-9]|$)' "$error_file"; then
+        printf 'auth\n'
+    else
+        printf 'other\n'
+    fi
+}
 
 # --- 로테이트 모드 ---
 if [[ "${1:-}" == "rotate" ]]; then
     echo "[$DATE] ===== 로테이트 시작: $(date) =====" >> "$LOGFILE"
     if [[ -s "$SUMMARY_FILE" ]]; then
-        # 수요일 00:05 로테이트 기준: 지난 수요일(7일 전) ~ 어제(화요일)
+        # 수요일 09:10 로테이트 기준: 지난 수요일(7일 전) ~ 어제(화요일)
         FIRST_DATE=$(date -d "7 days ago" +%Y-%m-%d)
         LAST_DATE=$(date -d "yesterday" +%Y-%m-%d)
         ARCHIVE_NAME="summary-${FIRST_DATE}_${LAST_DATE}.md"
@@ -77,6 +136,37 @@ fi
 SEARCH_FROM="$YESTERDAY"
 
 echo "[$DATE] ===== 세션 요약 시작: $(date) =====" >> "$LOGFILE"
+
+exec 8>"$LOCK_FILE"
+if ! flock -n 8; then
+    echo "[$DATE] skipped: already running" >> "$LOGFILE"
+    exit 0
+fi
+
+validate_positive_config() {
+    local config_name=$1
+    local config_value=$2
+    if [[ ! "$config_value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[$DATE] Claude 호출 생략 class=other invalid_config=${config_name} value=${config_value}" >> "$LOGFILE"
+        append_failure_summary other
+        return 1
+    fi
+}
+
+validate_positive_config SESSION_SUMMARY_MAX_INPUT_BYTES "$MAX_INPUT_BYTES" || exit 0
+validate_positive_config SESSION_SUMMARY_TIMEOUT_SECONDS "$TIMEOUT_SECONDS" || exit 0
+validate_positive_config SESSION_SUMMARY_TIMEOUT_KILL_AFTER_SECONDS "$TIMEOUT_KILL_AFTER_SECONDS" || exit 0
+validate_positive_config SESSION_SUMMARY_QUOTA_BACKOFF_SECONDS "$QUOTA_BACKOFF_SECONDS" || exit 0
+validate_positive_config SESSION_SUMMARY_AUTH_BACKOFF_SECONDS "$AUTH_BACKOFF_SECONDS" || exit 0
+
+if [[ -f "$BACKOFF_FILE" ]]; then
+    BACKOFF_REASON=$(awk -F= '$1 == "reason" {print $2}' "$BACKOFF_FILE")
+    BACKOFF_UNTIL=$(awk -F= '$1 == "until_epoch" {print $2}' "$BACKOFF_FILE")
+    if [[ "$BACKOFF_UNTIL" =~ ^[0-9]+$ ]] && (( $(date +%s) < BACKOFF_UNTIL )); then
+        echo "[$DATE] Claude 호출 보류 class=${BACKOFF_REASON:-other} until_epoch=${BACKOFF_UNTIL}" >> "$LOGFILE"
+        exit 0
+    fi
+fi
 
 # --- 원격 호스트 동기화 (REMOTE_HOSTS가 비어있지 않으면) ---
 # 각 호스트의 ~/.claude/projects/ 와 opencode.db를 staging/{host}/ 로 rsync.
@@ -378,47 +468,47 @@ ${COMMIT_CONTEXT:-(커밋 없음 또는 비활성)}
 PROMPT_END
 )
 
-echo "[$DATE] Claude 실행 시작" >> "$LOGFILE"
+PROMPT_BYTES=$(LC_ALL=C printf '%s' "$PROMPT" | wc -c | tr -d ' ')
+if (( PROMPT_BYTES > MAX_INPUT_BYTES )); then
+    echo "[$DATE] Claude 호출 생략 class=input-limit input_bytes=${PROMPT_BYTES} max_input_bytes=${MAX_INPUT_BYTES}" >> "$LOGFILE"
+    append_failure_summary input-limit
+    echo "[$DATE] ===== 완료 (입력 상한) =====" >> "$LOGFILE"
+    exit 0
+fi
+
+echo "[$DATE] Claude 실행 시작 model=${CLAUDE_MODEL} effort=${CLAUDE_EFFORT} input_bytes=${PROMPT_BYTES} max_input_bytes=${MAX_INPUT_BYTES} timeout_seconds=${TIMEOUT_SECONDS} kill_after_seconds=${TIMEOUT_KILL_AFTER_SECONDS}" >> "$LOGFILE"
 
 # 임시 파일에 당일 요약 생성
 TMPFILE=$(mktemp)
-trap 'rm -f "$TMPFILE"' EXIT
+ERRFILE=$(mktemp)
+trap 'rm -f "$TMPFILE" "$ERRFILE"' EXIT
 
 # claude 호출 실패와 "작업 없음(빈 출력)"을 구분하기 위해 exit code 분리 캡처
 set +e
-claude --print \
-    --dangerously-skip-permissions \
-    --model sonnet \
+"$TIMEOUT_BIN" --kill-after="${TIMEOUT_KILL_AFTER_SECONDS}s" "${TIMEOUT_SECONDS}s" \
+    "$CLAUDE_BIN" --print \
+    --model "$CLAUDE_MODEL" \
+    --effort "$CLAUDE_EFFORT" \
+    --tools "" \
+    --disable-slash-commands \
+    --no-session-persistence \
     --output-format text \
     "$PROMPT" \
     < /dev/null \
-    > "$TMPFILE" 2>> "$LOGFILE"
+    > "$TMPFILE" 2> "$ERRFILE"
 CLAUDE_EXIT=$?
 set -e
-
-# 헤더 보장 헬퍼 (실패/빈출력 양쪽에서 사용)
-ensure_header() {
-    if [[ ! -f "$SUMMARY_FILE" ]]; then
-        cat > "$SUMMARY_FILE" <<EOF
-# Claude 세션 요약
-
-> 자동 생성 파일. 매주 수요일 00시 로테이트.
-EOF
-    fi
-}
+cat "$ERRFILE" >> "$LOGFILE"
 
 # claude 자체가 실패한 경우: 빈 출력과 구분해서 명시적으로 기록
 if [[ $CLAUDE_EXIT -ne 0 ]]; then
-    echo "[$DATE] claude 호출 실패 (exit=${CLAUDE_EXIT})" >> "$LOGFILE"
-    ensure_header
-    cat >> "$SUMMARY_FILE" <<EOF
-
----
-
-## ${DATE} (${SEARCH_FROM} ~ ${DATE})
-
-_(요약 실패: claude exit=${CLAUDE_EXIT}, see logs/summary.log)_
-EOF
+    FAILURE_CLASS=$(classify_claude_failure "$CLAUDE_EXIT" "$ERRFILE")
+    echo "[$DATE] Claude 호출 실패 class=${FAILURE_CLASS} exit=${CLAUDE_EXIT}" >> "$LOGFILE"
+    case "$FAILURE_CLASS" in
+        quota) write_backoff quota "$QUOTA_BACKOFF_SECONDS" ;;
+        auth) write_backoff auth "$AUTH_BACKOFF_SECONDS" ;;
+    esac
+    append_failure_summary "$FAILURE_CLASS"
     echo "[$DATE] ===== 완료 (실패 헤더) =====" >> "$LOGFILE"
     exit 0
 fi
