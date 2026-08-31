@@ -287,12 +287,14 @@ def _collapse_marked_history(summary_items: list[SummaryItem]) -> list[SummaryIt
 
 def _coalesce_legacy_history(
     summary_items: list[SummaryItem],
+    state_by_id: dict[str, dict[str, Any]],
 ) -> list[SummaryItem]:
     """Join legacy copies to their later marked occurrence using summary evidence."""
-    occurrences: dict[tuple[str, str, str, str | None], int] = {}
+    occurrences: dict[tuple[str, str, str, str, str | None], int] = {}
     item_occurrences: list[int] = []
     for summary in summary_items:
         occurrence_key = (
+            "legacy" if summary.marker_id is None else "marked",
             summary.opened_on,
             summary.text,
             summary.project,
@@ -329,6 +331,9 @@ def _coalesce_legacy_history(
             marked_index
             for marked_index in marked.get(identity, [])
             if summary_items[marked_index].opened_on >= summary.opened_on
+            and _state_allows_legacy_coalescing(
+                summary, summary_items[marked_index], state_by_id
+            )
         ]
         if len(candidates) > 1:
             raise TrackerError("ambiguous legacy summary match")
@@ -361,6 +366,33 @@ def _coalesce_legacy_history(
             )
         coalesced.append(summary)
     return coalesced
+
+
+def _state_allows_legacy_coalescing(
+    legacy: SummaryItem,
+    marked: SummaryItem,
+    state_by_id: dict[str, dict[str, Any]],
+) -> bool:
+    if marked.marker_id is None:
+        return False
+    stored = state_by_id.get(marked.marker_id)
+    if stored is None:
+        return True
+    return all(
+        (
+            stored["text"] == legacy.text,
+            stored["project"] == legacy.project,
+            stored["priority"] == legacy.priority,
+            stored["opened_on"] == legacy.opened_on,
+            stored["id"]
+            == make_item_id(
+                legacy.opened_on,
+                legacy.project,
+                legacy.text,
+                stored["identity_repo_key"],
+            ),
+        )
+    )
 
 
 def run_git(
@@ -525,7 +557,7 @@ def recover_items(
     repositories: list[Repository],
 ) -> list[dict[str, Any]]:
     summary_items = _coalesce_legacy_history(
-        _collapse_marked_history(summary_items)
+        _collapse_marked_history(summary_items), state_by_id
     )
     occurrences: dict[tuple[str, str, str], int] = {}
     recovered: list[dict[str, Any]] = []

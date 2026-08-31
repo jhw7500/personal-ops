@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import hashlib
 import json
 import os
 import subprocess
@@ -755,6 +756,95 @@ class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
                 self.assertEqual(marker_id, items[0]["id"])
                 self.assertEqual("2026-05-09", items[0]["opened_on"])
                 self.assertEqual(str(repo.resolve()), items[0]["repo_path"])
+
+    def test_valid_marked_state_prevents_unrelated_legacy_date_override(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-01T12:00:00+0900",
+        )
+        pre_open_fix = self.commit(
+            repo,
+            "fix: earlier identical work",
+            "void configure(void) { arg.cam[i].bps = json_array_length(node); }\n",
+            "2026-05-05T12:00:00+0900",
+        )
+        identity = "\0".join(
+            (
+                "2026-05-10",
+                "gstApp",
+                "bps 배열 길이 불일치",
+                str(repo.resolve()),
+            )
+        ).encode("utf-8")
+        marker_id = f"unresolved-{hashlib.sha256(identity).hexdigest()[:12]}"
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-01 (2026-04-30 ~ 2026-05-01)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n\n"
+            "## 2026-05-10 (2026-05-09 ~ 2026-05-10)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{marker_id} -->\n",
+            encoding="utf-8",
+        )
+        self.write_state(marker_id, repo, pre_open_fix)
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        state["items"][0]["opened_on"] = "2026-05-10"
+        self.state.write_text(json.dumps(state) + "\n", encoding="utf-8")
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        items = json.loads(self.manifest.read_text(encoding="utf-8"))["items"]
+        self.assertEqual(2, len(items))
+        marked = next(item for item in items if item["id"] == marker_id)
+        self.assertEqual("2026-05-10", marked["opened_on"])
+        self.assertEqual([], marked["candidates"])
+
+    def test_same_day_legacy_and_marked_occurrences_coalesce_without_state(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        first_marker = "unresolved-111111111111"
+        second_marker = "unresolved-222222222222"
+        line = "- [ ] repeated same-day item — gstApp — 중\n"
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            f"{line}{line}{line}"
+            f"<!-- unresolved-id:{first_marker} -->\n"
+            f"{line}"
+            f"<!-- unresolved-id:{second_marker} -->\n",
+            encoding="utf-8",
+        )
+
+        for state_contents in (None, "{broken"):
+            with self.subTest(state=state_contents):
+                if state_contents is None:
+                    self.state.unlink(missing_ok=True)
+                else:
+                    self.state.write_text(state_contents, encoding="utf-8")
+
+                result = self.run_prepare(repo)
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                items = json.loads(self.manifest.read_text(encoding="utf-8"))["items"]
+                self.assertEqual(2, len(items))
+                self.assertEqual(
+                    {first_marker, second_marker}, {item["id"] for item in items}
+                )
+                self.assertTrue(
+                    all(item["opened_on"] == "2026-05-09" for item in items)
+                )
 
     def test_state_cannot_move_opened_on_before_summary_evidence(self) -> None:
         repo = self.create_repo()
