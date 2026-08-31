@@ -901,5 +901,93 @@ class ResolutionTrackerReconcileTests(TrackerGitFixture, unittest.TestCase):
         self.assertNotEqual("f" * 40, recovered["resolution"]["commit"])
 
 
+class ResolutionTrackerAcceptanceTests(TrackerGitFixture, unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.generated = self.root / "generated.md"
+        self.validated = self.root / "validated.md"
+        self.next_state = self.root / "next-state.json"
+
+    def reconcile(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "python3",
+                str(TRACKER),
+                "reconcile",
+                "--generated",
+                str(self.generated),
+                "--manifest",
+                str(self.manifest),
+                "--validated",
+                str(self.validated),
+                "--next-state",
+                str(self.next_state),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_generic_chore_symbol_fix_resolves_exactly_once(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: initial camera config",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        fix = self.commit(
+            repo,
+            "chore: build directory cleanup",
+            "void configure(void) { arg.cam[i].bps = json_array_length(node); }\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.write_open_summary()
+        prepared = self.run_prepare(repo)
+        self.assertEqual(0, prepared.returncode, prepared.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+        first_reconcile = self.reconcile()
+        self.assertEqual(0, first_reconcile.returncode, first_reconcile.stderr)
+        first_daily = self.validated.read_text(encoding="utf-8")
+        resolved_line = (
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]"
+        )
+        self.assertEqual(1, first_daily.count(resolved_line))
+
+        prior_open = self.summary.read_text(encoding="utf-8").rstrip()
+        self.summary.write_text(
+            f"{prior_open}\n<!-- unresolved-id:{item['id']} -->\n\n{first_daily}",
+            encoding="utf-8",
+        )
+        self.state.write_bytes(self.next_state.read_bytes())
+        second_prepare = self.run_prepare(repo)
+        self.assertEqual(0, second_prepare.returncode, second_prepare.stderr)
+        second_manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.assertEqual("resolved", second_manifest["items"][0]["status"])
+        self.assertEqual(b"", self.context.read_bytes())
+
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-13 (2026-05-12 ~ 2026-05-13)\n\n"
+            "### 미완료 항목\n",
+            encoding="utf-8",
+        )
+        second_reconcile = self.reconcile()
+        self.assertEqual(0, second_reconcile.returncode, second_reconcile.stderr)
+        combined = first_daily + self.validated.read_text(encoding="utf-8")
+        self.assertEqual(1, combined.count(resolved_line))
+        final_state = json.loads(self.next_state.read_text(encoding="utf-8"))
+        self.assertEqual(fix, final_state["items"][0]["resolution"]["commit"])
+
+
 if __name__ == "__main__":
     unittest.main()
