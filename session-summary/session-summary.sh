@@ -14,6 +14,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MODULE_DIR="${SESSION_SUMMARY_MODULE_DIR:-/home/jhw/ai/opencode/projects/personal-ops/session-summary}"
 SUMMARY_FILE="${MODULE_DIR}/logs/session-summary.md"
 LOGFILE="${MODULE_DIR}/logs/summary.log"
@@ -30,6 +31,9 @@ TIMEOUT_SECONDS="${SESSION_SUMMARY_TIMEOUT_SECONDS:-180}"
 TIMEOUT_KILL_AFTER_SECONDS="${SESSION_SUMMARY_TIMEOUT_KILL_AFTER_SECONDS:-5}"
 QUOTA_BACKOFF_SECONDS="${SESSION_SUMMARY_QUOTA_BACKOFF_SECONDS:-21600}"
 AUTH_BACKOFF_SECONDS="${SESSION_SUMMARY_AUTH_BACKOFF_SECONDS:-86400}"
+RESOLUTION_TRACKING="${SESSION_SUMMARY_RESOLUTION_TRACKING:-1}"
+RESOLUTION_TRACKER="${SESSION_SUMMARY_RESOLUTION_TRACKER:-${SCRIPT_DIR}/resolution-tracker.py}"
+UNRESOLVED_STATE_FILE="${STATE_DIR}/unresolved-items.json"
 RUN_STARTED_EPOCH=$(date +%s)
 DATE=$(date +%Y-%m-%d)
 YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
@@ -37,12 +41,12 @@ YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
 # opencode 세션 포함 여부 (1=포함, 0=제외)
 # DB 파일을 직접 read-only로 읽으므로 opencode 바이너리/토큰 의존 없음
 INCLUDE_OPENCODE="${INCLUDE_OPENCODE:-1}"
-OPENCODE_DB="/home/jhw/.local/share/opencode/opencode.db"
+OPENCODE_DB="${OPENCODE_DB:-/home/jhw/.local/share/opencode/opencode.db}"
 
 # Claude Code 세션 포함 여부 (1=포함, 0=제외)
 # ~/.claude/projects/*/*.jsonl을 직접 읽어 시간 기반으로 추출 (opencode와 대칭)
 INCLUDE_CC="${INCLUDE_CC:-1}"
-CC_PROJECTS_DIR="/home/jhw/.claude/projects"
+CC_PROJECTS_DIR="${CC_PROJECTS_DIR:-/home/jhw/.claude/projects}"
 
 # git 커밋 컨텍스트 포함 여부 (1=포함, 0=제외)
 # 세션에서 발견된 cwd들에서 해당 기간 커밋 추출 (로컬 경로만 — 원격은 [host] 라벨이라 자동 제외)
@@ -55,9 +59,24 @@ REMOTE_HOSTS="${REMOTE_HOSTS-hwjo-1}"
 REMOTE_USER="${REMOTE_USER:-jhw}"
 STAGING_DIR="${MODULE_DIR}/staging"
 
-export PATH="/home/jhw/.nvm/versions/node/$(ls /home/jhw/.nvm/versions/node/ 2>/dev/null | tail -1)/bin:/home/jhw/.local/bin:/usr/bin:/bin"
+NVM_BIN_PREFIX=""
+if [[ -d /home/jhw/.nvm/versions/node ]]; then
+    NVM_VERSION=$(find /home/jhw/.nvm/versions/node \
+        -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+        | sort -V | tail -1)
+    [[ -n "$NVM_VERSION" ]] && NVM_BIN_PREFIX="/home/jhw/.nvm/versions/node/${NVM_VERSION}/bin:"
+fi
+PATH="${NVM_BIN_PREFIX}/home/jhw/.local/bin:/usr/bin:/bin"
+export PATH
 
 mkdir -p "$ARCHIVE_DIR" "$STATE_DIR" "$(dirname "$LOGFILE")"
+
+if [[ "${1:-}" == "rotate" \
+    && "$RESOLUTION_TRACKING" != "0" \
+    && "$RESOLUTION_TRACKING" != "1" ]]; then
+    echo "[$DATE] 로테이트 실패: invalid_config=SESSION_SUMMARY_RESOLUTION_TRACKING value=${RESOLUTION_TRACKING}" >> "$LOGFILE"
+    exit 1
+fi
 
 ensure_header() {
     if [[ ! -f "$SUMMARY_FILE" ]]; then
@@ -119,6 +138,18 @@ if [[ "${1:-}" == "rotate" ]]; then
     fi
     echo "[$DATE] ===== 로테이트 시작: $(date) =====" >> "$LOGFILE"
     if [[ -s "$SUMMARY_FILE" ]]; then
+        CARRYOVER_FILE=""
+        if [[ "$RESOLUTION_TRACKING" == "1" ]]; then
+            CARRYOVER_FILE="${SUMMARY_FILE}.carryover.$$"
+            if ! "$RESOLUTION_TRACKER" carryover \
+                --summary "$SUMMARY_FILE" \
+                --state "$UNRESOLVED_STATE_FILE" \
+                --output "$CARRYOVER_FILE" >> "$LOGFILE" 2>&1; then
+                rm -f -- "$CARRYOVER_FILE"
+                echo "[$DATE] 로테이트 실패: resolution carryover 생성 실패" >> "$LOGFILE"
+                exit 1
+            fi
+        fi
         # 수요일 09:10 로테이트 기준: 지난 수요일(7일 전) ~ 어제(화요일)
         FIRST_DATE=$(date -d "7 days ago" +%Y-%m-%d)
         LAST_DATE=$(date -d "yesterday" +%Y-%m-%d)
@@ -131,6 +162,13 @@ if [[ "${1:-}" == "rotate" ]]; then
             echo "[$DATE] 주의: 동명 아카이브 존재, 새 이름 사용: ${ARCHIVE_NAME}" >> "$LOGFILE"
         fi
         mv "$SUMMARY_FILE" "$TARGET"
+        if [[ -n "$CARRYOVER_FILE" ]]; then
+            if [[ -s "$CARRYOVER_FILE" ]]; then
+                mv -fT "$CARRYOVER_FILE" "$SUMMARY_FILE"
+            else
+                rm -f -- "$CARRYOVER_FILE"
+            fi
+        fi
         echo "[$DATE] 아카이브 완료: ${ARCHIVE_NAME}" >> "$LOGFILE"
     else
         echo "[$DATE] 로테이트 대상 없음 (파일 비어있거나 없음)" >> "$LOGFILE"
@@ -161,11 +199,22 @@ validate_positive_config() {
     fi
 }
 
+validate_boolean_config() {
+    local config_name=$1
+    local config_value=$2
+    if [[ "$config_value" != "0" && "$config_value" != "1" ]]; then
+        echo "[$DATE] Claude 호출 생략 class=other invalid_config=${config_name} value=${config_value}" >> "$LOGFILE"
+        append_failure_summary other
+        return 1
+    fi
+}
+
 validate_positive_config SESSION_SUMMARY_MAX_INPUT_BYTES "$MAX_INPUT_BYTES" || exit 0
 validate_positive_config SESSION_SUMMARY_TIMEOUT_SECONDS "$TIMEOUT_SECONDS" || exit 0
 validate_positive_config SESSION_SUMMARY_TIMEOUT_KILL_AFTER_SECONDS "$TIMEOUT_KILL_AFTER_SECONDS" || exit 0
 validate_positive_config SESSION_SUMMARY_QUOTA_BACKOFF_SECONDS "$QUOTA_BACKOFF_SECONDS" || exit 0
 validate_positive_config SESSION_SUMMARY_AUTH_BACKOFF_SECONDS "$AUTH_BACKOFF_SECONDS" || exit 0
+validate_boolean_config SESSION_SUMMARY_RESOLUTION_TRACKING "$RESOLUTION_TRACKING" || exit 0
 
 if [[ -f "$BACKOFF_FILE" ]]; then
     BACKOFF_REASON=$(awk -F= '$1 == "reason" {print $2}' "$BACKOFF_FILE")
@@ -389,27 +438,42 @@ PYEOF
     fi
 fi
 
+# --- 세션에서 관측된 로컬 git root ---
+# 원격 cwd는 `[host] /path` 형태라 제외한다. workspace/부모 디렉토리는 스캔하지 않는다.
+SESSION_DIRS=$( { printf '%s\n' "$OPENCODE_CONTEXT"; printf '%s\n' "$CC_CONTEXT"; } \
+    | awk -F'\t' '$2 ~ /^\// {print $2}' \
+    | sort -u )
+REPO_ROOTS=()
+declare -A SEEN_REPO_ROOTS=()
+if [[ -n "$SESSION_DIRS" ]]; then
+    while IFS= read -r session_dir; do
+        [[ -z "$session_dir" || ! -d "$session_dir" ]] && continue
+        repo_root=$(git -C "$session_dir" rev-parse --show-toplevel 2>/dev/null || true)
+        [[ "$repo_root" != /* || ! -d "$repo_root" ]] && continue
+        if [[ -z "${SEEN_REPO_ROOTS[$repo_root]+present}" ]]; then
+            SEEN_REPO_ROOTS["$repo_root"]=1
+            REPO_ROOTS+=("$repo_root")
+        fi
+    done <<< "$SESSION_DIRS"
+fi
+
 # --- git 커밋 컨텍스트 (INCLUDE_COMMITS=1일 때만) ---
 # 두 세션 컨텍스트에서 발견된 distinct cwd들에 한해 커밋 조회 (로컬 절대 경로만)
 # 원격 cwd는 `[host] /path` 형태라 `/`로 시작 안 함 → awk 필터에서 자동 제외
 COMMIT_CONTEXT=""
 if [[ "$INCLUDE_COMMITS" == "1" ]]; then
-    DIRS=$( { printf '%s\n' "$OPENCODE_CONTEXT"; printf '%s\n' "$CC_CONTEXT"; } \
-        | awk -F'\t' '$2 ~ /^\// {print $2}' \
-        | sort -u )
     COMMIT_BLOCKS=""
-    if [[ -n "$DIRS" ]]; then
-        while IFS= read -r d; do
-            [[ -z "$d" || ! -d "$d/.git" ]] && continue
-            OUT=$(git -C "$d" log --all --no-merges \
+    if (( ${#REPO_ROOTS[@]} > 0 )); then
+        for repo_root in "${REPO_ROOTS[@]}"; do
+            OUT=$(git -C "$repo_root" log --all --no-merges \
                 --since="$SEARCH_FROM 00:00" \
                 --until="$DATE 00:00" \
                 --pretty=format:"  %ad %h %s" \
                 --date=format:'%H:%M' 2>/dev/null || true)
             if [[ -n "$OUT" ]]; then
-                COMMIT_BLOCKS+=$'\n'"### ${d}"$'\n'"$OUT"$'\n'
+                COMMIT_BLOCKS+=$'\n'"### ${repo_root}"$'\n'"$OUT"$'\n'
             fi
-        done <<< "$DIRS"
+        done
     fi
     if [[ -n "$COMMIT_BLOCKS" ]]; then
         COMMIT_CONTEXT="$COMMIT_BLOCKS"
@@ -420,10 +484,68 @@ if [[ "$INCLUDE_COMMITS" == "1" ]]; then
     fi
 fi
 
+RUN_DIR=$(mktemp -d "${STATE_DIR}/.resolution-run.XXXXXX")
+chmod 700 "$RUN_DIR"
+TMPFILE="${RUN_DIR}/generated.md"
+ERRFILE="${RUN_DIR}/claude.err"
+MANIFEST_FILE="${RUN_DIR}/manifest.json"
+RESOLUTION_CONTEXT_FILE="${RUN_DIR}/resolution-context.txt"
+VALIDATED_FILE="${RUN_DIR}/validated.md"
+NEXT_STATE_FILE="${RUN_DIR}/next-state.json"
+
+cleanup_run_dir() {
+    if [[ -n "${RUN_DIR:-}" && "$RUN_DIR" == "${STATE_DIR}/.resolution-run."* ]]; then
+        rm -rf -- "$RUN_DIR"
+    fi
+}
+trap cleanup_run_dir EXIT
+
+RESOLUTION_CONTEXT=""
+if [[ "$RESOLUTION_TRACKING" == "1" ]]; then
+    REPO_ARGS=()
+    PRIOR_SUMMARY_ARGS=()
+    for repo_root in "${REPO_ROOTS[@]}"; do
+        REPO_ARGS+=(--repo "$repo_root")
+    done
+    LATEST_ARCHIVE=""
+    LATEST_ARCHIVE_KEY=""
+    for archive_candidate in "${ARCHIVE_DIR}"/summary-*.md; do
+        archive_name=${archive_candidate##*/}
+        if [[ -f "$archive_candidate" ]] && \
+            [[ "$archive_name" =~ ^summary-[0-9]{4}-[0-9]{2}-[0-9]{2}_([0-9]{4}-[0-9]{2}-[0-9]{2})(-([0-9]{6}))?\.md$ ]]; then
+            archive_key="${BASH_REMATCH[1]}:${BASH_REMATCH[3]:-000000}:${archive_name}"
+        else
+            continue
+        fi
+        if [[ -z "$LATEST_ARCHIVE_KEY" || "$archive_key" > "$LATEST_ARCHIVE_KEY" ]]; then
+            LATEST_ARCHIVE="$archive_candidate"
+            LATEST_ARCHIVE_KEY="$archive_key"
+        fi
+    done
+    if [[ -n "$LATEST_ARCHIVE" ]]; then
+        PRIOR_SUMMARY_ARGS=(--prior-summary "$LATEST_ARCHIVE")
+    fi
+    if ! "$RESOLUTION_TRACKER" prepare \
+        --summary "$SUMMARY_FILE" \
+        "${PRIOR_SUMMARY_ARGS[@]}" \
+        --prepared-on "$DATE" \
+        --state "$UNRESOLVED_STATE_FILE" \
+        --manifest "$MANIFEST_FILE" \
+        --context "$RESOLUTION_CONTEXT_FILE" \
+        "${REPO_ARGS[@]}" >> "$LOGFILE" 2>&1; then
+        echo "[$DATE] resolution tracker prepare failed" >> "$LOGFILE"
+        echo "[$DATE] ===== 완료 (resolution prepare 실패) =====" >> "$LOGFILE"
+        exit 0
+    fi
+    if [[ -s "$RESOLUTION_CONTEXT_FILE" ]]; then
+        RESOLUTION_CONTEXT=$(<"$RESOLUTION_CONTEXT_FILE")
+    fi
+fi
+
 PROMPT=$(cat <<PROMPT_END
 당신은 업무 세션 정리 비서입니다. 오늘: ${DATE}, 검색 시작일: ${SEARCH_FROM}
 
-세 종류의 사실 컨텍스트가 사전 추출되어 아래에 제공됩니다. 추가 도구 호출 없이 이 컨텍스트만으로 종합 요약하세요.
+네 종류의 사실 컨텍스트가 사전 추출되어 아래에 제공됩니다. 추가 도구 호출 없이 이 컨텍스트만으로 종합 요약하세요.
 
 ### A. Claude Code 세션 (이미 추출됨)
 컬럼: 시작시각 / 작업디렉토리 / count(동일시드프롬프트반복횟수) / 세션ID(8자) / 첫_user_메시지(300자)
@@ -449,10 +571,20 @@ ${OPENCODE_CONTEXT:-(opencode 세션 없음 또는 비활성)}
 ${COMMIT_CONTEXT:-(커밋 없음 또는 비활성)}
 \`\`\`
 
+### D. 이전 미완료 항목과 resolution 후보 (사전 검증됨)
+각 ITEM은 반드시 정확히 한 번 출력하세요. CANDIDATE가 없거나 STATUS가 ready가 아니면 해결 처리하지 마세요.
+\`\`\`
+${RESOLUTION_CONTEXT:-(이전 미완료 항목 없음 또는 추적 비활성)}
+\`\`\`
+
 ## 요약 작성 규칙
 - A·B를 종합해 같은 프로젝트(=같은 디렉토리/주제)는 한 항목으로 통합. 도구 구분이 필요하면 \`[cc]\`/\`[oc]\` 태그를 붙이세요.
 - 같은 git repo를 두 PC에서 작업했으면 한 항목으로 통합하고 호스트 차이만 짧게 메모.
-- A·B·C 모두 비어있으면 아무 출력도 하지 마세요 (빈 출력).
+- A·B·C가 모두 비어 있고 D에 ITEM도 없으면 아무 출력도 하지 마세요 (빈 출력).
+- D의 기존 ITEM은 누락·중복 없이 정확히 한 번 출력하고 숨은 unresolved-id를 그대로 다음 줄에 복사하세요.
+- 해결 표시는 해당 ITEM에 나열된 CANDIDATE SHA만 사용하세요. 커밋 제목만으로 해결 처리 금지이며 diff 근거가 실제 항목을 해결한다고 판단될 때만 \`[x]\`로 바꾸세요.
+- 기존 ITEM의 원문·프로젝트·우선순위·숫자·단위·코드 심볼은 절대 변경하지 마세요. 숫자 집계·환산·반올림과 조수사(개/건/회) 변경도 금지합니다.
+- 검증 불가, 후보 없음, 판단 불충분이면 원본 \`[ ]\` 줄과 unresolved-id를 그대로 출력하세요.
 - 중요: 구분선(---)부터 바로 시작. 다른 설명/인사/상태 보고 없이 형식만 출력.
 
 ## 출력 형식
@@ -470,6 +602,11 @@ ${COMMIT_CONTEXT:-(커밋 없음 또는 비활성)}
 
 ### 미완료 항목
 - [ ] 항목 — 프로젝트 — 우선순위(높/중/낮)
+<!-- unresolved-id:unresolved-12자리hex -->
+
+해결된 기존 ITEM만 다음 형식을 사용:
+- [x] 원본 항목 — 원본 프로젝트 [resolved by D에 제시된 SHA]
+<!-- unresolved-id:기존 ITEM의 동일 ID -->
 
 ### 기술 메모
 세션 중 발견된 중요한 기술 사항 (없으면 생략).
@@ -485,11 +622,6 @@ if (( PROMPT_BYTES > MAX_INPUT_BYTES )); then
 fi
 
 echo "[$DATE] Claude 실행 시작 model=${CLAUDE_MODEL} effort=${CLAUDE_EFFORT} input_bytes=${PROMPT_BYTES} max_input_bytes=${MAX_INPUT_BYTES} timeout_seconds=${TIMEOUT_SECONDS} kill_after_seconds=${TIMEOUT_KILL_AFTER_SECONDS}" >> "$LOGFILE"
-
-# 임시 파일에 당일 요약 생성
-TMPFILE=$(mktemp)
-ERRFILE=$(mktemp)
-trap 'rm -f "$TMPFILE" "$ERRFILE"' EXIT
 
 # claude 호출 실패와 "작업 없음(빈 출력)"을 구분하기 위해 exit code 분리 캡처
 set +e
@@ -521,11 +653,12 @@ if [[ $CLAUDE_EXIT -ne 0 ]]; then
     exit 0
 fi
 
-# 빈 결과면 헤더만 기록 (날짜 누락 방지 + 작업 없음 가시화)
-if [[ ! -s "$TMPFILE" ]] || ! grep -q '[^[:space:]]' "$TMPFILE"; then
-    echo "[$DATE] 검색된 세션 없음 — 헤더만 기록" >> "$LOGFILE"
-    ensure_header
-    cat >> "$SUMMARY_FILE" <<EOF
+# 진단 토글에서는 기존 direct-append 동작을 그대로 유지한다.
+if [[ "$RESOLUTION_TRACKING" == "0" ]]; then
+    if [[ ! -s "$TMPFILE" ]] || ! grep -q '[^[:space:]]' "$TMPFILE"; then
+        echo "[$DATE] 검색된 세션 없음 — 헤더만 기록" >> "$LOGFILE"
+        ensure_header
+        cat >> "$SUMMARY_FILE" <<EOF
 
 ---
 
@@ -533,16 +666,50 @@ if [[ ! -s "$TMPFILE" ]] || ! grep -q '[^[:space:]]' "$TMPFILE"; then
 
 _(작업 없음)_
 EOF
-    echo "[$DATE] ===== 완료 (빈 헤더) =====" >> "$LOGFILE"
+        echo "[$DATE] ===== 완료 (빈 헤더) =====" >> "$LOGFILE"
+        exit 0
+    fi
+
+    ensure_header
+    echo "" >> "$SUMMARY_FILE"
+    cat "$TMPFILE" >> "$SUMMARY_FILE"
+    echo "[$DATE] 요약 추가 완료: $(date)" >> "$LOGFILE"
+    echo "[$DATE] ===== 전체 완료 =====" >> "$LOGFILE"
     exit 0
 fi
 
-# 헤더가 없으면 생성
-ensure_header
+# 빈 모델 출력도 이전 open item/state를 잃지 않도록 검증 가능한 일일 골격으로 바꾼다.
+if [[ ! -s "$TMPFILE" ]] || ! grep -q '[^[:space:]]' "$TMPFILE"; then
+    cat > "$TMPFILE" <<EOF
+---
 
-# 당일 요약 누적 추가
+## ${DATE} (${SEARCH_FROM} ~ ${DATE})
+
+_(작업 없음)_
+
+### 미완료 항목
+EOF
+fi
+
+if ! "$RESOLUTION_TRACKER" reconcile \
+    --generated "$TMPFILE" \
+    --manifest "$MANIFEST_FILE" \
+    --validated "$VALIDATED_FILE" \
+    --next-state "$NEXT_STATE_FILE" >> "$LOGFILE" 2>&1; then
+    echo "[$DATE] resolution tracker reconcile failed" >> "$LOGFILE"
+    append_failure_summary other
+    echo "[$DATE] ===== 완료 (resolution reconcile 실패) =====" >> "$LOGFILE"
+    exit 0
+fi
+
+ensure_header
 echo "" >> "$SUMMARY_FILE"
-cat "$TMPFILE" >> "$SUMMARY_FILE"
+cat "$VALIDATED_FILE" >> "$SUMMARY_FILE"
+
+if ! mv -fT "$NEXT_STATE_FILE" "$UNRESOLVED_STATE_FILE"; then
+    echo "[$DATE] resolution state replace failed after summary append" >> "$LOGFILE"
+    exit 1
+fi
 
 echo "[$DATE] 요약 추가 완료: $(date)" >> "$LOGFILE"
 echo "[$DATE] ===== 전체 완료 =====" >> "$LOGFILE"

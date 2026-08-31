@@ -72,8 +72,16 @@ esac
 
 if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+elif [[ -n "${CLAUDE_STUB_OUTPUT_FILE:-}" && -f "$CLAUDE_STUB_OUTPUT_FILE" ]]; then
+    /bin/cat "$CLAUDE_STUB_OUTPUT_FILE"
 else
-    printf '%s\n' '---' '' '## stub summary' '' '### 작업 내역' '- **stub**: 완료'
+    today=$(date +%Y-%m-%d)
+    yesterday=$(date -d yesterday +%Y-%m-%d)
+    printf '%s\n' \
+        '---' '' \
+        "## ${today} (${yesterday} ~ ${today})" '' \
+        '### 작업 내역' '- **stub**: 완료' '' \
+        '### 미완료 항목'
 fi
 EOF
 chmod +x "$STUB_CLAUDE"
@@ -143,6 +151,10 @@ run_session_summary() {
     local kill_after_seconds=${6:-1}
     local runtime_case="/mnt/${case_dir##*/}"
     local runtime_stub="/mnt/claude-stub"
+    local runtime_tracker="${REPO_ROOT}/session-summary/resolution-tracker.py"
+    if [[ -n "${TEST_TRACKER_BASENAME:-}" ]]; then
+        runtime_tracker="${runtime_case}/${TEST_TRACKER_BASENAME}"
+    fi
 
     sandbox_run "$case_dir" \
         "$SESSION_SUMMARY_SCRIPT" \
@@ -150,17 +162,22 @@ run_session_summary() {
         CLAUDE_STUB_CALLS="${runtime_case}/calls" \
         CLAUDE_STUB_MODE="$mode" \
         CLAUDE_STUB_SLEEP="$sleep_seconds" \
+        CLAUDE_STUB_OUTPUT_FILE="${runtime_case}/stub-output" \
         CLAUDE_BIN="$runtime_stub" \
         SESSION_SUMMARY_MODULE_DIR="${runtime_case}/module" \
         SESSION_SUMMARY_LOCK_FILE="${runtime_case}/tmp/session-summary.lock" \
+        SESSION_SUMMARY_RESOLUTION_TRACKER="$runtime_tracker" \
+        SESSION_SUMMARY_RESOLUTION_TRACKING="${TEST_RESOLUTION_TRACKING:-1}" \
         SESSION_SUMMARY_MAX_INPUT_BYTES="$max_input_bytes" \
         SESSION_SUMMARY_TIMEOUT_SECONDS="$timeout_seconds" \
         SESSION_SUMMARY_TIMEOUT_KILL_AFTER_SECONDS="$kill_after_seconds" \
         SESSION_SUMMARY_QUOTA_BACKOFF_SECONDS="${TEST_QUOTA_BACKOFF_SECONDS:-21600}" \
         SESSION_SUMMARY_AUTH_BACKOFF_SECONDS="${TEST_AUTH_BACKOFF_SECONDS:-86400}" \
         INCLUDE_OPENCODE=0 \
-        INCLUDE_CC=0 \
-        INCLUDE_COMMITS=0 \
+        OPENCODE_DB="${runtime_case}/opencode.db" \
+        INCLUDE_CC="${TEST_INCLUDE_CC:-0}" \
+        CC_PROJECTS_DIR="${runtime_case}/cc-projects" \
+        INCLUDE_COMMITS="${TEST_INCLUDE_COMMITS:-0}" \
         REMOTE_HOSTS=" "
 }
 
@@ -172,7 +189,8 @@ run_session_rotate() {
         "$SESSION_SUMMARY_SCRIPT" \
         env \
         SESSION_SUMMARY_MODULE_DIR="${runtime_case}/module" \
-        SESSION_SUMMARY_LOCK_FILE="${runtime_case}/tmp/session-summary.lock"
+        SESSION_SUMMARY_LOCK_FILE="${runtime_case}/tmp/session-summary.lock" \
+        SESSION_SUMMARY_RESOLUTION_TRACKING="${TEST_RESOLUTION_TRACKING:-1}"
 }
 
 call_count() {
@@ -201,6 +219,93 @@ assert_contains() {
         printf '  missing %q in %s\n' "$literal" "$file" >&2
         return 1
     fi
+}
+
+assert_not_contains() {
+    local file=$1
+    local literal=$2
+    if grep -Fq -- "$literal" "$file"; then
+        printf '  unexpected %q in %s\n' "$literal" "$file" >&2
+        return 1
+    fi
+}
+
+seed_resolution_case() {
+    local case_dir=$1
+    local repo="${case_dir}/gstApp"
+    local runtime_case="/mnt/${case_dir##*/}"
+    local runtime_repo="${runtime_case}/gstApp"
+    local open_date fix_date today session_time
+    open_date=$(date -d '3 days ago' +%Y-%m-%d)
+    fix_date=$(date -d yesterday +%Y-%m-%d)
+    today=$(date +%Y-%m-%d)
+    session_time="${fix_date}T12:00:00+09:00"
+
+    mkdir -p "${repo}/src" "${case_dir}/cc-projects/project"
+    git -C "$repo" init -q
+    git -C "$repo" config user.name 'Resolution Shell Test'
+    git -C "$repo" config user.email 'resolution-shell@example.test'
+    printf '%s\n' 'void configure(void) { arg.cam[i].bps = 4096; }' \
+        > "${repo}/src/config.c"
+    git -C "$repo" add src/config.c
+    GIT_AUTHOR_DATE="${open_date}T12:00:00+0900" \
+        GIT_COMMITTER_DATE="${open_date}T12:00:00+0900" \
+        git -C "$repo" commit -q -m 'feat: initial camera config'
+    printf '%s\n' \
+        'void configure(void) { arg.cam[i].bps = json_array_length(node); }' \
+        > "${repo}/src/config.c"
+    git -C "$repo" add src/config.c
+    GIT_AUTHOR_DATE="${fix_date}T12:00:00+0900" \
+        GIT_COMMITTER_DATE="${fix_date}T12:00:00+0900" \
+        git -C "$repo" commit -q -m 'chore: build directory cleanup'
+    SEEDED_FIX_SHA=$(git -C "$repo" rev-parse HEAD)
+    SEEDED_ITEM_ID=$(python3 -c \
+        'import hashlib,sys; print("unresolved-" + hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:12])' \
+        "$open_date" gstApp 'bps 배열 길이 불일치' "$runtime_repo")
+
+    printf '%s\n' \
+        '# Claude 세션 요약' '' \
+        '> 자동 생성 파일.' '' \
+        "## ${open_date} (${open_date} ~ ${open_date})" '' \
+        '### 미완료 항목' \
+        '- [ ] bps 배열 길이 불일치 — gstApp — 중' \
+        > "${case_dir}/module/logs/session-summary.md"
+
+    printf '{"type":"user","timestamp":"%s","sessionId":"resolution-shell-session","cwd":"%s","message":{"content":"bps 설정 수정"}}\n' \
+        "$session_time" "$runtime_repo" \
+        > "${case_dir}/cc-projects/project/session.jsonl"
+
+    printf '%s\n' \
+        '---' '' \
+        "## ${today} (${fix_date} ~ ${today})" '' \
+        '### 작업 내역' \
+        '- **gstApp**: 설정 검증 수정' '' \
+        '### 미완료 항목' \
+        "- [x] bps 배열 길이 불일치 — gstApp [resolved by ${SEEDED_FIX_SHA:0:7}]" \
+        "<!-- unresolved-id:${SEEDED_ITEM_ID} -->" \
+        > "${case_dir}/stub-output"
+}
+
+make_tracker_stub() {
+    local case_dir=$1
+    local mode=$2
+    local target="${case_dir}/tracker-stub"
+    printf '%s\n' '#!/bin/bash' 'set -u' > "$target"
+    case "$mode" in
+        prepare-fail)
+            printf '%s\n' 'exit 1' >> "$target"
+            ;;
+        reconcile-fail)
+            printf '%s\n' \
+                "if [[ \"\${1:-}\" == \"reconcile\" ]]; then exit 1; fi" \
+                "exec '${REPO_ROOT}/session-summary/resolution-tracker.py' \"\$@\"" \
+                >> "$target"
+            ;;
+        always-fail)
+            printf '%s\n' 'exit 1' >> "$target"
+            ;;
+    esac
+    chmod +x "$target"
 }
 
 test_cli_init_uses_non_generative_auth_status() {
@@ -401,11 +506,106 @@ test_summary_rotate_waits_for_running_summary() {
         printf '  rotate did not archive the completed summary\n' >&2
         return 1
     fi
-    assert_contains "$archive_file" '## stub summary' || return 1
+    assert_contains "$archive_file" '- **stub**: 완료' || return 1
     if [[ -e "${case_dir}/module/logs/session-summary.md" ]]; then
         printf '  rotate left the completed summary in the active file\n' >&2
         return 1
     fi
+}
+
+test_summary_recovers_open_item_from_latest_archive_after_rotate() {
+    local case_dir marker summary state
+    case_dir=$(new_case)
+    marker='unresolved-555555555555'
+    summary="${case_dir}/module/logs/session-summary.md"
+    state="${case_dir}/module/state/unresolved-items.json"
+    printf '%s\n' \
+        '# Claude 세션 요약' '' \
+        '## 2026-05-09 (2026-05-08 ~ 2026-05-09)' '' \
+        '### 미완료 항목' \
+        '- [ ] 주간 이월 확인 — unknown — 중' \
+        "<!-- unresolved-id:${marker} -->" \
+        > "$summary"
+    printf '%s\n' \
+        "{\"schema\":1,\"items\":[{\"id\":\"${marker}\",\"text\":\"주간 이월 확인\",\"project\":\"unknown\",\"priority\":\"중\",\"opened_on\":\"2026-05-09\",\"identity_repo_key\":\"unmapped:1\",\"repo_path\":null,\"baseline_head\":null,\"status\":\"open\",\"resolution\":null,\"verification\":\"repo-unmapped\"}]}" \
+        > "$state"
+
+    run_session_rotate "$case_dir" >/dev/null 2>&1 || return 1
+
+    assert_contains "$summary" '- [ ] 주간 이월 확인 — unknown — 중' || return 1
+    assert_contains "$summary" "<!-- unresolved-id:${marker} -->" || return 1
+    run_session_summary "$case_dir" >/dev/null 2>&1 || return 1
+
+    assert_contains "$summary" '- [ ] 주간 이월 확인 — unknown — 중 [검증 필요]' || return 1
+    assert_contains "$summary" "<!-- unresolved-id:${marker} -->" || return 1
+    python3 - "$state" "$marker" <<'PY' || return 1
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(state["items"]) == 1
+assert state["items"][0]["id"] == sys.argv[2]
+assert state["items"][0]["status"] == "open"
+PY
+}
+
+test_summary_rejects_invalid_tracking_config_before_rotate() {
+    local case_dir summary original
+    case_dir=$(new_case)
+    summary="${case_dir}/module/logs/session-summary.md"
+    original="${case_dir}/original-summary.md"
+    printf '%s\n' \
+        '# Claude 세션 요약' '' \
+        '## 2026-05-09 (2026-05-08 ~ 2026-05-09)' '' \
+        '### 미완료 항목' \
+        '- [ ] 설정 검증 — unknown — 중' \
+        > "$summary"
+    cp "$summary" "$original"
+
+    if TEST_RESOLUTION_TRACKING=invalid \
+        run_session_rotate "$case_dir" >/dev/null 2>&1; then
+        printf '  rotate accepted invalid tracking config\n' >&2
+        return 1
+    fi
+    cmp -s "$original" "$summary" || {
+        printf '  rotate mutated summary before config validation\n' >&2
+        return 1
+    }
+    if find "${case_dir}/module/archive" -type f -name 'summary-*.md' | grep -q .; then
+        printf '  rotate archived summary before config validation\n' >&2
+        return 1
+    fi
+}
+
+test_summary_selects_prior_archive_by_period_not_mtime() {
+    local case_dir marker summary state old_archive latest_archive
+    case_dir=$(new_case)
+    marker='unresolved-666666666666'
+    summary="${case_dir}/module/logs/session-summary.md"
+    state="${case_dir}/module/state/unresolved-items.json"
+    old_archive="${case_dir}/module/archive/summary-2026-08-13_2026-08-19.md"
+    latest_archive="${case_dir}/module/archive/summary-2026-08-20_2026-08-26.md"
+    printf '%s\n' '# Claude 세션 요약' > "$summary"
+    printf '%s\n' \
+        '# Claude 세션 요약' '' \
+        '## 2026-08-19 (2026-08-18 ~ 2026-08-19)' '' \
+        '### 미완료 항목' \
+        > "$old_archive"
+    printf '%s\n' \
+        '# Claude 세션 요약' '' \
+        '## 2026-08-25 (2026-08-24 ~ 2026-08-25)' '' \
+        '### 미완료 항목' \
+        '- [ ] archive period 확인 — unknown — 중' \
+        "<!-- unresolved-id:${marker} -->" \
+        > "$latest_archive"
+    touch -d '2030-01-01 00:00:00' "$old_archive"
+    touch -d '2020-01-01 00:00:00' "$latest_archive"
+    printf '%s\n' \
+        "{\"schema\":1,\"items\":[{\"id\":\"${marker}\",\"text\":\"archive period 확인\",\"project\":\"unknown\",\"priority\":\"중\",\"opened_on\":\"2026-08-25\",\"identity_repo_key\":\"unmapped:1\",\"repo_path\":null,\"baseline_head\":null,\"status\":\"open\",\"resolution\":null,\"verification\":\"repo-unmapped\"}]}" \
+        > "$state"
+
+    run_session_summary "$case_dir" >/dev/null 2>&1 || return 1
+
+    assert_contains "$summary" '- [ ] archive period 확인 — unknown — 중 [검증 필요]' || return 1
+    assert_contains "$summary" "<!-- unresolved-id:${marker} -->"
 }
 
 test_summary_rejects_oversized_prompt_without_model_call() {
@@ -429,6 +629,127 @@ test_summary_rejects_invalid_numeric_config_before_model_call() {
     run_session_summary "$case_dir" success bad >/dev/null 2>&1 || return 1
     assert_equals 0 "$(call_count "${case_dir}/calls")" "invalid input config model calls" || return 1
     assert_contains "${case_dir}/module/logs/summary.log" 'class=other invalid_config=SESSION_SUMMARY_MAX_INPUT_BYTES'
+}
+
+test_summary_publishes_supported_resolution_and_state_once() {
+    local case_dir summary state calls
+    case_dir=$(new_case)
+    seed_resolution_case "$case_dir"
+
+    TEST_INCLUDE_CC=1 run_session_summary "$case_dir" >/dev/null 2>&1 || return 1
+
+    summary="${case_dir}/module/logs/session-summary.md"
+    state="${case_dir}/module/state/unresolved-items.json"
+    calls="${case_dir}/calls"
+    assert_equals 1 "$(call_count "$calls")" "supported resolution calls" || return 1
+    assert_equals 1 "$(grep -Fc -- "[resolved by ${SEEDED_FIX_SHA:0:7}]" "$summary")" \
+        "supported resolution publication" || return 1
+    assert_contains "$summary" "<!-- unresolved-id:${SEEDED_ITEM_ID} -->" || return 1
+    python3 - "$state" "$SEEDED_FIX_SHA" <<'PY' || return 1
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(state["items"]) == 1
+assert state["items"][0]["status"] == "resolved"
+assert state["items"][0]["resolution"]["commit"] == sys.argv[2]
+PY
+    assert_contains "$calls" "ITEM ${SEEDED_ITEM_ID}" || return 1
+    assert_contains "$calls" "CANDIDATE ${SEEDED_FIX_SHA:0:7}" || return 1
+    assert_contains "$calls" '커밋 제목만으로 해결 처리 금지' || return 1
+    assert_contains "$calls" '숫자·단위·코드 심볼' || return 1
+}
+
+test_summary_downgrades_unsupported_resolution() {
+    local case_dir summary state
+    case_dir=$(new_case)
+    seed_resolution_case "$case_dir"
+    sed -i "s/${SEEDED_FIX_SHA:0:7}/deadbee/" "${case_dir}/stub-output"
+
+    TEST_INCLUDE_CC=1 run_session_summary "$case_dir" >/dev/null 2>&1 || return 1
+
+    summary="${case_dir}/module/logs/session-summary.md"
+    state="${case_dir}/module/state/unresolved-items.json"
+    assert_equals 1 "$(call_count "${case_dir}/calls")" "unsupported resolution calls" || return 1
+    assert_contains "$summary" '- [ ] bps 배열 길이 불일치 — gstApp — 중 [검증 필요]' || return 1
+    assert_not_contains "$summary" '[resolved by deadbee]' || return 1
+    python3 - "$state" <<'PY' || return 1
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(state["items"]) == 1
+assert state["items"][0]["status"] == "open"
+PY
+}
+
+test_summary_prepare_failure_skips_model_and_publication() {
+    local case_dir
+    case_dir=$(new_case)
+    make_tracker_stub "$case_dir" prepare-fail
+
+    TEST_TRACKER_BASENAME=tracker-stub run_session_summary "$case_dir" >/dev/null 2>&1 || true
+
+    assert_equals 0 "$(call_count "${case_dir}/calls")" "prepare failure calls" || return 1
+    assert_contains "${case_dir}/module/logs/summary.log" 'resolution tracker prepare failed' || return 1
+    if [[ -e "${case_dir}/module/logs/session-summary.md" ]]; then
+        printf '  prepare failure published a summary\n' >&2
+        return 1
+    fi
+}
+
+test_summary_reconcile_failure_never_publishes_generated_output() {
+    local case_dir summary
+    case_dir=$(new_case)
+    make_tracker_stub "$case_dir" reconcile-fail
+
+    TEST_TRACKER_BASENAME=tracker-stub run_session_summary "$case_dir" >/dev/null 2>&1 || true
+
+    summary="${case_dir}/module/logs/session-summary.md"
+    assert_equals 1 "$(call_count "${case_dir}/calls")" "reconcile failure calls" || return 1
+    assert_contains "$summary" '_(요약 실패: other, see logs/summary.log)_' || return 1
+    assert_not_contains "$summary" '- **stub**: 완료' || return 1
+    if [[ -e "${case_dir}/module/state/unresolved-items.json" ]]; then
+        printf '  reconcile failure replaced state\n' >&2
+        return 1
+    fi
+}
+
+test_summary_tracking_toggle_preserves_direct_append() {
+    local case_dir summary
+    case_dir=$(new_case)
+    make_tracker_stub "$case_dir" always-fail
+    printf '%s\n' '---' '' '## direct append sentinel' > "${case_dir}/stub-output"
+
+    TEST_TRACKER_BASENAME=tracker-stub TEST_RESOLUTION_TRACKING=0 \
+        run_session_summary "$case_dir" >/dev/null 2>&1 || return 1
+
+    summary="${case_dir}/module/logs/session-summary.md"
+    assert_equals 1 "$(call_count "${case_dir}/calls")" "disabled tracking calls" || return 1
+    assert_contains "$summary" '## direct append sentinel' || return 1
+    if [[ -e "${case_dir}/module/state/unresolved-items.json" ]]; then
+        printf '  disabled tracking created resolution state\n' >&2
+        return 1
+    fi
+}
+
+test_summary_state_replace_failure_is_not_silent() {
+    local case_dir exit_code summary
+    case_dir=$(new_case)
+    mkdir "${case_dir}/module/state/unresolved-items.json"
+
+    run_session_summary "$case_dir" >/dev/null 2>&1
+    exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        printf '  state replace failure returned success\n' >&2
+        return 1
+    fi
+    summary="${case_dir}/module/logs/session-summary.md"
+    assert_equals 1 "$(call_count "${case_dir}/calls")" "state replace failure calls" || return 1
+    assert_contains "$summary" '- **stub**: 완료' || return 1
+    assert_contains "${case_dir}/module/logs/summary.log" \
+        'resolution state replace failed after summary append' || return 1
+    if [[ ! -d "${case_dir}/module/state/unresolved-items.json" ]]; then
+        printf '  damaged state target was unexpectedly replaced\n' >&2
+        return 1
+    fi
 }
 
 run_test() {
@@ -455,8 +776,17 @@ run_test test_summary_classifies_real_auth_error_corpus
 run_test test_summary_classifies_timeout
 run_test test_summary_hard_kills_term_ignoring_process
 run_test test_summary_rotate_waits_for_running_summary
+run_test test_summary_recovers_open_item_from_latest_archive_after_rotate
+run_test test_summary_rejects_invalid_tracking_config_before_rotate
+run_test test_summary_selects_prior_archive_by_period_not_mtime
 run_test test_summary_rejects_oversized_prompt_without_model_call
 run_test test_summary_rejects_invalid_numeric_config_before_model_call
+run_test test_summary_publishes_supported_resolution_and_state_once
+run_test test_summary_downgrades_unsupported_resolution
+run_test test_summary_prepare_failure_skips_model_and_publication
+run_test test_summary_reconcile_failure_never_publishes_generated_output
+run_test test_summary_tracking_toggle_preserves_direct_append
+run_test test_summary_state_replace_failure_is_not_silent
 
 if (( FAILURES > 0 )); then
     printf '%s test(s) failed\n' "$FAILURES" >&2
