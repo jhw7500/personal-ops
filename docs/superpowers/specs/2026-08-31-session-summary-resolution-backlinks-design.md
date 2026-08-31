@@ -102,7 +102,10 @@ Its public CLI is:
 ```text
 resolution-tracker.py prepare \
   --summary <path> --state <path> --manifest <path> --context <path> \
-  [--repo <absolute-git-root> ...]
+  [--prior-summary <path>] [--repo <absolute-git-root> ...]
+
+resolution-tracker.py carryover \
+  --summary <path> --state <path> --output <path>
 
 resolution-tracker.py reconcile \
   --generated <path> --manifest <path> --validated <path> --next-state <path>
@@ -115,13 +118,16 @@ verification unavailable and never as evidence of completion.
 
 The shell script will:
 
-1. Build an exact local repository list from the already-extracted local session directories.
-2. Create private temporary manifest, context, validated-output, and next-state files.
-3. Run `prepare` before constructing the prompt.
-4. Include the bounded resolution context and explicit output contract in the existing prompt.
-5. Run `reconcile` after a successful model response.
-6. Append only validated output to the summary.
-7. Move the staged state into place after the summary append succeeds.
+1. Before rotation, stage a validated carryover summary containing open items with their original
+   `opened_on` and stable IDs; abort rotation if this cannot be produced.
+2. Select the latest archive by the canonical filename period and collision suffix, never by mtime.
+3. Build an exact local repository list from the already-extracted local session directories.
+4. Create private temporary manifest, context, validated-output, and next-state files.
+5. Run `prepare` before constructing the prompt, with the latest archive as explicit prior evidence.
+6. Include the bounded resolution context and explicit output contract in the existing prompt.
+7. Run `reconcile` after a successful model response.
+8. Append only validated output to the summary.
+9. Move the staged state into place after the summary append succeeds.
 
 No additional Claude call, git fetch, remote lookup, or fallback model is introduced.
 
@@ -335,7 +341,9 @@ to prove resolution by itself.
 
 The existing summary lock covers prepare, model execution, reconcile, summary append, and state
 replace. Rotate continues to wait on the same lock, so the archive and state cannot observe a
-half-published daily summary.
+half-published daily summary. Rotate stages its carryover before moving the archive and keeps each
+open item's original date in the new active summary, so a later state record cannot move the
+historical baseline earlier than summary evidence.
 
 ## 13. Failure behavior
 

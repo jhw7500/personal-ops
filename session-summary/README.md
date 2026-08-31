@@ -10,7 +10,8 @@ Claude Code episodic-memory + opencode SQLite에서 전일 세션을 긁어와 �
   - 이전 `미완료 항목`은 stable ID와 로컬 Git patch 근거를 대조하고, 검증된 경우에만
     resolution commit을 표시
 - **로테이트 모드** (`rotate` 인자): `logs/session-summary.md`를 `archive/summary-<지난수>_<이번화>.md`로 이동
-  - 다음 요약은 최신 archive도 검증 입력으로 읽어 이전 주의 open item을 active summary와 state에 이월
+  - 이동 전에 검증된 open item을 원래 `opened_on`과 stable ID로 새 active summary에 이월
+  - 다음 요약은 mtime이 아니라 파일명의 보고 종료일로 선택한 최신 archive도 검증 입력으로 사용
 
 ## 미완료 항목 resolution 추적
 

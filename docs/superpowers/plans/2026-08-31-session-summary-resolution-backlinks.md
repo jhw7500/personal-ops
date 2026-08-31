@@ -28,7 +28,10 @@ The helper CLI is fixed:
 ```text
 session-summary/resolution-tracker.py prepare \
   --summary PATH --state PATH --manifest PATH --context PATH \
-  [--repo ABSOLUTE_GIT_ROOT ...]
+  [--prior-summary PATH] [--repo ABSOLUTE_GIT_ROOT ...]
+
+session-summary/resolution-tracker.py carryover \
+  --summary PATH --state PATH --output PATH
 
 session-summary/resolution-tracker.py reconcile \
   --generated PATH --manifest PATH --validated PATH --next-state PATH
@@ -85,6 +88,10 @@ The implementation may use internal dataclasses or dictionaries, but these behav
 - `make_item_id(opened_on, project, normalized_text, identity_repo_key)` hashes the exact NUL-separated identity with SHA-256 and returns `unresolved-` plus 12 lowercase hex characters.
 - `run_git(repo, args, timeout, max_output)` uses an argument array, disables color/external diff, rejects nonzero status, timeout, malformed UTF-8 replacement-sensitive output, or output beyond the bound, and returns no partial evidence.
 - `prepare` never mutates the state file. `reconcile` never mutates the summary or state path. The shell owns publication ordering.
+- `carryover` writes a staged active-summary replacement only; rotate publishes it after the prior
+  summary is archived. It preserves summary-proven `opened_on` values and stable IDs.
+- The shell selects `--prior-summary` by the canonical archive end date and optional collision
+  suffix in the filename, not filesystem mtime.
 
 ---
 

@@ -251,6 +251,7 @@ def _state_matches_summary(item: dict[str, Any], summary: SummaryItem) -> bool:
     return (
         common_match
         and item["priority"] == summary.priority
+        and item["opened_on"] == summary.opened_on
     )
 
 
@@ -402,6 +403,43 @@ def _dated_baseline(repo: Repository, opened_on: str) -> str | None:
     return output if SHA_RE.fullmatch(output) else None
 
 
+def _legacy_state_match(
+    summary: SummaryItem,
+    occurrence: int,
+    state_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    matches: list[dict[str, Any]] = []
+    for stored in state_by_id.values():
+        identity_key = stored["identity_repo_key"]
+        if not all(
+            (
+                stored["status"] == "open",
+                stored["text"] == summary.text,
+                stored["project"] == summary.project,
+                stored["priority"] == summary.priority,
+                stored["opened_on"] == summary.opened_on,
+                stored["id"]
+                == make_item_id(
+                    summary.opened_on,
+                    summary.project,
+                    summary.text,
+                    identity_key,
+                ),
+            )
+        ):
+            continue
+        if identity_key.startswith("unmapped:"):
+            try:
+                if int(identity_key.removeprefix("unmapped:")) != occurrence:
+                    continue
+            except ValueError:
+                continue
+        matches.append(stored)
+    if len(matches) > 1:
+        raise TrackerError("ambiguous legacy state match")
+    return matches[0] if matches else None
+
+
 def recover_items(
     summary_items: list[SummaryItem],
     state_by_id: dict[str, dict[str, Any]],
@@ -417,7 +455,11 @@ def recover_items(
         occurrences[occurrence_key] = occurrence
         fallback_identity = f"unmapped:{occurrence}"
         stored = state_by_id.get(summary.marker_id or "")
-        if stored is not None and _state_matches_summary(stored, summary):
+        if summary.marker_id is None:
+            stored = _legacy_state_match(summary, occurrence, state_by_id)
+        if stored is not None and (
+            summary.marker_id is None or _state_matches_summary(stored, summary)
+        ):
             item = dict(stored)
         else:
             if summary.priority is None:
@@ -762,6 +804,58 @@ def prepare(args: argparse.Namespace) -> None:
     _atomic_write(Path(args.context), context_bytes)
 
 
+def _render_carryover(items: list[dict[str, Any]]) -> str:
+    open_items = sorted(
+        (item for item in items if item["status"] == "open"),
+        key=lambda item: (item["opened_on"], item["id"]),
+    )
+    if not open_items:
+        return ""
+    lines = [
+        "# Claude 세션 요약",
+        "",
+        "> 자동 생성 파일. 매주 수요일 09:10 로테이트.",
+    ]
+    current_date = ""
+    for item in open_items:
+        if item["opened_on"] != current_date:
+            current_date = item["opened_on"]
+            lines.extend(
+                (
+                    "",
+                    "---",
+                    "",
+                    f"## {current_date} (주간 이월)",
+                    "",
+                    "### 미완료 항목",
+                )
+            )
+        lines.extend(
+            (
+                f"- [ ] {item['text']} — {item['project']} — {item['priority']}",
+                f"<!-- unresolved-id:{item['id']} -->",
+            )
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def carryover(args: argparse.Namespace) -> None:
+    summary_path = Path(args.summary)
+    try:
+        markdown = summary_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise TrackerError(f"cannot read summary: {error}") from error
+    items = recover_items(
+        parse_summary(markdown), load_state(Path(args.state)), []
+    )
+    open_count = sum(item["status"] == "open" for item in items)
+    if open_count > OPEN_LIMIT:
+        raise TrackerError(
+            f"open item limit exceeded: {open_count} > {OPEN_LIMIT}"
+        )
+    _atomic_write(Path(args.output), _render_carryover(items).encode("utf-8"))
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1087,6 +1181,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--context", required=True)
     prepare_parser.add_argument("--repo", action="append", default=[])
     prepare_parser.set_defaults(handler=prepare)
+    carryover_parser = subparsers.add_parser("carryover")
+    carryover_parser.add_argument("--summary", required=True)
+    carryover_parser.add_argument("--state", required=True)
+    carryover_parser.add_argument("--output", required=True)
+    carryover_parser.set_defaults(handler=carryover)
     reconcile_parser = subparsers.add_parser("reconcile")
     reconcile_parser.add_argument("--generated", required=True)
     reconcile_parser.add_argument("--manifest", required=True)

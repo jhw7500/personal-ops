@@ -131,6 +131,18 @@ if [[ "${1:-}" == "rotate" ]]; then
     fi
     echo "[$DATE] ===== 로테이트 시작: $(date) =====" >> "$LOGFILE"
     if [[ -s "$SUMMARY_FILE" ]]; then
+        CARRYOVER_FILE=""
+        if [[ "$RESOLUTION_TRACKING" == "1" ]]; then
+            CARRYOVER_FILE="${SUMMARY_FILE}.carryover.$$"
+            if ! "$RESOLUTION_TRACKER" carryover \
+                --summary "$SUMMARY_FILE" \
+                --state "$UNRESOLVED_STATE_FILE" \
+                --output "$CARRYOVER_FILE" >> "$LOGFILE" 2>&1; then
+                rm -f -- "$CARRYOVER_FILE"
+                echo "[$DATE] 로테이트 실패: resolution carryover 생성 실패" >> "$LOGFILE"
+                exit 1
+            fi
+        fi
         # 수요일 09:10 로테이트 기준: 지난 수요일(7일 전) ~ 어제(화요일)
         FIRST_DATE=$(date -d "7 days ago" +%Y-%m-%d)
         LAST_DATE=$(date -d "yesterday" +%Y-%m-%d)
@@ -143,6 +155,13 @@ if [[ "${1:-}" == "rotate" ]]; then
             echo "[$DATE] 주의: 동명 아카이브 존재, 새 이름 사용: ${ARCHIVE_NAME}" >> "$LOGFILE"
         fi
         mv "$SUMMARY_FILE" "$TARGET"
+        if [[ -n "$CARRYOVER_FILE" ]]; then
+            if [[ -s "$CARRYOVER_FILE" ]]; then
+                mv -fT "$CARRYOVER_FILE" "$SUMMARY_FILE"
+            else
+                rm -f -- "$CARRYOVER_FILE"
+            fi
+        fi
         echo "[$DATE] 아카이브 완료: ${ARCHIVE_NAME}" >> "$LOGFILE"
     else
         echo "[$DATE] 로테이트 대상 없음 (파일 비어있거나 없음)" >> "$LOGFILE"
@@ -482,10 +501,18 @@ if [[ "$RESOLUTION_TRACKING" == "1" ]]; then
         REPO_ARGS+=(--repo "$repo_root")
     done
     LATEST_ARCHIVE=""
+    LATEST_ARCHIVE_KEY=""
     for archive_candidate in "${ARCHIVE_DIR}"/summary-*.md; do
+        archive_name=${archive_candidate##*/}
         if [[ -f "$archive_candidate" ]] && \
-            { [[ -z "$LATEST_ARCHIVE" ]] || [[ "$archive_candidate" -nt "$LATEST_ARCHIVE" ]]; }; then
+            [[ "$archive_name" =~ ^summary-[0-9]{4}-[0-9]{2}-[0-9]{2}_([0-9]{4}-[0-9]{2}-[0-9]{2})(-([0-9]{6}))?\.md$ ]]; then
+            archive_key="${BASH_REMATCH[1]}:${BASH_REMATCH[3]:-000000}:${archive_name}"
+        else
+            continue
+        fi
+        if [[ -z "$LATEST_ARCHIVE_KEY" || "$archive_key" > "$LATEST_ARCHIVE_KEY" ]]; then
             LATEST_ARCHIVE="$archive_candidate"
+            LATEST_ARCHIVE_KEY="$archive_key"
         fi
     done
     if [[ -n "$LATEST_ARCHIVE" ]]; then

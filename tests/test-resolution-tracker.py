@@ -269,6 +269,44 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         self.assertEqual(marker_id, items[0]["id"])
         self.assertEqual("2026-05-09", items[0]["opened_on"])
 
+    def test_legacy_open_line_does_not_trust_resolved_state(self) -> None:
+        marker_id = "unresolved-c0bf9d34ba97"
+        self.write_summary(["- [ ] bps 배열 길이 불일치 — gstApp — 중"])
+        self.state.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "items": [
+                        {
+                            "id": marker_id,
+                            "text": "bps 배열 길이 불일치",
+                            "project": "gstApp",
+                            "priority": "중",
+                            "opened_on": "2026-05-09",
+                            "identity_repo_key": "unmapped:1",
+                            "repo_path": None,
+                            "baseline_head": None,
+                            "status": "resolved",
+                            "resolution": {
+                                "commit": "f" * 40,
+                                "resolved_on": "2026-05-10",
+                            },
+                            "verification": "repo-unmapped",
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_prepare()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = self.read_manifest()["items"][0]
+        self.assertEqual("open", item["status"])
+        self.assertIsNone(item["resolution"])
+
     def test_prepare_accepts_exactly_one_hundred_open_items(self) -> None:
         self.write_summary(
             [f"- [ ] open item {index:03d} — unknown — 낮" for index in range(100)]
@@ -528,6 +566,99 @@ class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
         self.assertIsNone(item["repo_path"])
         self.assertIsNone(item["baseline_head"])
         self.assertEqual("repo-ambiguous", item["verification"])
+        self.assertEqual([], item["candidates"])
+
+    def test_legacy_unmapped_identity_survives_later_repository_mapping(self) -> None:
+        repo = self.create_repo()
+        baseline = self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        marker_id = "unresolved-c0bf9d34ba97"
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{marker_id} -->\n",
+            encoding="utf-8",
+        )
+        self.state.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "items": [
+                        {
+                            "id": marker_id,
+                            "text": "bps 배열 길이 불일치",
+                            "project": "gstApp",
+                            "priority": "중",
+                            "opened_on": "2026-05-09",
+                            "identity_repo_key": "unmapped:1",
+                            "repo_path": None,
+                            "baseline_head": None,
+                            "status": "open",
+                            "resolution": None,
+                            "verification": "repo-unmapped",
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        items = json.loads(self.manifest.read_text(encoding="utf-8"))["items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual(marker_id, items[0]["id"])
+        self.assertEqual("unmapped:1", items[0]["identity_repo_key"])
+        self.assertEqual(str(repo.resolve()), items[0]["repo_path"])
+        self.assertEqual(baseline, items[0]["baseline_head"])
+
+    def test_state_cannot_move_opened_on_before_summary_evidence(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-01T12:00:00+0900",
+        )
+        pre_open_fix = self.commit(
+            repo,
+            "fix: pre-open bps change",
+            "void configure(void) { arg.cam[i].bps = json_array_length(node); }\n",
+            "2026-05-05T12:00:00+0900",
+        )
+        marker_id = "unresolved-777777777777"
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-10 (2026-05-09 ~ 2026-05-10)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{marker_id} -->\n",
+            encoding="utf-8",
+        )
+        self.write_state(marker_id, repo, "0" * 40)
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        state["items"][0]["opened_on"] = "2026-05-01"
+        self.state.write_text(
+            json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual("2026-05-10", item["opened_on"])
+        self.assertEqual(pre_open_fix, item["baseline_head"])
         self.assertEqual([], item["candidates"])
 
     def test_nested_or_unlisted_repository_is_not_mapped(self) -> None:

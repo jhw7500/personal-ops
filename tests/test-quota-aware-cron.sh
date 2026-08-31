@@ -530,6 +530,9 @@ test_summary_recovers_open_item_from_latest_archive_after_rotate() {
         > "$state"
 
     run_session_rotate "$case_dir" >/dev/null 2>&1 || return 1
+
+    assert_contains "$summary" '- [ ] 주간 이월 확인 — unknown — 중' || return 1
+    assert_contains "$summary" "<!-- unresolved-id:${marker} -->" || return 1
     run_session_summary "$case_dir" >/dev/null 2>&1 || return 1
 
     assert_contains "$summary" '- [ ] 주간 이월 확인 — unknown — 중 [검증 필요]' || return 1
@@ -541,6 +544,39 @@ assert len(state["items"]) == 1
 assert state["items"][0]["id"] == sys.argv[2]
 assert state["items"][0]["status"] == "open"
 PY
+}
+
+test_summary_selects_prior_archive_by_period_not_mtime() {
+    local case_dir marker summary state old_archive latest_archive
+    case_dir=$(new_case)
+    marker='unresolved-666666666666'
+    summary="${case_dir}/module/logs/session-summary.md"
+    state="${case_dir}/module/state/unresolved-items.json"
+    old_archive="${case_dir}/module/archive/summary-2026-08-13_2026-08-19.md"
+    latest_archive="${case_dir}/module/archive/summary-2026-08-20_2026-08-26.md"
+    printf '%s\n' '# Claude 세션 요약' > "$summary"
+    printf '%s\n' \
+        '# Claude 세션 요약' '' \
+        '## 2026-08-19 (2026-08-18 ~ 2026-08-19)' '' \
+        '### 미완료 항목' \
+        > "$old_archive"
+    printf '%s\n' \
+        '# Claude 세션 요약' '' \
+        '## 2026-08-25 (2026-08-24 ~ 2026-08-25)' '' \
+        '### 미완료 항목' \
+        '- [ ] archive period 확인 — unknown — 중' \
+        "<!-- unresolved-id:${marker} -->" \
+        > "$latest_archive"
+    touch -d '2030-01-01 00:00:00' "$old_archive"
+    touch -d '2020-01-01 00:00:00' "$latest_archive"
+    printf '%s\n' \
+        "{\"schema\":1,\"items\":[{\"id\":\"${marker}\",\"text\":\"archive period 확인\",\"project\":\"unknown\",\"priority\":\"중\",\"opened_on\":\"2026-08-25\",\"identity_repo_key\":\"unmapped:1\",\"repo_path\":null,\"baseline_head\":null,\"status\":\"open\",\"resolution\":null,\"verification\":\"repo-unmapped\"}]}" \
+        > "$state"
+
+    run_session_summary "$case_dir" >/dev/null 2>&1 || return 1
+
+    assert_contains "$summary" '- [ ] archive period 확인 — unknown — 중 [검증 필요]' || return 1
+    assert_contains "$summary" "<!-- unresolved-id:${marker} -->"
 }
 
 test_summary_rejects_oversized_prompt_without_model_call() {
@@ -712,6 +748,7 @@ run_test test_summary_classifies_timeout
 run_test test_summary_hard_kills_term_ignoring_process
 run_test test_summary_rotate_waits_for_running_summary
 run_test test_summary_recovers_open_item_from_latest_archive_after_rotate
+run_test test_summary_selects_prior_archive_by_period_not_mtime
 run_test test_summary_rejects_oversized_prompt_without_model_call
 run_test test_summary_rejects_invalid_numeric_config_before_model_call
 run_test test_summary_publishes_supported_resolution_and_state_once
