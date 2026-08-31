@@ -947,12 +947,33 @@ def prepare(args: argparse.Namespace) -> None:
     _atomic_write(Path(args.context), context_bytes)
 
 
+def _has_published_resolution(item: dict[str, Any]) -> bool:
+    prefix = item.get("_published_resolution_prefix")
+    resolved_on = item.get("_published_resolved_on")
+    return bool(
+        item["status"] == "open"
+        and isinstance(prefix, str)
+        and re.fullmatch(r"[0-9a-f]{7,40}", prefix)
+        and _valid_iso_date(resolved_on)
+    )
+
+
 def _render_carryover(items: list[dict[str, Any]]) -> str:
-    open_items = [item for item in items if item["status"] == "open"]
+    open_items = [
+        item
+        for item in items
+        if item["status"] == "open" and not _has_published_resolution(item)
+    ]
     resolved_items = sorted(
-        (item for item in items if item["status"] == "resolved"),
+        (
+            item
+            for item in items
+            if item["status"] == "resolved" or _has_published_resolution(item)
+        ),
         key=lambda item: (
-            item["resolution"]["resolved_on"] if item["resolution"] else "",
+            item["resolution"]["resolved_on"]
+            if item["resolution"]
+            else item.get("_published_resolved_on", ""),
             item["id"],
         ),
         reverse=True,
@@ -1022,7 +1043,10 @@ def carryover(args: argparse.Namespace) -> None:
     items = recover_items(
         parse_summary(markdown), load_state(Path(args.state)), []
     )
-    open_count = sum(item["status"] == "open" for item in items)
+    open_count = sum(
+        item["status"] == "open" and not _has_published_resolution(item)
+        for item in items
+    )
     if open_count > OPEN_LIMIT:
         raise TrackerError(
             f"open item limit exceeded: {open_count} > {OPEN_LIMIT}"

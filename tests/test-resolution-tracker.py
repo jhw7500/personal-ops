@@ -445,6 +445,119 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         self.assertEqual("manifest sentinel\n", self.manifest.read_text(encoding="utf-8"))
         self.assertEqual("context sentinel\n", self.context.read_text(encoding="utf-8"))
 
+    def test_carryover_caps_published_resolutions_before_open_limit(self) -> None:
+        item_count = 301
+        markers = [f"unresolved-{index:012x}" for index in range(item_count)]
+        commits = [f"{index + 1:040x}" for index in range(item_count)]
+        open_lines = []
+        resolved_lines = []
+        for index, (marker, commit) in enumerate(zip(markers, commits)):
+            open_lines.extend(
+                (
+                    f"- [ ] resolved item {index:03d} — unknown — 낮",
+                    f"<!-- unresolved-id:{marker} -->",
+                )
+            )
+            resolved_lines.extend(
+                (
+                    f"- [x] resolved item {index:03d} — unknown "
+                    f"[resolved by {commit[:7]}]",
+                    f"<!-- unresolved-id:{marker} -->",
+                )
+            )
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-01 (주간 이월)\n\n"
+            "### 미완료 항목\n"
+            + "\n".join(open_lines)
+            + "\n\n## 2026-05-10 (주간 이월)\n\n"
+            "### 미완료 항목\n"
+            + "\n".join(resolved_lines)
+            + "\n",
+            encoding="utf-8",
+        )
+        retained_items = []
+        for index in range(item_count - 200, item_count):
+            retained_items.append(
+                {
+                    "id": markers[index],
+                    "text": f"resolved item {index:03d}",
+                    "project": "unknown",
+                    "priority": "낮",
+                    "opened_on": "2026-05-01",
+                    "identity_repo_key": f"unmapped:{index + 1}",
+                    "repo_path": None,
+                    "baseline_head": None,
+                    "status": "resolved",
+                    "resolution": {
+                        "commit": commits[index],
+                        "resolved_on": "2026-05-10",
+                    },
+                    "verification": "repo-unmapped",
+                }
+            )
+        self.state.write_text(
+            json.dumps(
+                {"schema": 1, "items": retained_items}, ensure_ascii=False
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        carryover = self.root / "carryover.md"
+
+        result = subprocess.run(
+            [
+                "python3",
+                str(TRACKER),
+                "carryover",
+                "--summary",
+                str(self.summary),
+                "--state",
+                str(self.state),
+                "--output",
+                str(carryover),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        carried_text = carryover.read_text(encoding="utf-8")
+        self.assertEqual(200, carried_text.count("[resolved by "))
+        self.assertNotIn(markers[0], carried_text)
+        self.assertIn(markers[-1], carried_text)
+
+    def test_carryover_still_rejects_one_hundred_and_one_open_items(self) -> None:
+        self.write_summary(
+            [f"- [ ] open item {index:03d} — unknown — 낮" for index in range(101)]
+        )
+        carryover = self.root / "carryover.md"
+        carryover.write_text("carryover sentinel\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                "python3",
+                str(TRACKER),
+                "carryover",
+                "--summary",
+                str(self.summary),
+                "--state",
+                str(self.state),
+                "--output",
+                str(carryover),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("open item limit exceeded", result.stderr)
+        self.assertEqual("carryover sentinel\n", carryover.read_text(encoding="utf-8"))
+
     def test_prepare_outputs_are_private(self) -> None:
         self.write_summary(["- [ ] private artifacts — unknown — 낮"])
 
