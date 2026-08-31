@@ -57,6 +57,14 @@ OPEN_RE = re.compile(
 MARKER_RE = re.compile(
     r"^<!-- unresolved-id:(?P<id>unresolved-[0-9a-f]{12}) -->$"
 )
+RESOLVED_RE = re.compile(
+    r"^- \[x\] (?P<text>.+?) — (?P<project>[^—]+?) "
+    r"\[resolved by (?P<sha>[0-9a-f]{7,40})\]$"
+)
+NEW_RESOLVED_RE = re.compile(
+    r"^- \[x\] (?P<text>.+?) — (?P<project>[^—]+?) — "
+    r"(?P<priority>높|중|낮) \[resolved by (?P<sha>[0-9a-f]{7,40})\]$"
+)
 
 
 class TrackerError(RuntimeError):
@@ -67,9 +75,12 @@ class TrackerError(RuntimeError):
 class SummaryItem:
     text: str
     project: str
-    priority: str
+    priority: str | None
     opened_on: str
     marker_id: str | None
+    status: str
+    resolution_prefix: str | None
+    resolved_on: str | None
 
 
 @dataclass(frozen=True)
@@ -118,22 +129,40 @@ def parse_summary(markdown: str) -> list[SummaryItem]:
             continue
 
         open_match = OPEN_RE.match(line)
-        if not open_match:
+        resolved_match = RESOLVED_RE.match(line)
+        if not open_match and not resolved_match:
             continue
         marker_id = None
         if index + 1 < len(lines):
             marker_match = MARKER_RE.match(lines[index + 1])
             if marker_match:
                 marker_id = marker_match.group("id")
-        items.append(
-            SummaryItem(
-                text=normalize_text(open_match.group("text")),
-                project=normalize_text(open_match.group("project")),
-                priority=open_match.group("priority"),
-                opened_on=current_date,
-                marker_id=marker_id,
+        if open_match:
+            items.append(
+                SummaryItem(
+                    text=normalize_text(open_match.group("text")),
+                    project=normalize_text(open_match.group("project")),
+                    priority=open_match.group("priority"),
+                    opened_on=current_date,
+                    marker_id=marker_id,
+                    status="open",
+                    resolution_prefix=None,
+                    resolved_on=None,
+                )
             )
-        )
+        elif marker_id is not None and resolved_match:
+            items.append(
+                SummaryItem(
+                    text=normalize_text(resolved_match.group("text")),
+                    project=normalize_text(resolved_match.group("project")),
+                    priority=None,
+                    opened_on=current_date,
+                    marker_id=marker_id,
+                    status="resolved",
+                    resolution_prefix=resolved_match.group("sha"),
+                    resolved_on=current_date,
+                )
+            )
     return items
 
 
@@ -202,15 +231,57 @@ def load_state(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def _state_matches_summary(item: dict[str, Any], summary: SummaryItem) -> bool:
-    return all(
+    common_match = all(
         (
             item["id"] == summary.marker_id,
             item["text"] == summary.text,
             item["project"] == summary.project,
-            item["priority"] == summary.priority,
-            item["opened_on"] == summary.opened_on,
         )
     )
+    if summary.status == "resolved":
+        resolution = item.get("resolution")
+        return bool(
+            common_match
+            and item["status"] == "resolved"
+            and isinstance(resolution, dict)
+            and isinstance(summary.resolution_prefix, str)
+            and resolution["commit"].startswith(summary.resolution_prefix)
+            and resolution["resolved_on"] == summary.resolved_on
+        )
+    return (
+        common_match
+        and item["priority"] == summary.priority
+        and item["opened_on"] == summary.opened_on
+    )
+
+
+def _collapse_marked_history(summary_items: list[SummaryItem]) -> list[SummaryItem]:
+    collapsed: list[SummaryItem] = []
+    positions: dict[str, int] = {}
+    for summary in summary_items:
+        marker_id = summary.marker_id
+        if marker_id is None or marker_id not in positions:
+            if marker_id is not None:
+                positions[marker_id] = len(collapsed)
+            collapsed.append(summary)
+            continue
+        position = positions[marker_id]
+        previous = collapsed[position]
+        priority = previous.priority if summary.priority is None else summary.priority
+        opened_on = (
+            previous.opened_on if previous.priority is not None else summary.opened_on
+        )
+        collapsed[position] = SummaryItem(
+            text=summary.text,
+            project=summary.project,
+            priority=priority,
+            opened_on=opened_on,
+            marker_id=marker_id,
+            status=summary.status,
+            resolution_prefix=summary.resolution_prefix,
+            resolved_on=summary.resolved_on,
+        )
+    return collapsed
 
 
 def run_git(
@@ -337,6 +408,7 @@ def recover_items(
     state_by_id: dict[str, dict[str, Any]],
     repositories: list[Repository],
 ) -> list[dict[str, Any]]:
+    summary_items = _collapse_marked_history(summary_items)
     occurrences: dict[tuple[str, str, str], int] = {}
     recovered: list[dict[str, Any]] = []
     for summary in summary_items:
@@ -348,6 +420,8 @@ def recover_items(
         if stored is not None and _state_matches_summary(stored, summary):
             item = dict(stored)
         else:
+            if summary.priority is None:
+                continue
             matches = [repo for repo in repositories if repo.name == summary.project]
             mapped_repo = matches[0] if len(matches) == 1 else None
             identity_repo_key = (
@@ -385,6 +459,9 @@ def recover_items(
                     )
                 except TrackerError:
                     item["verification"] = "git-unavailable"
+            if summary.status == "resolved":
+                item["_published_resolution_prefix"] = summary.resolution_prefix
+                item["_published_resolved_on"] = summary.resolved_on
         if item["repo_path"] is None:
             matches = [repo for repo in repositories if repo.name == item["project"]]
             if len(matches) == 1:
@@ -509,9 +586,35 @@ def attach_candidates(
                 if len(candidates) == 5:
                     break
             item["candidates"] = candidates
-        except TrackerError as error:
+        except TrackerError:
             item["candidates"] = []
             item["verification"] = "git-unavailable"
+
+
+def recover_published_resolutions(items: list[dict[str, Any]]) -> None:
+    for item in items:
+        prefix = item.pop("_published_resolution_prefix", None)
+        resolved_on = item.pop("_published_resolved_on", None)
+        if (
+            item["status"] != "open"
+            or not isinstance(prefix, str)
+            or len(prefix) < 7
+            or not _valid_iso_date(resolved_on)
+        ):
+            continue
+        matches = [
+            candidate
+            for candidate in item["candidates"]
+            if candidate["commit"].startswith(prefix)
+        ]
+        if len(matches) != 1:
+            continue
+        item["status"] = "resolved"
+        item["resolution"] = {
+            "commit": matches[0]["commit"],
+            "resolved_on": resolved_on,
+        }
+        item["candidates"] = []
 
 
 def _render_item_card(item: dict[str, Any]) -> str:
@@ -609,6 +712,7 @@ def prepare(args: argparse.Namespace) -> None:
         summary_items, load_state(Path(args.state)), repositories
     )
     attach_candidates(items, repositories)
+    recover_published_resolutions(items)
     apply_context_limits(items)
     open_count = sum(item["status"] == "open" for item in items)
     if open_count > OPEN_LIMIT:
@@ -633,6 +737,320 @@ def prepare(args: argparse.Namespace) -> None:
     _atomic_write(Path(args.context), context_bytes)
 
 
+def load_manifest(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise TrackerError(f"cannot read manifest: {error}") from error
+    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
+        raise TrackerError("unsupported manifest schema")
+    if not isinstance(payload.get("items"), list) or not isinstance(
+        payload.get("repositories"), list
+    ):
+        raise TrackerError("malformed manifest")
+    for item in payload["items"]:
+        if not isinstance(item, dict) or not isinstance(item.get("candidates"), list):
+            raise TrackerError("malformed manifest item")
+        state_item = {field: item.get(field) for field in STATE_FIELDS}
+        if not _valid_state_item(state_item):
+            raise TrackerError("malformed manifest state item")
+        for candidate in item["candidates"]:
+            if (
+                not isinstance(candidate, dict)
+                or set(candidate)
+                != {
+                    "commit",
+                    "short",
+                    "subject",
+                    "matched_tokens",
+                    "path",
+                    "excerpt",
+                }
+                or not SHA_RE.fullmatch(candidate.get("commit", ""))
+                or candidate.get("short") != candidate["commit"][:7]
+                or not isinstance(candidate.get("subject"), str)
+                or not isinstance(candidate.get("matched_tokens"), list)
+                or not all(
+                    isinstance(token, str) and token
+                    for token in candidate["matched_tokens"]
+                )
+                or not isinstance(candidate.get("path"), str)
+                or not isinstance(candidate.get("excerpt"), str)
+            ):
+                raise TrackerError("malformed manifest candidate")
+    return payload
+
+
+def _daily_date(lines: list[str]) -> str:
+    dates = [match.group("date") for line in lines if (match := DATE_HEADING_RE.match(line))]
+    if len(dates) != 1 or not _valid_iso_date(dates[0]):
+        raise TrackerError("generated markdown must contain one daily date heading")
+    return dates[0]
+
+
+def _incomplete_section(lines: list[str]) -> tuple[int, int, bool]:
+    headings = [index for index, line in enumerate(lines) if line == "### 미완료 항목"]
+    if len(headings) > 1:
+        raise TrackerError("generated markdown contains duplicate incomplete sections")
+    if not headings:
+        insertion = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if line == "### 기술 메모"
+            ),
+            len(lines),
+        )
+        return insertion, insertion, False
+    start = headings[0]
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if lines[index].startswith("### "):
+            end = index
+            break
+    return start, end, True
+
+
+def _generated_entries(
+    lines: list[str], start: int, end: int, section_exists: bool
+) -> list[tuple[str, str | None]]:
+    entries: list[tuple[str, str | None]] = []
+    index = start + 1 if section_exists else start
+    while index < end:
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        if not line.startswith("- ["):
+            raise TrackerError("unsafe content in generated incomplete section")
+        marker_id = None
+        if index + 1 < end:
+            marker_match = MARKER_RE.match(lines[index + 1])
+            if marker_match:
+                marker_id = marker_match.group("id")
+                index += 1
+        entries.append((line, marker_id))
+        index += 1
+    return entries
+
+
+def _authorized_candidate(
+    item: dict[str, Any], prefix: str
+) -> dict[str, Any] | None:
+    if len(prefix) < 7:
+        return None
+    matches = [
+        candidate
+        for candidate in item["candidates"]
+        if candidate["commit"].startswith(prefix)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _state_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {field: item[field] for field in STATE_FIELDS}
+
+
+def _manifest_repositories(manifest: dict[str, Any]) -> list[Repository]:
+    repositories: list[Repository] = []
+    for record in manifest["repositories"]:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"path", "name", "head"}
+            or not isinstance(record["path"], str)
+            or not Path(record["path"]).is_absolute()
+            or not isinstance(record["name"], str)
+            or not record["name"]
+            or not SHA_RE.fullmatch(record.get("head", ""))
+        ):
+            raise TrackerError("malformed manifest repository")
+        repositories.append(
+            Repository(
+                path=Path(record["path"]),
+                name=record["name"],
+                head=record["head"],
+            )
+        )
+    return repositories
+
+
+def _new_open_item(
+    match: re.Match[str],
+    opened_on: str,
+    repositories: list[Repository],
+    occurrence: int,
+) -> dict[str, Any]:
+    text = normalize_text(match.group("text"))
+    project = normalize_text(match.group("project"))
+    priority = match.group("priority")
+    matches = [repo for repo in repositories if repo.name == project]
+    mapped_repo = matches[0] if len(matches) == 1 else None
+    identity_repo_key = (
+        str(mapped_repo.path) if mapped_repo is not None else f"unmapped:{occurrence}"
+    )
+    return {
+        "id": make_item_id(opened_on, project, text, identity_repo_key),
+        "text": text,
+        "project": project,
+        "priority": priority,
+        "opened_on": opened_on,
+        "identity_repo_key": identity_repo_key,
+        "repo_path": str(mapped_repo.path) if mapped_repo is not None else None,
+        "baseline_head": mapped_repo.head if mapped_repo is not None else None,
+        "status": "open",
+        "resolution": None,
+        "verification": (
+            "ready"
+            if mapped_repo is not None
+            else "repo-ambiguous"
+            if len(matches) > 1
+            else "repo-unmapped"
+        ),
+    }
+
+
+def reconcile(args: argparse.Namespace) -> None:
+    manifest = load_manifest(Path(args.manifest))
+    try:
+        generated = Path(args.generated).read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise TrackerError(f"cannot read generated markdown: {error}") from error
+    lines = generated.splitlines()
+    resolved_on = _daily_date(lines)
+    section_start, section_end, section_exists = _incomplete_section(lines)
+    generated_entries = _generated_entries(
+        lines, section_start, section_end, section_exists
+    )
+    manifest_ids = {item["id"] for item in manifest["items"]}
+    generated_by_id: dict[str, list[str]] = {}
+    unknown_entries: list[str] = []
+    for line, marker_id in generated_entries:
+        if marker_id in manifest_ids:
+            generated_by_id.setdefault(marker_id, []).append(line)
+        else:
+            unknown_entries.append(line)
+
+    canonical_lines: list[str] = []
+    open_items: list[dict[str, Any]] = []
+    resolved_items: list[dict[str, Any]] = []
+    for manifest_item in manifest["items"]:
+        item = dict(manifest_item)
+        if item["status"] == "resolved":
+            resolved_items.append(_state_item(item))
+            continue
+        generated_lines = generated_by_id.get(item["id"], [])
+        candidate = None
+        exact_open = False
+        if len(generated_lines) == 1:
+            open_match = OPEN_RE.match(generated_lines[0])
+            exact_open = bool(
+                open_match
+                and normalize_text(open_match.group("text")) == item["text"]
+                and normalize_text(open_match.group("project")) == item["project"]
+                and open_match.group("priority") == item["priority"]
+            )
+            resolved_match = RESOLVED_RE.match(generated_lines[0])
+            if (
+                resolved_match
+                and normalize_text(resolved_match.group("text")) == item["text"]
+                and normalize_text(resolved_match.group("project")) == item["project"]
+            ):
+                candidate = _authorized_candidate(item, resolved_match.group("sha"))
+        if candidate is not None:
+            item["status"] = "resolved"
+            item["resolution"] = {
+                "commit": candidate["commit"],
+                "resolved_on": resolved_on,
+            }
+            canonical_lines.extend(
+                (
+                    f"- [x] {item['text']} — {item['project']} "
+                    f"[resolved by {candidate['short']}]",
+                    f"<!-- unresolved-id:{item['id']} -->",
+                )
+            )
+            resolved_items.append(_state_item(item))
+        else:
+            verification_suffix = "" if exact_open else " [검증 필요]"
+            canonical_lines.extend(
+                (
+                    f"- [ ] {item['text']} — {item['project']} — "
+                    f"{item['priority']}{verification_suffix}",
+                    f"<!-- unresolved-id:{item['id']} -->",
+                )
+            )
+            open_items.append(_state_item(item))
+
+    repositories = _manifest_repositories(manifest)
+    occurrence_counts: dict[tuple[str, str, str], int] = {}
+    known_state_ids = {item["id"] for item in open_items + resolved_items}
+    for line in unknown_entries:
+        open_match = OPEN_RE.match(line)
+        downgraded_match = NEW_RESOLVED_RE.match(line)
+        if open_match is None and downgraded_match is None:
+            misplaced_resolved = RESOLVED_RE.match(line)
+            if misplaced_resolved:
+                matching_prior = [
+                    item
+                    for item in manifest["items"]
+                    if item["status"] == "open"
+                    and item["text"]
+                    == normalize_text(misplaced_resolved.group("text"))
+                    and item["project"]
+                    == normalize_text(misplaced_resolved.group("project"))
+                ]
+                if len(matching_prior) == 1:
+                    continue
+            raise TrackerError("unsupported new resolved or malformed open item")
+        match = open_match or downgraded_match
+        assert match is not None
+        identity = (
+            resolved_on,
+            normalize_text(match.group("project")),
+            normalize_text(match.group("text")),
+        )
+        occurrence = occurrence_counts.get(identity, 0) + 1
+        occurrence_counts[identity] = occurrence
+        item = _new_open_item(match, resolved_on, repositories, occurrence)
+        if item["id"] in known_state_ids:
+            continue
+        known_state_ids.add(item["id"])
+        verification_suffix = " [검증 필요]" if downgraded_match else ""
+        canonical_lines.extend(
+            (
+                f"- [ ] {item['text']} — {item['project']} — "
+                f"{item['priority']}{verification_suffix}",
+                f"<!-- unresolved-id:{item['id']} -->",
+            )
+        )
+        open_items.append(item)
+
+    if len(open_items) > OPEN_LIMIT:
+        raise TrackerError(
+            f"open item limit exceeded: {len(open_items)} > {OPEN_LIMIT}"
+        )
+    resolved_items.sort(
+        key=lambda item: (
+            item["resolution"]["resolved_on"] if item["resolution"] else "",
+            item["id"],
+        ),
+        reverse=True,
+    )
+    next_items = open_items + resolved_items[:RESOLVED_LIMIT]
+
+    replacement = ["### 미완료 항목", *canonical_lines]
+    if section_end < len(lines):
+        replacement.append("")
+    validated_lines = lines[:section_start] + replacement + lines[section_end:]
+    validated = "\n".join(validated_lines).rstrip() + "\n"
+    next_state = {"schema": SCHEMA, "items": next_items}
+    state_bytes = (
+        json.dumps(next_state, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    _atomic_write(Path(args.validated), validated.encode("utf-8"))
+    _atomic_write(Path(args.next_state), state_bytes)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -643,6 +1061,12 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--context", required=True)
     prepare_parser.add_argument("--repo", action="append", default=[])
     prepare_parser.set_defaults(handler=prepare)
+    reconcile_parser = subparsers.add_parser("reconcile")
+    reconcile_parser.add_argument("--generated", required=True)
+    reconcile_parser.add_argument("--manifest", required=True)
+    reconcile_parser.add_argument("--validated", required=True)
+    reconcile_parser.add_argument("--next-state", required=True)
+    reconcile_parser.set_defaults(handler=reconcile)
     return parser
 
 

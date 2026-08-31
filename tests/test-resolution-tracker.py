@@ -208,7 +208,7 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         self.assertEqual(0o600, self.context.stat().st_mode & 0o777)
 
 
-class ResolutionTrackerGitTests(unittest.TestCase):
+class TrackerGitFixture:
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
@@ -330,6 +330,8 @@ class ResolutionTrackerGitTests(unittest.TestCase):
             check=False,
         )
 
+
+class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
     def test_generic_subject_with_matching_patch_is_candidate(self) -> None:
         repo = self.create_repo()
         baseline = self.commit(
@@ -547,6 +549,356 @@ class ResolutionTrackerGitTests(unittest.TestCase):
         self.assertEqual([], item["candidates"])
         self.assertEqual("git-unavailable", item["verification"])
         self.assertLessEqual(len(self.context.read_bytes()), 4096)
+
+
+class ResolutionTrackerReconcileTests(TrackerGitFixture, unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.generated = self.root / "generated.md"
+        self.validated = self.root / "validated.md"
+        self.next_state = self.root / "next-state.json"
+
+    def run_reconcile(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "python3",
+                str(TRACKER),
+                "reconcile",
+                "--generated",
+                str(self.generated),
+                "--manifest",
+                str(self.manifest),
+                "--validated",
+                str(self.validated),
+                "--next-state",
+                str(self.next_state),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def prepare_supported_candidate(self) -> tuple[dict, str]:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: initial camera config",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        fix = self.commit(
+            repo,
+            "chore: build directory cleanup",
+            "void configure(void) { arg.cam[i].bps = json_array_length(node); }\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.write_open_summary()
+        prepared = self.run_prepare(repo)
+        self.assertEqual(0, prepared.returncode, prepared.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        return item, fix
+
+    def test_authorized_candidate_resolves_once(self) -> None:
+        item, fix = self.prepare_supported_candidate()
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 작업 내역\n"
+            "- **gstApp**: 설정 검증 수정\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]\n"
+            f"<!-- unresolved-id:{item['id']} -->\n\n"
+            "### 기술 메모\n"
+            "배열 길이는 실제 배열에서 파생한다.\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        validated = self.validated.read_text(encoding="utf-8")
+        resolved_line = (
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]"
+        )
+        self.assertEqual(1, validated.count(resolved_line))
+        self.assertEqual(1, validated.count(f"<!-- unresolved-id:{item['id']} -->"))
+        state = json.loads(self.next_state.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(state["items"]))
+        resolved = state["items"][0]
+        self.assertEqual("resolved", resolved["status"])
+        self.assertEqual(
+            {"commit": fix, "resolved_on": "2026-05-12"},
+            resolved["resolution"],
+        )
+        self.assertNotIn("candidates", resolved)
+
+    def test_exact_unresolved_item_stays_open_without_verification_warning(self) -> None:
+        item, _ = self.prepare_supported_candidate()
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        validated = self.validated.read_text(encoding="utf-8")
+        self.assertIn("- [ ] bps 배열 길이 불일치 — gstApp — 중\n", validated)
+        self.assertNotIn("[검증 필요]", validated)
+        state = json.loads(self.next_state.read_text(encoding="utf-8"))
+        self.assertEqual("open", state["items"][0]["status"])
+
+    def test_missing_incomplete_section_reinserts_prior_item_open(self) -> None:
+        item, _ = self.prepare_supported_candidate()
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 작업 내역\n"
+            "- **gstApp**: 작업함\n\n"
+            "### 기술 메모\n"
+            "근거 없음\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        validated = self.validated.read_text(encoding="utf-8")
+        incomplete_index = validated.index("### 미완료 항목")
+        memo_index = validated.index("### 기술 메모")
+        self.assertLess(incomplete_index, memo_index)
+        self.assertIn(
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중 [검증 필요]",
+            validated,
+        )
+        self.assertIn(f"<!-- unresolved-id:{item['id']} -->", validated)
+
+    def test_new_open_item_is_mapped_and_assigned_prepared_head(self) -> None:
+        repo = self.create_repo()
+        head = self.commit(
+            repo,
+            "feat: baseline",
+            "int retries = 3;\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.summary.write_text("# Claude 세션 요약\n", encoding="utf-8")
+        prepared = self.run_prepare(repo)
+        self.assertEqual(0, prepared.returncode, prepared.stderr)
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] 재시도 정책 점검 — gstApp — 낮\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        state = json.loads(self.next_state.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(state["items"]))
+        item = state["items"][0]
+        self.assertEqual(str(repo.resolve()), item["repo_path"])
+        self.assertEqual(head, item["baseline_head"])
+        self.assertEqual("ready", item["verification"])
+        self.assertRegex(item["id"], r"^unresolved-[0-9a-f]{12}$")
+        validated = self.validated.read_text(encoding="utf-8")
+        self.assertIn(f"<!-- unresolved-id:{item['id']} -->", validated)
+
+    def test_unknown_resolved_item_with_priority_is_downgraded(self) -> None:
+        self.summary.write_text("# Claude 세션 요약\n", encoding="utf-8")
+        prepared = self.run_prepare()
+        self.assertEqual(0, prepared.returncode, prepared.stderr)
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            "- [x] 근거 없는 완료 — unknown — 중 [resolved by deadbee]\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        validated = self.validated.read_text(encoding="utf-8")
+        self.assertIn("- [ ] 근거 없는 완료 — unknown — 중 [검증 필요]", validated)
+        self.assertNotIn("[resolved by deadbee]", validated)
+        state = json.loads(self.next_state.read_text(encoding="utf-8"))
+        self.assertEqual("open", state["items"][0]["status"])
+
+    def test_unparseable_unknown_resolved_item_fails_without_artifacts(self) -> None:
+        self.summary.write_text("# Claude 세션 요약\n", encoding="utf-8")
+        prepared = self.run_prepare()
+        self.assertEqual(0, prepared.returncode, prepared.stderr)
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            "- [x] 필드가 부족한 완료 — unknown [resolved by deadbee]\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(self.validated.exists())
+        self.assertFalse(self.next_state.exists())
+
+    def test_changed_number_unit_and_symbol_cannot_resolve(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        fix = self.commit(
+            repo,
+            "chore: build directory cleanup",
+            "void configure(void) { arg.cam[i].bps = json_array_length(node); }\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.write_open_summary("PASS 5/8, 실패 3건, bps 점검")
+        prepared = self.run_prepare(repo)
+        self.assertEqual(0, prepared.returncode, prepared.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] PASS 10/11, 실패 3개, bitrate 점검 — gstApp [resolved by {fix[:7]}]\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        validated = self.validated.read_text(encoding="utf-8")
+        self.assertIn(
+            "- [ ] PASS 5/8, 실패 3건, bps 점검 — gstApp — 중 [검증 필요]",
+            validated,
+        )
+        self.assertNotIn("10/11", validated)
+        self.assertNotIn("3개", validated)
+        self.assertNotIn("bitrate", validated)
+
+    def test_resolved_marker_and_state_are_retained_by_next_prepare(self) -> None:
+        item, _ = self.prepare_supported_candidate()
+        candidate = item["candidates"][0]
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {candidate['short']}]\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+        reconciled = self.run_reconcile()
+        self.assertEqual(0, reconciled.returncode, reconciled.stderr)
+        self.summary.write_bytes(self.validated.read_bytes())
+        self.state.write_bytes(self.next_state.read_bytes())
+
+        prepared_again = self.run_prepare(self.root / "gstApp")
+
+        self.assertEqual(0, prepared_again.returncode, prepared_again.stderr)
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(manifest["items"]))
+        self.assertEqual("resolved", manifest["items"][0]["status"])
+        self.assertEqual(b"", self.context.read_bytes())
+
+    def test_wrong_marker_cannot_resolve_or_duplicate_prior_item(self) -> None:
+        item, fix = self.prepare_supported_candidate()
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]\n"
+            "<!-- unresolved-id:unresolved-999999999999 -->\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        validated = self.validated.read_text(encoding="utf-8")
+        self.assertEqual(1, validated.count("bps 배열 길이 불일치"))
+        self.assertIn(
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중 [검증 필요]",
+            validated,
+        )
+        self.assertIn(f"<!-- unresolved-id:{item['id']} -->", validated)
+        self.assertNotIn("unresolved-999999999999", validated)
+        state = json.loads(self.next_state.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(state["items"]))
+        self.assertEqual("open", state["items"][0]["status"])
+
+    def test_missing_state_recovers_published_resolution_from_git_candidate(self) -> None:
+        item, fix = self.prepare_supported_candidate()
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{item['id']} -->\n\n"
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+        self.state.unlink(missing_ok=True)
+
+        result = self.run_prepare(self.root / "gstApp")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(manifest["items"]))
+        recovered = manifest["items"][0]
+        self.assertEqual("resolved", recovered["status"])
+        self.assertEqual(
+            {"commit": fix, "resolved_on": "2026-05-12"},
+            recovered["resolution"],
+        )
+        self.assertEqual(b"", self.context.read_bytes())
+
+    def test_state_resolution_must_match_published_short_sha(self) -> None:
+        item, fix = self.prepare_supported_candidate()
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{item['id']} -->\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+        forged = {key: value for key, value in item.items() if key != "candidates"}
+        forged["status"] = "resolved"
+        forged["resolution"] = {
+            "commit": "f" * 40,
+            "resolved_on": "2026-05-12",
+        }
+        self.state.write_text(
+            json.dumps({"schema": 1, "items": [forged]}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_prepare(self.root / "gstApp")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        recovered = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual(fix, recovered["resolution"]["commit"])
+        self.assertNotEqual("f" * 40, recovered["resolution"]["commit"])
 
 
 if __name__ == "__main__":
