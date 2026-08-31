@@ -268,6 +268,22 @@ def _collapse_marked_history(summary_items: list[SummaryItem]) -> list[SummaryIt
             continue
         position = positions[marker_id]
         previous = collapsed[position]
+        if previous.status == "resolved" and summary.status == "open":
+            collapsed[position] = SummaryItem(
+                text=previous.text,
+                project=previous.project,
+                priority=previous.priority or summary.priority,
+                opened_on=(
+                    previous.opened_on
+                    if previous.priority is not None
+                    else summary.opened_on
+                ),
+                marker_id=marker_id,
+                status=previous.status,
+                resolution_prefix=previous.resolution_prefix,
+                resolved_on=previous.resolved_on,
+            )
+            continue
         priority = previous.priority if summary.priority is None else summary.priority
         opened_on = (
             previous.opened_on if previous.priority is not None else summary.opened_on
@@ -304,33 +320,33 @@ def _coalesce_legacy_history(
         occurrences[occurrence_key] = occurrence
         item_occurrences.append(occurrence)
 
-    marked: dict[tuple[str, str, str | None, int], list[int]] = {}
+    marked: dict[tuple[str, str, int], list[int]] = {}
     for index, summary in enumerate(summary_items):
         if summary.marker_id is None:
             continue
         identity = (
             summary.text,
             summary.project,
-            summary.priority,
             item_occurrences[index],
         )
         marked.setdefault(identity, []).append(index)
 
     remove: set[int] = set()
     earliest_by_marked: dict[int, str] = {}
+    priority_by_marked: dict[int, str] = {}
     for index, summary in enumerate(summary_items):
         if summary.marker_id is not None or summary.status != "open":
             continue
         identity = (
             summary.text,
             summary.project,
-            summary.priority,
             item_occurrences[index],
         )
         candidates = [
             marked_index
             for marked_index in marked.get(identity, [])
             if summary_items[marked_index].opened_on >= summary.opened_on
+            and summary_items[marked_index].priority in (None, summary.priority)
             and _state_allows_legacy_coalescing(
                 summary, summary_items[marked_index], state_by_id
             )
@@ -340,6 +356,11 @@ def _coalesce_legacy_history(
         if not candidates:
             continue
         marked_index = candidates[0]
+        prior_priority = priority_by_marked.get(marked_index)
+        if prior_priority is not None and prior_priority != summary.priority:
+            raise TrackerError("ambiguous legacy summary priority")
+        assert summary.priority is not None
+        priority_by_marked[marked_index] = summary.priority
         earliest_by_marked[marked_index] = min(
             earliest_by_marked.get(
                 marked_index, summary_items[marked_index].opened_on
@@ -357,7 +378,7 @@ def _coalesce_legacy_history(
             summary = SummaryItem(
                 text=summary.text,
                 project=summary.project,
-                priority=summary.priority,
+                priority=summary.priority or priority_by_marked.get(index),
                 opened_on=opened_on,
                 marker_id=summary.marker_id,
                 status=summary.status,
@@ -715,13 +736,26 @@ def attach_candidates(
 ) -> None:
     repositories_by_path = {str(repo.path): repo for repo in repositories}
     for item in items:
-        if item["status"] != "open" or item["verification"] != "ready":
+        if item["status"] != "open":
+            continue
+        item["candidates"] = []
+        if item["repo_path"] is None:
             continue
         repo = repositories_by_path.get(item["repo_path"])
         baseline = item["baseline_head"]
-        if repo is None or not isinstance(baseline, str):
+        if repo is None:
             item["verification"] = "git-unavailable"
             continue
+        if not isinstance(baseline, str):
+            try:
+                baseline = _dated_baseline(repo, item["opened_on"])
+            except TrackerError:
+                baseline = None
+            item["baseline_head"] = baseline
+        if not isinstance(baseline, str):
+            item["verification"] = "git-unavailable"
+            continue
+        item["verification"] = "ready"
         try:
             run_git(repo.path, ("cat-file", "-e", f"{baseline}^{{commit}}"))
             run_git(repo.path, ("merge-base", "--is-ancestor", baseline, repo.head))
@@ -865,6 +899,9 @@ def _atomic_write(path: Path, content: bytes) -> None:
 
 
 def prepare(args: argparse.Namespace) -> None:
+    prepared_on = args.prepared_on or date.today().isoformat()
+    if not _valid_iso_date(prepared_on):
+        raise TrackerError("invalid prepared date")
     summary_path = Path(args.summary)
     try:
         markdown = (
@@ -895,7 +932,7 @@ def prepare(args: argparse.Namespace) -> None:
 
     manifest = {
         "schema": SCHEMA,
-        "prepared_on": date.today().isoformat(),
+        "prepared_on": prepared_on,
         "repositories": [
             {"path": str(repo.path), "name": repo.name, "head": repo.head}
             for repo in repositories
@@ -911,11 +948,47 @@ def prepare(args: argparse.Namespace) -> None:
 
 
 def _render_carryover(items: list[dict[str, Any]]) -> str:
-    open_items = sorted(
-        (item for item in items if item["status"] == "open"),
-        key=lambda item: (item["opened_on"], item["id"]),
-    )
-    if not open_items:
+    open_items = [item for item in items if item["status"] == "open"]
+    resolved_items = sorted(
+        (item for item in items if item["status"] == "resolved"),
+        key=lambda item: (
+            item["resolution"]["resolved_on"] if item["resolution"] else "",
+            item["id"],
+        ),
+        reverse=True,
+    )[:RESOLVED_LIMIT]
+    carry_items = open_items + resolved_items
+    events: list[tuple[str, int, str, str]] = []
+    for item in carry_items:
+        marker = f"<!-- unresolved-id:{item['id']} -->"
+        events.append(
+            (
+                item["opened_on"],
+                0,
+                item["id"],
+                f"- [ ] {item['text']} — {item['project']} — {item['priority']}\n{marker}",
+            )
+        )
+        resolution = item.get("resolution")
+        if item["status"] == "resolved" and isinstance(resolution, dict):
+            resolved_on = resolution["resolved_on"]
+            prefix = resolution["commit"][:7]
+        else:
+            resolved_on = item.get("_published_resolved_on")
+            prefix = item.get("_published_resolution_prefix")
+        if _valid_iso_date(resolved_on) and isinstance(prefix, str):
+            events.append(
+                (
+                    resolved_on,
+                    1,
+                    item["id"],
+                    f"- [x] {item['text']} — {item['project']} "
+                    f"[resolved by {prefix}]\n{marker}",
+                )
+            )
+
+    events.sort(key=lambda event: (event[0], event[2], event[1]))
+    if not events:
         return ""
     lines = [
         "# Claude 세션 요약",
@@ -923,9 +996,9 @@ def _render_carryover(items: list[dict[str, Any]]) -> str:
         "> 자동 생성 파일. 매주 수요일 09:10 로테이트.",
     ]
     current_date = ""
-    for item in open_items:
-        if item["opened_on"] != current_date:
-            current_date = item["opened_on"]
+    for event_date, _, _, rendered in events:
+        if event_date != current_date:
+            current_date = event_date
             lines.extend(
                 (
                     "",
@@ -936,12 +1009,7 @@ def _render_carryover(items: list[dict[str, Any]]) -> str:
                     "### 미완료 항목",
                 )
             )
-        lines.extend(
-            (
-                f"- [ ] {item['text']} — {item['project']} — {item['priority']}",
-                f"<!-- unresolved-id:{item['id']} -->",
-            )
-        )
+        lines.extend(rendered.splitlines())
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -969,6 +1037,8 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise TrackerError(f"cannot read manifest: {error}") from error
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise TrackerError("unsupported manifest schema")
+    if not _valid_iso_date(payload.get("prepared_on")):
+        raise TrackerError("malformed manifest prepared date")
     if not isinstance(payload.get("items"), list) or not isinstance(
         payload.get("repositories"), list
     ):
@@ -1142,6 +1212,8 @@ def reconcile(args: argparse.Namespace) -> None:
         raise TrackerError(f"cannot read generated markdown: {error}") from error
     lines = generated.splitlines()
     resolved_on = _daily_date(lines)
+    if resolved_on != manifest["prepared_on"]:
+        raise TrackerError("generated date does not match prepared date")
     section_start, section_end, section_exists = _incomplete_section(lines)
     generated_entries = _generated_entries(
         lines, section_start, section_end, section_exists
@@ -1158,6 +1230,7 @@ def reconcile(args: argparse.Namespace) -> None:
     canonical_lines: list[str] = []
     open_items: list[dict[str, Any]] = []
     resolved_items: list[dict[str, Any]] = []
+    represented_prior_ids: set[str] = set()
     for manifest_item in manifest["items"]:
         item = dict(manifest_item)
         if item["status"] == "resolved":
@@ -1174,6 +1247,8 @@ def reconcile(args: argparse.Namespace) -> None:
                 and normalize_text(open_match.group("project")) == item["project"]
                 and open_match.group("priority") == item["priority"]
             )
+            if exact_open:
+                represented_prior_ids.add(item["id"])
             resolved_match = RESOLVED_RE.match(generated_lines[0])
             if (
                 resolved_match
@@ -1182,6 +1257,7 @@ def reconcile(args: argparse.Namespace) -> None:
             ):
                 candidate = _authorized_candidate(item, resolved_match.group("sha"))
         if candidate is not None:
+            represented_prior_ids.add(item["id"])
             item["status"] = "resolved"
             item["resolution"] = {
                 "commit": candidate["commit"],
@@ -1229,6 +1305,19 @@ def reconcile(args: argparse.Namespace) -> None:
             raise TrackerError("unsupported new resolved or malformed open item")
         match = open_match or downgraded_match
         assert match is not None
+        matching_prior_open = [
+            item
+            for item in manifest["items"]
+            if item["status"] == "open"
+            and item["text"] == normalize_text(match.group("text"))
+            and item["project"] == normalize_text(match.group("project"))
+            and item["priority"] == match.group("priority")
+        ]
+        if matching_prior_open and any(
+            item["id"] not in represented_prior_ids
+            for item in matching_prior_open
+        ):
+            continue
         identity = (
             resolved_on,
             normalize_text(match.group("project")),
@@ -1282,6 +1371,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--summary", required=True)
     prepare_parser.add_argument("--prior-summary")
+    prepare_parser.add_argument("--prepared-on")
     prepare_parser.add_argument("--state", required=True)
     prepare_parser.add_argument("--manifest", required=True)
     prepare_parser.add_argument("--context", required=True)

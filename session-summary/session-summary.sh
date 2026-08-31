@@ -528,6 +528,7 @@ if [[ "$RESOLUTION_TRACKING" == "1" ]]; then
     if ! "$RESOLUTION_TRACKER" prepare \
         --summary "$SUMMARY_FILE" \
         "${PRIOR_SUMMARY_ARGS[@]}" \
+        --prepared-on "$DATE" \
         --state "$UNRESOLVED_STATE_FILE" \
         --manifest "$MANIFEST_FILE" \
         --context "$RESOLUTION_CONTEXT_FILE" \

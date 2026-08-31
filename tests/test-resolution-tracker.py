@@ -34,7 +34,9 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         )
 
     def run_prepare(
-        self, prior_summary: Path | None = None
+        self,
+        prior_summary: Path | None = None,
+        prepared_on: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [
             "python3",
@@ -51,6 +53,8 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         ]
         if prior_summary is not None:
             command.extend(("--prior-summary", str(prior_summary)))
+        if prepared_on is not None:
+            command.extend(("--prepared-on", prepared_on))
         return subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -87,6 +91,22 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         self.assertEqual(0, second.returncode, second.stderr)
         self.assertEqual(first_manifest, self.manifest.read_bytes())
         self.assertEqual(first_context, self.context.read_bytes())
+
+    def test_prepare_uses_explicit_run_date_and_rejects_invalid_date(self) -> None:
+        self.write_summary(["- [ ] explicit date — unknown — 낮"])
+
+        valid = self.run_prepare(prepared_on="2026-05-12")
+
+        self.assertEqual(0, valid.returncode, valid.stderr)
+        self.assertEqual("2026-05-12", self.read_manifest()["prepared_on"])
+        manifest_before = self.manifest.read_bytes()
+        context_before = self.context.read_bytes()
+
+        invalid = self.run_prepare(prepared_on="2026-02-30")
+
+        self.assertNotEqual(0, invalid.returncode)
+        self.assertEqual(manifest_before, self.manifest.read_bytes())
+        self.assertEqual(context_before, self.context.read_bytes())
 
     def test_prepare_distinguishes_identical_unmapped_occurrences(self) -> None:
         line = "- [ ] 동일한 미완료 — unknown — 낮"
@@ -533,13 +553,17 @@ class TrackerGitFixture:
             json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
         )
 
-    def run_prepare(self, *repos: Path) -> subprocess.CompletedProcess[str]:
+    def run_prepare(
+        self, *repos: Path, prepared_on: str = "2026-05-12"
+    ) -> subprocess.CompletedProcess[str]:
         command = [
             "python3",
             str(TRACKER),
             "prepare",
             "--summary",
             str(self.summary),
+            "--prepared-on",
+            prepared_on,
             "--state",
             str(self.state),
             "--manifest",
@@ -840,6 +864,52 @@ class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
         self.assertEqual("2026-05-10", marked["opened_on"])
         self.assertEqual([], marked["candidates"])
 
+    def test_legacy_open_coalesces_with_first_marked_resolution(self) -> None:
+        repo = self.create_repo()
+        baseline = self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        fix = self.commit(
+            repo,
+            "fix: resolve bps length",
+            "void configure(void) { arg.cam[i].bps = json_array_length(node); }\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        marker_id = "unresolved-555555555555"
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]\n"
+            f"<!-- unresolved-id:{marker_id} -->\n",
+            encoding="utf-8",
+        )
+
+        for state_kind in ("missing", "malformed", "stale-open"):
+            with self.subTest(state=state_kind):
+                if state_kind == "missing":
+                    self.state.unlink(missing_ok=True)
+                elif state_kind == "malformed":
+                    self.state.write_text("{broken", encoding="utf-8")
+                else:
+                    self.write_state(marker_id, repo, baseline)
+
+                result = self.run_prepare(repo)
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                items = json.loads(self.manifest.read_text(encoding="utf-8"))["items"]
+                self.assertEqual(1, len(items))
+                self.assertEqual(marker_id, items[0]["id"])
+                self.assertEqual("2026-05-09", items[0]["opened_on"])
+                self.assertEqual("resolved", items[0]["status"])
+                self.assertEqual(fix, items[0]["resolution"]["commit"])
+
     def test_same_day_legacy_and_marked_occurrences_coalesce_without_state(self) -> None:
         repo = self.create_repo()
         self.commit(
@@ -968,6 +1038,38 @@ class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
         item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
         self.assertEqual("history-diverged", item["verification"])
         self.assertEqual([], item["candidates"])
+
+    def test_transient_repository_absence_is_revalidated_when_repo_returns(self) -> None:
+        repo = self.create_repo()
+        baseline = self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        fix = self.commit(
+            repo,
+            "fix: restore repository evidence",
+            "void configure(void) { arg.cam[i].bps = json_array_length(node); }\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        marker_id = "unresolved-666666666666"
+        self.write_marked_summary(marker_id)
+        self.write_state(marker_id, repo, baseline)
+
+        absent = self.run_prepare()
+
+        self.assertEqual(0, absent.returncode, absent.stderr)
+        absent_item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual("git-unavailable", absent_item["verification"])
+        self.write_manifest_items_as_state()
+
+        returned = self.run_prepare(repo)
+
+        self.assertEqual(0, returned.returncode, returned.stderr)
+        returned_item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual("ready", returned_item["verification"])
+        self.assertEqual([fix], [candidate["commit"] for candidate in returned_item["candidates"]])
 
     def test_more_than_two_hundred_later_commits_discards_history(self) -> None:
         repo = self.create_repo()
@@ -1150,6 +1252,78 @@ class ResolutionTrackerReconcileTests(TrackerGitFixture, unittest.TestCase):
         self.assertNotIn("[검증 필요]", validated)
         state = json.loads(self.next_state.read_text(encoding="utf-8"))
         self.assertEqual("open", state["items"][0]["status"])
+
+    def test_markerless_or_wrong_marker_open_copy_does_not_duplicate_prior(self) -> None:
+        item, _ = self.prepare_supported_candidate()
+        for marker in ("", "<!-- unresolved-id:unresolved-999999999999 -->\n"):
+            with self.subTest(marker=bool(marker)):
+                self.generated.write_text(
+                    "---\n\n"
+                    "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+                    "### 미완료 항목\n"
+                    "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+                    f"{marker}",
+                    encoding="utf-8",
+                )
+
+                result = self.run_reconcile()
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                validated = self.validated.read_text(encoding="utf-8")
+                self.assertEqual(1, validated.count("bps 배열 길이 불일치"))
+                self.assertIn(f"<!-- unresolved-id:{item['id']} -->", validated)
+                state = json.loads(self.next_state.read_text(encoding="utf-8"))
+                self.assertEqual(1, len(state["items"]))
+                self.assertEqual(item["id"], state["items"][0]["id"])
+
+    def test_markerless_identical_item_is_new_when_prior_marker_is_present(self) -> None:
+        item, _ = self.prepare_supported_candidate()
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{item['id']} -->\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_reconcile()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        state = json.loads(self.next_state.read_text(encoding="utf-8"))
+        self.assertEqual(2, len(state["items"]))
+        self.assertEqual(2, len({record["id"] for record in state["items"]}))
+        self.assertIn(item["id"], {record["id"] for record in state["items"]})
+        self.assertEqual(
+            2,
+            self.validated.read_text(encoding="utf-8").count(
+                "bps 배열 길이 불일치"
+            ),
+        )
+
+    def test_generated_date_must_match_manifest_prepared_on(self) -> None:
+        item, _ = self.prepare_supported_candidate()
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        manifest["prepared_on"] = "2026-05-12"
+        self.manifest.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-13 (2026-05-12 ~ 2026-05-13)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+        self.validated.write_text("validated sentinel\n", encoding="utf-8")
+        self.next_state.write_text("state sentinel\n", encoding="utf-8")
+
+        result = self.run_reconcile()
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("generated date does not match prepared date", result.stderr)
+        self.assertEqual("validated sentinel\n", self.validated.read_text(encoding="utf-8"))
+        self.assertEqual("state sentinel\n", self.next_state.read_text(encoding="utf-8"))
 
     def test_missing_incomplete_section_reinserts_prior_item_open(self) -> None:
         item, _ = self.prepare_supported_candidate()
@@ -1366,6 +1540,120 @@ class ResolutionTrackerReconcileTests(TrackerGitFixture, unittest.TestCase):
         )
         self.assertEqual(b"", self.context.read_bytes())
 
+    def test_carryover_preserves_published_resolution_with_stale_open_state(self) -> None:
+        item, fix = self.prepare_supported_candidate()
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{item['id']} -->\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+        self.write_manifest_items_as_state()
+        carryover = self.root / "carryover.md"
+
+        carried = subprocess.run(
+            [
+                "python3",
+                str(TRACKER),
+                "carryover",
+                "--summary",
+                str(self.summary),
+                "--state",
+                str(self.state),
+                "--output",
+                str(carryover),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, carried.returncode, carried.stderr)
+        carried_text = carryover.read_text(encoding="utf-8")
+        self.assertIn(f"[resolved by {fix[:7]}]", carried_text)
+        self.summary.write_bytes(carryover.read_bytes())
+        prepared = self.run_prepare(self.root / "gstApp")
+        self.assertEqual(0, prepared.returncode, prepared.stderr)
+        recovered = json.loads(self.manifest.read_text(encoding="utf-8"))["items"]
+        self.assertEqual(1, len(recovered))
+        self.assertEqual("resolved", recovered[0]["status"])
+
+        self.summary.write_bytes(carryover.read_bytes())
+        unavailable = self.run_prepare(prepared_on="2026-05-13")
+        self.assertEqual(0, unavailable.returncode, unavailable.stderr)
+        unavailable_item = json.loads(
+            self.manifest.read_text(encoding="utf-8")
+        )["items"][0]
+        self.assertEqual("open", unavailable_item["status"])
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-13 (2026-05-12 ~ 2026-05-13)\n\n"
+            "### 미완료 항목\n",
+            encoding="utf-8",
+        )
+        reconciled = self.run_reconcile()
+        self.assertEqual(0, reconciled.returncode, reconciled.stderr)
+        with self.summary.open("a", encoding="utf-8") as handle:
+            handle.write("\n" + self.validated.read_text(encoding="utf-8"))
+        self.state.write_bytes(self.next_state.read_bytes())
+
+        returned = self.run_prepare(
+            self.root / "gstApp", prepared_on="2026-05-14"
+        )
+
+        self.assertEqual(0, returned.returncode, returned.stderr)
+        returned_item = json.loads(
+            self.manifest.read_text(encoding="utf-8")
+        )["items"][0]
+        self.assertEqual("resolved", returned_item["status"])
+        self.assertEqual(fix, returned_item["resolution"]["commit"])
+
+    def test_resolved_record_survives_repeated_carryovers(self) -> None:
+        item, fix = self.prepare_supported_candidate()
+        self.generated.write_text(
+            "---\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            f"- [x] bps 배열 길이 불일치 — gstApp [resolved by {fix[:7]}]\n"
+            f"<!-- unresolved-id:{item['id']} -->\n",
+            encoding="utf-8",
+        )
+        reconciled = self.run_reconcile()
+        self.assertEqual(0, reconciled.returncode, reconciled.stderr)
+        self.summary.write_bytes(self.validated.read_bytes())
+        self.state.write_bytes(self.next_state.read_bytes())
+
+        for index in range(2):
+            carryover = self.root / f"carryover-{index}.md"
+            carried = subprocess.run(
+                [
+                    "python3",
+                    str(TRACKER),
+                    "carryover",
+                    "--summary",
+                    str(self.summary),
+                    "--state",
+                    str(self.state),
+                    "--output",
+                    str(carryover),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, carried.returncode, carried.stderr)
+            self.assertIn(item["id"], carryover.read_text(encoding="utf-8"))
+            self.assertIn(f"[resolved by {fix[:7]}]", carryover.read_text(encoding="utf-8"))
+            self.summary.write_bytes(carryover.read_bytes())
+
     def test_state_resolution_must_match_published_short_sha(self) -> None:
         item, fix = self.prepare_supported_candidate()
         self.summary.write_text(
@@ -1467,7 +1755,7 @@ class ResolutionTrackerAcceptanceTests(TrackerGitFixture, unittest.TestCase):
             encoding="utf-8",
         )
         self.state.write_bytes(self.next_state.read_bytes())
-        second_prepare = self.run_prepare(repo)
+        second_prepare = self.run_prepare(repo, prepared_on="2026-05-13")
         self.assertEqual(0, second_prepare.returncode, second_prepare.stderr)
         second_manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
         self.assertEqual("resolved", second_manifest["items"][0]["status"])

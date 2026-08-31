@@ -101,7 +101,8 @@ Its public CLI is:
 
 ```text
 resolution-tracker.py prepare \
-  --summary <path> --state <path> --manifest <path> --context <path> \
+  --summary <path> [--prepared-on YYYY-MM-DD] \
+  --state <path> --manifest <path> --context <path> \
   [--prior-summary <path>] [--repo <absolute-git-root> ...]
 
 resolution-tracker.py carryover \
@@ -118,12 +119,14 @@ verification unavailable and never as evidence of completion.
 
 The shell script will:
 
-1. Before rotation, stage a validated carryover summary containing open items with their original
-   `opened_on` and stable IDs; abort rotation if this cannot be produced.
+1. Before rotation, stage a validated carryover summary containing open items plus at most 200
+   recent resolved evidence chains. Preserve each original `opened_on`, stable ID, and published
+   resolution marker; abort rotation if this cannot be produced.
 2. Select the latest archive by the canonical filename period and collision suffix, never by mtime.
 3. Build an exact local repository list from the already-extracted local session directories.
 4. Create private temporary manifest, context, validated-output, and next-state files.
-5. Run `prepare` before constructing the prompt, with the latest archive as explicit prior evidence.
+5. Run `prepare` before constructing the prompt, with the shell's fixed run date and the latest
+   archive as explicit prior evidence.
 6. Include the bounded resolution context and explicit output contract in the existing prompt.
 7. Run `reconcile` after a successful model response.
 8. Append only validated output to the summary.

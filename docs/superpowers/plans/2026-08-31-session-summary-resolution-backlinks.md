@@ -27,7 +27,8 @@ The helper CLI is fixed:
 
 ```text
 session-summary/resolution-tracker.py prepare \
-  --summary PATH --state PATH --manifest PATH --context PATH \
+--summary PATH [--prepared-on YYYY-MM-DD] \
+--state PATH --manifest PATH --context PATH \
   [--prior-summary PATH] [--repo ABSOLUTE_GIT_ROOT ...]
 
 session-summary/resolution-tracker.py carryover \
@@ -89,7 +90,10 @@ The implementation may use internal dataclasses or dictionaries, but these behav
 - `run_git(repo, args, timeout, max_output)` uses an argument array, disables color/external diff, rejects nonzero status, timeout, malformed UTF-8 replacement-sensitive output, or output beyond the bound, and returns no partial evidence.
 - `prepare` never mutates the state file. `reconcile` never mutates the summary or state path. The shell owns publication ordering.
 - `carryover` writes a staged active-summary replacement only; rotate publishes it after the prior
-  summary is archived. It preserves summary-proven `opened_on` values and stable IDs.
+  summary is archived. It preserves summary-proven `opened_on` values, stable IDs, and bounded
+  open→resolved evidence chains so a stale state file cannot reopen published work.
+- The shell passes one fixed `--prepared-on` date from run start; `reconcile` requires the generated
+  daily heading to match that manifest date exactly.
 - The shell selects `--prior-summary` by the canonical archive end date and optional collision
   suffix in the filename, not filesystem mtime.
 
@@ -426,7 +430,10 @@ next-state.json
 claude.err
 ```
 
-When tracking is enabled, call `prepare` with `SUMMARY_FILE`, `state/unresolved-items.json`, and the exact repository array. If it fails, log `resolution tracker prepare failed`, make no Claude call, do not append a summary, and leave state untouched. This is the open-limit/malformed-authority stop condition.
+When tracking is enabled, call `prepare` with `SUMMARY_FILE`, the fixed run date,
+`state/unresolved-items.json`, and the exact repository array. If it fails, log
+`resolution tracker prepare failed`, make no Claude call, do not append a summary, and leave state
+untouched. This is the open-limit/malformed-authority stop condition.
 
 Add the prepared context as section D and add an explicit contract stating that every prior item is emitted once, only its listed candidate may resolve it, subjects alone are insufficient, and original text/project/priority/numbers/units/code symbols must not change. Include this section in the existing whole-prompt byte check.
 
