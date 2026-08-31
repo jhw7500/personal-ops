@@ -384,13 +384,6 @@ def _state_allows_legacy_coalescing(
             stored["project"] == legacy.project,
             stored["priority"] == legacy.priority,
             stored["opened_on"] == legacy.opened_on,
-            stored["id"]
-            == make_item_id(
-                legacy.opened_on,
-                legacy.project,
-                legacy.text,
-                stored["identity_repo_key"],
-            ),
         )
     )
 

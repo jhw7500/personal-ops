@@ -557,6 +557,30 @@ class TrackerGitFixture:
             check=False,
         )
 
+    def write_manifest_items_as_state(self) -> None:
+        state_fields = {
+            "id",
+            "text",
+            "project",
+            "priority",
+            "opened_on",
+            "identity_repo_key",
+            "repo_path",
+            "baseline_head",
+            "status",
+            "resolution",
+            "verification",
+        }
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        payload = {
+            "schema": 1,
+            "items": [
+                {key: value for key, value in item.items() if key in state_fields}
+                for item in manifest["items"]
+            ],
+        }
+        self.state.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
 
 class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
     def test_generic_subject_with_matching_patch_is_candidate(self) -> None:
@@ -757,6 +781,17 @@ class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
                 self.assertEqual("2026-05-09", items[0]["opened_on"])
                 self.assertEqual(str(repo.resolve()), items[0]["repo_path"])
 
+                self.write_manifest_items_as_state()
+                repeated = self.run_prepare(repo)
+
+                self.assertEqual(0, repeated.returncode, repeated.stderr)
+                repeated_items = json.loads(
+                    self.manifest.read_text(encoding="utf-8")
+                )["items"]
+                self.assertEqual(1, len(repeated_items))
+                self.assertEqual(marker_id, repeated_items[0]["id"])
+                self.assertEqual("2026-05-09", repeated_items[0]["opened_on"])
+
     def test_valid_marked_state_prevents_unrelated_legacy_date_override(self) -> None:
         repo = self.create_repo()
         self.commit(
@@ -844,6 +879,19 @@ class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
                 )
                 self.assertTrue(
                     all(item["opened_on"] == "2026-05-09" for item in items)
+                )
+
+                self.write_manifest_items_as_state()
+                repeated = self.run_prepare(repo)
+
+                self.assertEqual(0, repeated.returncode, repeated.stderr)
+                repeated_items = json.loads(
+                    self.manifest.read_text(encoding="utf-8")
+                )["items"]
+                self.assertEqual(2, len(repeated_items))
+                self.assertEqual(
+                    {first_marker, second_marker},
+                    {item["id"] for item in repeated_items},
                 )
 
     def test_state_cannot_move_opened_on_before_summary_evidence(self) -> None:
