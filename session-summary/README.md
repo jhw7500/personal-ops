@@ -10,6 +10,7 @@ Claude Code episodic-memory + opencode SQLite에서 전일 세션을 긁어와 �
   - 이전 `미완료 항목`은 stable ID와 로컬 Git patch 근거를 대조하고, 검증된 경우에만
     resolution commit을 표시
 - **로테이트 모드** (`rotate` 인자): `logs/session-summary.md`를 `archive/summary-<지난수>_<이번화>.md`로 이동
+  - 다음 요약은 최신 archive도 검증 입력으로 읽어 이전 주의 open item을 active summary와 state에 이월
 
 ## 미완료 항목 resolution 추적
 
@@ -35,6 +36,8 @@ HTML comment의 stable ID는 모델에 의미를 맡기지 않는 opaque 식별�
 상태 파일이 summary append 뒤 교체되지 못하면 다음 실행이 이 marker와 Git 후보를 이용해
 상태를 복구한다. 모델이 항목을 누락하거나 원문·숫자·단위·조수사·코드 심볼을 바꾸거나
 등록되지 않은 SHA를 쓰면 원본 open 항목으로 되돌리고 `[검증 필요]`를 붙인다.
+추적 도입 전의 marker 없는 항목과 이후 marker가 붙은 동일 항목이 함께 남아 있어도 stable ID로
+한 번만 복구한다.
 
 repository 후보는 당일 Claude Code/opencode context에 실제로 등장한 로컬 절대경로만
 사용한다. `git rev-parse --show-toplevel`과 정확히 일치하고 project명이 repository basename과

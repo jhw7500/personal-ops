@@ -32,21 +32,26 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def run_prepare(self) -> subprocess.CompletedProcess[str]:
+    def run_prepare(
+        self, prior_summary: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            "python3",
+            str(TRACKER),
+            "prepare",
+            "--summary",
+            str(self.summary),
+            "--state",
+            str(self.state),
+            "--manifest",
+            str(self.manifest),
+            "--context",
+            str(self.context),
+        ]
+        if prior_summary is not None:
+            command.extend(("--prior-summary", str(prior_summary)))
         return subprocess.run(
-            [
-                "python3",
-                str(TRACKER),
-                "prepare",
-                "--summary",
-                str(self.summary),
-                "--state",
-                str(self.state),
-                "--manifest",
-                str(self.manifest),
-                "--context",
-                str(self.context),
-            ],
+            command,
             cwd=REPO_ROOT,
             text=True,
             capture_output=True,
@@ -172,6 +177,97 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual([], self.read_manifest()["items"])
         self.assertEqual(b"", self.context.read_bytes())
+
+    def test_prepare_recovers_state_item_from_prior_summary_after_rotation(self) -> None:
+        marker_id = "unresolved-333333333333"
+        prior_summary = self.root / "archived-summary.md"
+        prior_summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] state carryover — gstApp — 중\n"
+            f"<!-- unresolved-id:{marker_id} -->\n",
+            encoding="utf-8",
+        )
+        self.summary.write_text("# Claude 세션 요약\n", encoding="utf-8")
+        self.state.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "items": [
+                        {
+                            "id": marker_id,
+                            "text": "state carryover",
+                            "project": "gstApp",
+                            "priority": "중",
+                            "opened_on": "2026-05-09",
+                            "identity_repo_key": "unmapped:1",
+                            "repo_path": None,
+                            "baseline_head": None,
+                            "status": "open",
+                            "resolution": None,
+                            "verification": "repo-unmapped",
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_prepare(prior_summary)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        items = self.read_manifest()["items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual(marker_id, items[0]["id"])
+        self.assertEqual("2026-05-09", items[0]["opened_on"])
+
+    def test_prepare_coalesces_legacy_entry_with_later_marked_copy(self) -> None:
+        marker_id = "unresolved-c0bf9d34ba97"
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{marker_id} -->\n",
+            encoding="utf-8",
+        )
+        self.state.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "items": [
+                        {
+                            "id": marker_id,
+                            "text": "bps 배열 길이 불일치",
+                            "project": "gstApp",
+                            "priority": "중",
+                            "opened_on": "2026-05-09",
+                            "identity_repo_key": "unmapped:1",
+                            "repo_path": None,
+                            "baseline_head": None,
+                            "status": "open",
+                            "resolution": None,
+                            "verification": "repo-unmapped",
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_prepare()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        items = self.read_manifest()["items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual(marker_id, items[0]["id"])
+        self.assertEqual("2026-05-09", items[0]["opened_on"])
 
     def test_prepare_accepts_exactly_one_hundred_open_items(self) -> None:
         self.write_summary(

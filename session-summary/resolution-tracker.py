@@ -251,7 +251,6 @@ def _state_matches_summary(item: dict[str, Any], summary: SummaryItem) -> bool:
     return (
         common_match
         and item["priority"] == summary.priority
-        and item["opened_on"] == summary.opened_on
     )
 
 
@@ -411,6 +410,7 @@ def recover_items(
     summary_items = _collapse_marked_history(summary_items)
     occurrences: dict[tuple[str, str, str], int] = {}
     recovered: list[dict[str, Any]] = []
+    recovered_positions: dict[str, int] = {}
     for summary in summary_items:
         occurrence_key = (summary.opened_on, summary.project, summary.text)
         occurrence = occurrences.get(occurrence_key, 0) + 1
@@ -477,6 +477,25 @@ def recover_items(
             elif len(matches) > 1:
                 item["verification"] = "repo-ambiguous"
         item["candidates"] = []
+        prior_position = recovered_positions.get(item["id"])
+        if prior_position is not None:
+            prior = recovered[prior_position]
+            if any(
+                prior[field] != item[field]
+                for field in ("text", "project", "priority")
+            ):
+                raise TrackerError(f"conflicting summary item id: {item['id']}")
+            if prior["status"] != "resolved" and item["status"] == "resolved":
+                recovered[prior_position] = item
+            else:
+                for field in (
+                    "_published_resolution_prefix",
+                    "_published_resolved_on",
+                ):
+                    if field in item:
+                        prior[field] = item[field]
+            continue
+        recovered_positions[item["id"]] = len(recovered)
         recovered.append(item)
     return recovered
 
@@ -703,6 +722,12 @@ def prepare(args: argparse.Namespace) -> None:
         markdown = (
             summary_path.read_text(encoding="utf-8") if summary_path.is_file() else ""
         )
+        if args.prior_summary is not None:
+            prior_summary_path = Path(args.prior_summary)
+            if not prior_summary_path.is_file():
+                raise TrackerError("cannot read prior summary: not a file")
+            prior_markdown = prior_summary_path.read_text(encoding="utf-8")
+            markdown = f"{prior_markdown.rstrip()}\n\n{markdown.lstrip()}"
     except (OSError, UnicodeError) as error:
         raise TrackerError(f"cannot read summary: {error}") from error
 
@@ -1056,6 +1081,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--summary", required=True)
+    prepare_parser.add_argument("--prior-summary")
     prepare_parser.add_argument("--state", required=True)
     prepare_parser.add_argument("--manifest", required=True)
     prepare_parser.add_argument("--context", required=True)

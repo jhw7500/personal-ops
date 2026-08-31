@@ -477,11 +477,23 @@ trap cleanup_run_dir EXIT
 RESOLUTION_CONTEXT=""
 if [[ "$RESOLUTION_TRACKING" == "1" ]]; then
     REPO_ARGS=()
+    PRIOR_SUMMARY_ARGS=()
     for repo_root in "${REPO_ROOTS[@]}"; do
         REPO_ARGS+=(--repo "$repo_root")
     done
+    LATEST_ARCHIVE=""
+    for archive_candidate in "${ARCHIVE_DIR}"/summary-*.md; do
+        if [[ -f "$archive_candidate" ]] && \
+            { [[ -z "$LATEST_ARCHIVE" ]] || [[ "$archive_candidate" -nt "$LATEST_ARCHIVE" ]]; }; then
+            LATEST_ARCHIVE="$archive_candidate"
+        fi
+    done
+    if [[ -n "$LATEST_ARCHIVE" ]]; then
+        PRIOR_SUMMARY_ARGS=(--prior-summary "$LATEST_ARCHIVE")
+    fi
     if ! "$RESOLUTION_TRACKER" prepare \
         --summary "$SUMMARY_FILE" \
+        "${PRIOR_SUMMARY_ARGS[@]}" \
         --state "$UNRESOLVED_STATE_FILE" \
         --manifest "$MANIFEST_FILE" \
         --context "$RESOLUTION_CONTEXT_FILE" \
