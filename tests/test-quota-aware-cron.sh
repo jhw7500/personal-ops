@@ -44,6 +44,11 @@ case "${CLAUDE_STUB_MODE:-success}" in
         printf '%s\n' 'authentication_error: OAuth token has expired. Please run /login' >&2
         exit 1
         ;;
+    auth-slow)
+        sleep "${CLAUDE_STUB_SLEEP:-2}"
+        printf '%s\n' 'Failed to authenticate. API Error: 401 Invalid authentication credentials' >&2
+        exit 1
+        ;;
     quota)
         printf '%s\n' "You've hit your usage limit" >&2
         exit 1
@@ -86,14 +91,25 @@ sandbox_run() {
     local script=$2
     shift 2
 
-    bwrap --die-with-parent --unshare-net \
-        --ro-bind / / \
-        --dev /dev \
-        --proc /proc \
-        --bind "$TEST_ROOT" /mnt \
-        --bind "${case_dir}/tmp" /tmp \
-        --chdir "$REPO_ROOT" \
-        "$@" /bin/bash "$script"
+    if [[ -n "${SANDBOX_SCRIPT_ARG:-}" ]]; then
+        bwrap --die-with-parent --unshare-net \
+            --ro-bind / / \
+            --dev /dev \
+            --proc /proc \
+            --bind "$TEST_ROOT" /mnt \
+            --bind "${case_dir}/tmp" /tmp \
+            --chdir "$REPO_ROOT" \
+            "$@" /bin/bash "$script" "$SANDBOX_SCRIPT_ARG"
+    else
+        bwrap --die-with-parent --unshare-net \
+            --ro-bind / / \
+            --dev /dev \
+            --proc /proc \
+            --bind "$TEST_ROOT" /mnt \
+            --bind "${case_dir}/tmp" /tmp \
+            --chdir "$REPO_ROOT" \
+            "$@" /bin/bash "$script"
+    fi
 }
 
 run_cli_init() {
@@ -146,6 +162,17 @@ run_session_summary() {
         INCLUDE_CC=0 \
         INCLUDE_COMMITS=0 \
         REMOTE_HOSTS=" "
+}
+
+run_session_rotate() {
+    local case_dir=$1
+    local runtime_case="/mnt/${case_dir##*/}"
+
+    SANDBOX_SCRIPT_ARG=rotate sandbox_run "$case_dir" \
+        "$SESSION_SUMMARY_SCRIPT" \
+        env \
+        SESSION_SUMMARY_MODULE_DIR="${runtime_case}/module" \
+        SESSION_SUMMARY_LOCK_FILE="${runtime_case}/tmp/session-summary.lock"
 }
 
 call_count() {
@@ -300,6 +327,17 @@ test_summary_auth_creates_twenty_four_hour_backoff() {
     fi
 }
 
+test_summary_auth_backoff_is_anchored_to_run_start() {
+    local case_dir marker started until
+    case_dir=$(new_case)
+    run_session_summary "$case_dir" auth-slow 65536 5 2 >/dev/null 2>&1 || return 1
+    marker="${case_dir}/module/state/claude-backoff"
+
+    started=$(awk -F= '$1 == "started_epoch" {print $2}' "$marker")
+    until=$(awk -F= '$1 == "until_epoch" {print $2}' "$marker")
+    assert_equals 86400 "$(( until - started ))" "auth backoff anchor" || return 1
+}
+
 test_summary_classifies_real_quota_error_corpus() {
     local mode case_dir marker
     for mode in quota-weekly quota-api; do
@@ -343,6 +381,33 @@ test_summary_hard_kills_term_ignoring_process() {
     assert_contains "${case_dir}/module/logs/summary.log" 'class=timeout'
 }
 
+test_summary_rotate_waits_for_running_summary() {
+    local case_dir summary_pid rotate_pid archive_file
+    case_dir=$(new_case)
+
+    run_session_summary "$case_dir" sleep 65536 3 1 1 >/dev/null 2>&1 &
+    summary_pid=$!
+    for _ in $(seq 1 50); do
+        [[ -s "${case_dir}/calls" ]] && break
+        sleep 0.02
+    done
+    run_session_rotate "$case_dir" >/dev/null 2>&1 &
+    rotate_pid=$!
+
+    wait "$summary_pid" || return 1
+    wait "$rotate_pid" || return 1
+    archive_file=$(find "${case_dir}/module/archive" -type f -name 'summary-*.md' -print -quit)
+    if [[ -z "$archive_file" ]]; then
+        printf '  rotate did not archive the completed summary\n' >&2
+        return 1
+    fi
+    assert_contains "$archive_file" '## stub summary' || return 1
+    if [[ -e "${case_dir}/module/logs/session-summary.md" ]]; then
+        printf '  rotate left the completed summary in the active file\n' >&2
+        return 1
+    fi
+}
+
 test_summary_rejects_oversized_prompt_without_model_call() {
     local case_dir
     case_dir=$(new_case)
@@ -384,10 +449,12 @@ run_test test_summary_uses_one_bounded_low_effort_call
 run_test test_summary_serializes_overlapping_runs
 run_test test_summary_quota_creates_six_hour_backoff
 run_test test_summary_auth_creates_twenty_four_hour_backoff
+run_test test_summary_auth_backoff_is_anchored_to_run_start
 run_test test_summary_classifies_real_quota_error_corpus
 run_test test_summary_classifies_real_auth_error_corpus
 run_test test_summary_classifies_timeout
 run_test test_summary_hard_kills_term_ignoring_process
+run_test test_summary_rotate_waits_for_running_summary
 run_test test_summary_rejects_oversized_prompt_without_model_call
 run_test test_summary_rejects_invalid_numeric_config_before_model_call
 

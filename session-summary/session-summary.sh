@@ -30,6 +30,7 @@ TIMEOUT_SECONDS="${SESSION_SUMMARY_TIMEOUT_SECONDS:-180}"
 TIMEOUT_KILL_AFTER_SECONDS="${SESSION_SUMMARY_TIMEOUT_KILL_AFTER_SECONDS:-5}"
 QUOTA_BACKOFF_SECONDS="${SESSION_SUMMARY_QUOTA_BACKOFF_SECONDS:-21600}"
 AUTH_BACKOFF_SECONDS="${SESSION_SUMMARY_AUTH_BACKOFF_SECONDS:-86400}"
+RUN_STARTED_EPOCH=$(date +%s)
 DATE=$(date +%Y-%m-%d)
 YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
 
@@ -85,9 +86,10 @@ write_backoff() {
     local reason=$1
     local duration_seconds=$2
     local until_epoch marker_tmp
-    until_epoch=$(( $(date +%s) + duration_seconds ))
+    until_epoch=$(( RUN_STARTED_EPOCH + duration_seconds ))
     marker_tmp="${BACKOFF_FILE}.tmp.$$"
-    printf 'reason=%s\nuntil_epoch=%s\n' "$reason" "$until_epoch" > "$marker_tmp"
+    printf 'reason=%s\nstarted_epoch=%s\nuntil_epoch=%s\n' \
+        "$reason" "$RUN_STARTED_EPOCH" "$until_epoch" > "$marker_tmp"
     mv "$marker_tmp" "$BACKOFF_FILE"
 }
 
@@ -106,8 +108,15 @@ classify_claude_failure() {
     fi
 }
 
+exec 8>"$LOCK_FILE"
+
 # --- 로테이트 모드 ---
 if [[ "${1:-}" == "rotate" ]]; then
+    echo "[$DATE] 로테이트 대기: 실행 중인 요약 확인" >> "$LOGFILE"
+    if ! flock 8; then
+        echo "[$DATE] 로테이트 실패: lock 획득 실패" >> "$LOGFILE"
+        exit 1
+    fi
     echo "[$DATE] ===== 로테이트 시작: $(date) =====" >> "$LOGFILE"
     if [[ -s "$SUMMARY_FILE" ]]; then
         # 수요일 09:10 로테이트 기준: 지난 수요일(7일 전) ~ 어제(화요일)
@@ -137,7 +146,6 @@ SEARCH_FROM="$YESTERDAY"
 
 echo "[$DATE] ===== 세션 요약 시작: $(date) =====" >> "$LOGFILE"
 
-exec 8>"$LOCK_FILE"
 if ! flock -n 8; then
     echo "[$DATE] skipped: already running" >> "$LOGFILE"
     exit 0

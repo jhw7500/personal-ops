@@ -17,8 +17,11 @@ Claude Code episodic-memory + opencode SQLite에서 전일 세션을 긁어와 �
 - 전체 프롬프트는 기본 65,536 bytes 이하로 제한한다. 실행은 180초 후 TERM,
   종료되지 않으면 5초 뒤 KILL해 하드 상한을 둔다.
 - quota 오류는 6시간, 인증 오류는 24시간 `state/claude-backoff` marker로 재호출을 막는다.
+  만료 시각은 오류가 출력된 시점이 아니라 예약 실행 시작 시각을 기준으로 계산해 다음 날
+  같은 시각의 cron을 불필요하게 건너뛰지 않는다.
 - 실패는 `auth`, `quota`, `timeout`, `input-limit`, `other`로 로그와 요약 파일에 구분한다.
-- `flock -n`으로 겹친 요약 실행은 모델을 추가 호출하지 않고 건너뛴다.
+- `flock -n`으로 겹친 요약 실행은 모델을 추가 호출하지 않고 건너뛴다. 수요일 rotate는
+  같은 lock을 기다린 뒤 실행해 진행 중인 요약 결과까지 해당 주 archive에 포함한다.
 
 운영 기본값은 다음 환경변수로 명시적으로 덮어쓸 수 있다.
 
