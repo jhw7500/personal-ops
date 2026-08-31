@@ -250,6 +250,7 @@ def _state_matches_summary(item: dict[str, Any], summary: SummaryItem) -> bool:
         )
     return (
         common_match
+        and item["status"] == "open"
         and item["priority"] == summary.priority
         and item["opened_on"] == summary.opened_on
     )
@@ -282,6 +283,84 @@ def _collapse_marked_history(summary_items: list[SummaryItem]) -> list[SummaryIt
             resolved_on=summary.resolved_on,
         )
     return collapsed
+
+
+def _coalesce_legacy_history(
+    summary_items: list[SummaryItem],
+) -> list[SummaryItem]:
+    """Join legacy copies to their later marked occurrence using summary evidence."""
+    occurrences: dict[tuple[str, str, str, str | None], int] = {}
+    item_occurrences: list[int] = []
+    for summary in summary_items:
+        occurrence_key = (
+            summary.opened_on,
+            summary.text,
+            summary.project,
+            summary.priority,
+        )
+        occurrence = occurrences.get(occurrence_key, 0) + 1
+        occurrences[occurrence_key] = occurrence
+        item_occurrences.append(occurrence)
+
+    marked: dict[tuple[str, str, str | None, int], list[int]] = {}
+    for index, summary in enumerate(summary_items):
+        if summary.marker_id is None:
+            continue
+        identity = (
+            summary.text,
+            summary.project,
+            summary.priority,
+            item_occurrences[index],
+        )
+        marked.setdefault(identity, []).append(index)
+
+    remove: set[int] = set()
+    earliest_by_marked: dict[int, str] = {}
+    for index, summary in enumerate(summary_items):
+        if summary.marker_id is not None or summary.status != "open":
+            continue
+        identity = (
+            summary.text,
+            summary.project,
+            summary.priority,
+            item_occurrences[index],
+        )
+        candidates = [
+            marked_index
+            for marked_index in marked.get(identity, [])
+            if summary_items[marked_index].opened_on >= summary.opened_on
+        ]
+        if len(candidates) > 1:
+            raise TrackerError("ambiguous legacy summary match")
+        if not candidates:
+            continue
+        marked_index = candidates[0]
+        earliest_by_marked[marked_index] = min(
+            earliest_by_marked.get(
+                marked_index, summary_items[marked_index].opened_on
+            ),
+            summary.opened_on,
+        )
+        remove.add(index)
+
+    coalesced: list[SummaryItem] = []
+    for index, summary in enumerate(summary_items):
+        if index in remove:
+            continue
+        opened_on = earliest_by_marked.get(index)
+        if opened_on is not None:
+            summary = SummaryItem(
+                text=summary.text,
+                project=summary.project,
+                priority=summary.priority,
+                opened_on=opened_on,
+                marker_id=summary.marker_id,
+                status=summary.status,
+                resolution_prefix=summary.resolution_prefix,
+                resolved_on=summary.resolved_on,
+            )
+        coalesced.append(summary)
+    return coalesced
 
 
 def run_git(
@@ -445,7 +524,9 @@ def recover_items(
     state_by_id: dict[str, dict[str, Any]],
     repositories: list[Repository],
 ) -> list[dict[str, Any]]:
-    summary_items = _collapse_marked_history(summary_items)
+    summary_items = _coalesce_legacy_history(
+        _collapse_marked_history(summary_items)
+    )
     occurrences: dict[tuple[str, str, str], int] = {}
     recovered: list[dict[str, Any]] = []
     recovered_positions: dict[str, int] = {}

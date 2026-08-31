@@ -189,7 +189,8 @@ run_session_rotate() {
         "$SESSION_SUMMARY_SCRIPT" \
         env \
         SESSION_SUMMARY_MODULE_DIR="${runtime_case}/module" \
-        SESSION_SUMMARY_LOCK_FILE="${runtime_case}/tmp/session-summary.lock"
+        SESSION_SUMMARY_LOCK_FILE="${runtime_case}/tmp/session-summary.lock" \
+        SESSION_SUMMARY_RESOLUTION_TRACKING="${TEST_RESOLUTION_TRACKING:-1}"
 }
 
 call_count() {
@@ -546,6 +547,34 @@ assert state["items"][0]["status"] == "open"
 PY
 }
 
+test_summary_rejects_invalid_tracking_config_before_rotate() {
+    local case_dir summary original
+    case_dir=$(new_case)
+    summary="${case_dir}/module/logs/session-summary.md"
+    original="${case_dir}/original-summary.md"
+    printf '%s\n' \
+        '# Claude 세션 요약' '' \
+        '## 2026-05-09 (2026-05-08 ~ 2026-05-09)' '' \
+        '### 미완료 항목' \
+        '- [ ] 설정 검증 — unknown — 중' \
+        > "$summary"
+    cp "$summary" "$original"
+
+    if TEST_RESOLUTION_TRACKING=invalid \
+        run_session_rotate "$case_dir" >/dev/null 2>&1; then
+        printf '  rotate accepted invalid tracking config\n' >&2
+        return 1
+    fi
+    cmp -s "$original" "$summary" || {
+        printf '  rotate mutated summary before config validation\n' >&2
+        return 1
+    }
+    if find "${case_dir}/module/archive" -type f -name 'summary-*.md' | grep -q .; then
+        printf '  rotate archived summary before config validation\n' >&2
+        return 1
+    fi
+}
+
 test_summary_selects_prior_archive_by_period_not_mtime() {
     local case_dir marker summary state old_archive latest_archive
     case_dir=$(new_case)
@@ -748,6 +777,7 @@ run_test test_summary_classifies_timeout
 run_test test_summary_hard_kills_term_ignoring_process
 run_test test_summary_rotate_waits_for_running_summary
 run_test test_summary_recovers_open_item_from_latest_archive_after_rotate
+run_test test_summary_rejects_invalid_tracking_config_before_rotate
 run_test test_summary_selects_prior_archive_by_period_not_mtime
 run_test test_summary_rejects_oversized_prompt_without_model_call
 run_test test_summary_rejects_invalid_numeric_config_before_model_call

@@ -269,6 +269,34 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         self.assertEqual(marker_id, items[0]["id"])
         self.assertEqual("2026-05-09", items[0]["opened_on"])
 
+    def test_prepare_rejects_ambiguous_legacy_marker_history(self) -> None:
+        first_marker = "unresolved-111111111111"
+        second_marker = "unresolved-222222222222"
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] ambiguous carryover — unknown — 중\n\n"
+            "## 2026-05-10 (2026-05-09 ~ 2026-05-10)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] ambiguous carryover — unknown — 중\n"
+            f"<!-- unresolved-id:{first_marker} -->\n\n"
+            "## 2026-05-11 (2026-05-10 ~ 2026-05-11)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] ambiguous carryover — unknown — 중\n"
+            f"<!-- unresolved-id:{second_marker} -->\n",
+            encoding="utf-8",
+        )
+        self.manifest.write_text("manifest sentinel\n", encoding="utf-8")
+        self.context.write_text("context sentinel\n", encoding="utf-8")
+
+        result = self.run_prepare()
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("ambiguous legacy summary match", result.stderr)
+        self.assertEqual("manifest sentinel\n", self.manifest.read_text(encoding="utf-8"))
+        self.assertEqual("context sentinel\n", self.context.read_text(encoding="utf-8"))
+
     def test_legacy_open_line_does_not_trust_resolved_state(self) -> None:
         marker_id = "unresolved-c0bf9d34ba97"
         self.write_summary(["- [ ] bps 배열 길이 불일치 — gstApp — 중"])
@@ -304,6 +332,70 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         item = self.read_manifest()["items"][0]
+        self.assertEqual("open", item["status"])
+        self.assertIsNone(item["resolution"])
+
+    def test_marked_open_line_does_not_trust_resolved_state(self) -> None:
+        marker_id = "unresolved-444444444444"
+        self.write_summary(
+            [
+                "- [ ] marked open state — unknown — 중",
+                f"<!-- unresolved-id:{marker_id} -->",
+            ]
+        )
+        self.state.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "items": [
+                        {
+                            "id": marker_id,
+                            "text": "marked open state",
+                            "project": "unknown",
+                            "priority": "중",
+                            "opened_on": "2026-05-09",
+                            "identity_repo_key": "unmapped:1",
+                            "repo_path": None,
+                            "baseline_head": None,
+                            "status": "resolved",
+                            "resolution": {
+                                "commit": "f" * 40,
+                                "resolved_on": "2026-05-10",
+                            },
+                            "verification": "repo-unmapped",
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        carryover = self.root / "carryover.md"
+
+        carryover_result = subprocess.run(
+            [
+                "python3",
+                str(TRACKER),
+                "carryover",
+                "--summary",
+                str(self.summary),
+                "--state",
+                str(self.state),
+                "--output",
+                str(carryover),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        prepare_result = self.run_prepare()
+
+        self.assertEqual(0, carryover_result.returncode, carryover_result.stderr)
+        self.assertIn(marker_id, carryover.read_text(encoding="utf-8"))
+        self.assertEqual(0, prepare_result.returncode, prepare_result.stderr)
+        item = self.read_manifest()["items"][0]
+        self.assertEqual(marker_id, item["id"])
         self.assertEqual("open", item["status"])
         self.assertIsNone(item["resolution"])
 
@@ -622,6 +714,47 @@ class ResolutionTrackerGitTests(TrackerGitFixture, unittest.TestCase):
         self.assertEqual("unmapped:1", items[0]["identity_repo_key"])
         self.assertEqual(str(repo.resolve()), items[0]["repo_path"])
         self.assertEqual(baseline, items[0]["baseline_head"])
+
+    def test_legacy_and_marked_history_coalesce_without_valid_state(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        marker_id = "unresolved-c0bf9d34ba97"
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n\n"
+            "## 2026-05-12 (2026-05-11 ~ 2026-05-12)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{marker_id} -->\n\n"
+            "## 2026-05-13 (2026-05-12 ~ 2026-05-13)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{marker_id} -->\n",
+            encoding="utf-8",
+        )
+
+        for state_contents in (None, "{broken"):
+            with self.subTest(state=state_contents):
+                if state_contents is None:
+                    self.state.unlink(missing_ok=True)
+                else:
+                    self.state.write_text(state_contents, encoding="utf-8")
+
+                result = self.run_prepare(repo)
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                items = json.loads(self.manifest.read_text(encoding="utf-8"))["items"]
+                self.assertEqual(1, len(items))
+                self.assertEqual(marker_id, items[0]["id"])
+                self.assertEqual("2026-05-09", items[0]["opened_on"])
+                self.assertEqual(str(repo.resolve()), items[0]["repo_path"])
 
     def test_state_cannot_move_opened_on_before_summary_evidence(self) -> None:
         repo = self.create_repo()

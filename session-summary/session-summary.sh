@@ -71,6 +71,13 @@ export PATH
 
 mkdir -p "$ARCHIVE_DIR" "$STATE_DIR" "$(dirname "$LOGFILE")"
 
+if [[ "${1:-}" == "rotate" \
+    && "$RESOLUTION_TRACKING" != "0" \
+    && "$RESOLUTION_TRACKING" != "1" ]]; then
+    echo "[$DATE] 로테이트 실패: invalid_config=SESSION_SUMMARY_RESOLUTION_TRACKING value=${RESOLUTION_TRACKING}" >> "$LOGFILE"
+    exit 1
+fi
+
 ensure_header() {
     if [[ ! -f "$SUMMARY_FILE" ]]; then
         cat > "$SUMMARY_FILE" <<EOF
