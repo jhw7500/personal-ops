@@ -8,8 +8,11 @@ import hashlib
 import json
 import os
 import re
+import selectors
+import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import date
@@ -20,6 +23,10 @@ from typing import Any, Sequence
 SCHEMA = 1
 OPEN_LIMIT = 100
 RESOLVED_LIMIT = 200
+GIT_TIMEOUT_SECONDS = 5
+GIT_OUTPUT_LIMIT = 1024 * 1024
+ITEM_CONTEXT_LIMIT = 4 * 1024
+TOTAL_CONTEXT_LIMIT = 32 * 1024
 STATE_FIELDS = {
     "id",
     "text",
@@ -63,6 +70,13 @@ class SummaryItem:
     priority: str
     opened_on: str
     marker_id: str | None
+
+
+@dataclass(frozen=True)
+class Repository:
+    path: Path
+    name: str
+    head: str
 
 
 def normalize_text(text: str) -> str:
@@ -199,8 +213,129 @@ def _state_matches_summary(item: dict[str, Any], summary: SummaryItem) -> bool:
     )
 
 
+def run_git(
+    repo: Path,
+    args: Sequence[str],
+    timeout: int = GIT_TIMEOUT_SECONDS,
+    max_output: int = GIT_OUTPUT_LIMIT,
+) -> str:
+    environment = {
+        **os.environ,
+        "GIT_PAGER": "cat",
+        "LC_ALL": "C.UTF-8",
+    }
+    try:
+        process = subprocess.Popen(
+            ["git", "-C", str(repo), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+    except OSError as error:
+        raise TrackerError(f"git command failed for {repo}: {error}") from error
+    assert process.stdout is not None
+    assert process.stderr is not None
+    streams = {process.stdout: [], process.stderr: []}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    output_size = 0
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TrackerError(f"git command timed out for {repo}")
+            events = selector.select(min(remaining, 0.1))
+            if not events and process.poll() is None:
+                continue
+            for key, _ in events:
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                output_size += len(chunk)
+                if output_size > max_output:
+                    raise TrackerError(f"git output limit exceeded for {repo}")
+                streams[stream].append(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TrackerError(f"git command timed out for {repo}")
+        process.wait(timeout=remaining)
+    except (TrackerError, subprocess.TimeoutExpired):
+        process.kill()
+        process.wait()
+        raise TrackerError(
+            f"git command timed out for {repo}"
+            if time.monotonic() >= deadline
+            else f"git output limit exceeded for {repo}"
+        )
+    finally:
+        selector.close()
+        for stream in streams:
+            if not stream.closed:
+                stream.close()
+    stdout_bytes = b"".join(streams[process.stdout])
+    stderr_bytes = b"".join(streams[process.stderr])
+    try:
+        stdout = stdout_bytes.decode("utf-8", errors="strict")
+        stderr = stderr_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise TrackerError(f"git output is not valid UTF-8 for {repo}") from error
+    if process.returncode != 0:
+        detail = stderr.strip().splitlines()[-1] if stderr.strip() else "unknown error"
+        raise TrackerError(f"git exited {process.returncode} for {repo}: {detail}")
+    return stdout
+
+
+def validate_repositories(paths: Sequence[str]) -> list[Repository]:
+    repositories: list[Repository] = []
+    seen: set[Path] = set()
+    for raw_path in paths:
+        candidate = Path(raw_path)
+        if not candidate.is_absolute() or not candidate.is_dir():
+            continue
+        normalized = candidate.resolve()
+        try:
+            top_level_text = run_git(
+                normalized, ("rev-parse", "--show-toplevel")
+            ).strip()
+            top_level = Path(top_level_text).resolve()
+            head = run_git(normalized, ("rev-parse", "HEAD")).strip()
+        except (TrackerError, OSError):
+            continue
+        if top_level != normalized or not SHA_RE.fullmatch(head) or top_level in seen:
+            continue
+        seen.add(top_level)
+        repositories.append(
+            Repository(path=top_level, name=top_level.name, head=head)
+        )
+    return repositories
+
+
+def _dated_baseline(repo: Repository, opened_on: str) -> str | None:
+    output = run_git(
+        repo.path,
+        (
+            "log",
+            "--all",
+            "--no-merges",
+            f"--until={opened_on}T23:59:59",
+            "--format=%H",
+            "-n",
+            "1",
+        ),
+    ).strip()
+    return output if SHA_RE.fullmatch(output) else None
+
+
 def recover_items(
-    summary_items: list[SummaryItem], state_by_id: dict[str, dict[str, Any]]
+    summary_items: list[SummaryItem],
+    state_by_id: dict[str, dict[str, Any]],
+    repositories: list[Repository],
 ) -> list[dict[str, Any]]:
     occurrences: dict[tuple[str, str, str], int] = {}
     recovered: list[dict[str, Any]] = []
@@ -213,11 +348,16 @@ def recover_items(
         if stored is not None and _state_matches_summary(stored, summary):
             item = dict(stored)
         else:
+            matches = [repo for repo in repositories if repo.name == summary.project]
+            mapped_repo = matches[0] if len(matches) == 1 else None
+            identity_repo_key = (
+                str(mapped_repo.path) if mapped_repo is not None else fallback_identity
+            )
             item_id = summary.marker_id or make_item_id(
                 summary.opened_on,
                 summary.project,
                 summary.text,
-                fallback_identity,
+                identity_repo_key,
             )
             item = {
                 "id": item_id,
@@ -225,16 +365,202 @@ def recover_items(
                 "project": summary.project,
                 "priority": summary.priority,
                 "opened_on": summary.opened_on,
-                "identity_repo_key": fallback_identity,
-                "repo_path": None,
+                "identity_repo_key": identity_repo_key,
+                "repo_path": str(mapped_repo.path) if mapped_repo is not None else None,
                 "baseline_head": None,
                 "status": "open",
                 "resolution": None,
-                "verification": "repo-unmapped",
+                "verification": (
+                    "ready"
+                    if mapped_repo is not None
+                    else "repo-ambiguous"
+                    if len(matches) > 1
+                    else "repo-unmapped"
+                ),
             }
+            if mapped_repo is not None:
+                try:
+                    item["baseline_head"] = _dated_baseline(
+                        mapped_repo, summary.opened_on
+                    )
+                except TrackerError:
+                    item["verification"] = "git-unavailable"
+        if item["repo_path"] is None:
+            matches = [repo for repo in repositories if repo.name == item["project"]]
+            if len(matches) == 1:
+                mapped_repo = matches[0]
+                item["repo_path"] = str(mapped_repo.path)
+                try:
+                    item["baseline_head"] = _dated_baseline(
+                        mapped_repo, item["opened_on"]
+                    )
+                    item["verification"] = "ready"
+                except TrackerError:
+                    item["verification"] = "git-unavailable"
+            elif len(matches) > 1:
+                item["verification"] = "repo-ambiguous"
         item["candidates"] = []
         recovered.append(item)
     return recovered
+
+
+def extract_evidence_tokens(text: str, project: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_.:\[\]]{2,}|\d{2,}", text)
+    excluded = {project.casefold(), "todo", "fixme", "pass", "fail"}
+    return sorted(
+        {
+            token
+            for token in tokens
+            if token.casefold() not in excluded
+            and (not token.isdigit() or len(token) >= 2)
+        }
+    )
+
+
+def _token_pattern(token: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])"
+    )
+
+
+def _patch_candidate(
+    repo: Repository, commit: str, tokens: list[str]
+) -> dict[str, Any] | None:
+    subject = run_git(repo.path, ("show", "-s", "--format=%s", commit)).strip()
+    patch = run_git(
+        repo.path,
+        (
+            "show",
+            "--format=",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "--unified=2",
+            commit,
+            "--",
+        ),
+    )
+    lines = patch.splitlines()
+    current_path = ""
+    for index, line in enumerate(lines):
+        if line.startswith("--- a/"):
+            current_path = line[6:]
+            continue
+        if line.startswith("+++ b/"):
+            current_path = line[6:]
+            continue
+        if not line.startswith(("+", "-")) or line.startswith(("+++", "---")):
+            continue
+        matched = [token for token in tokens if _token_pattern(token).search(line[1:])]
+        if not matched:
+            continue
+        excerpt = "\n".join(lines[max(0, index - 2) : min(len(lines), index + 3)])
+        return {
+            "commit": commit,
+            "short": commit[:7],
+            "subject": subject,
+            "matched_tokens": matched,
+            "path": current_path,
+            "excerpt": excerpt,
+        }
+    return None
+
+
+def attach_candidates(
+    items: list[dict[str, Any]], repositories: list[Repository]
+) -> None:
+    repositories_by_path = {str(repo.path): repo for repo in repositories}
+    for item in items:
+        if item["status"] != "open" or item["verification"] != "ready":
+            continue
+        repo = repositories_by_path.get(item["repo_path"])
+        baseline = item["baseline_head"]
+        if repo is None or not isinstance(baseline, str):
+            item["verification"] = "git-unavailable"
+            continue
+        try:
+            run_git(repo.path, ("cat-file", "-e", f"{baseline}^{{commit}}"))
+            run_git(repo.path, ("merge-base", "--is-ancestor", baseline, repo.head))
+        except TrackerError:
+            item["candidates"] = []
+            item["verification"] = "history-diverged"
+            continue
+        try:
+            revisions = run_git(
+                repo.path,
+                (
+                    "rev-list",
+                    "--reverse",
+                    "--no-merges",
+                    "--max-count=201",
+                    f"{baseline}..{repo.head}",
+                ),
+            ).splitlines()
+            if len(revisions) > 200:
+                raise TrackerError("commit history limit exceeded")
+            tokens = extract_evidence_tokens(item["text"], item["project"])
+            candidates = []
+            for commit in revisions:
+                if not SHA_RE.fullmatch(commit):
+                    raise TrackerError("malformed commit id")
+                candidate = _patch_candidate(repo, commit, tokens)
+                if candidate is not None:
+                    candidates.append(candidate)
+                if len(candidates) == 5:
+                    break
+            item["candidates"] = candidates
+        except TrackerError as error:
+            item["candidates"] = []
+            item["verification"] = "git-unavailable"
+
+
+def _render_item_card(item: dict[str, Any]) -> str:
+    lines = [
+        f"ITEM {item['id']}",
+        "ORIGINAL "
+        f"- [ ] {item['text']} — {item['project']} — {item['priority']}",
+        f"STATUS {item['verification']}",
+    ]
+    if item["candidates"]:
+        for candidate in item["candidates"]:
+            lines.extend(
+                (
+                    "CANDIDATE "
+                    f"{candidate['short']} {candidate['subject']} "
+                    f"tokens={','.join(candidate['matched_tokens'])} "
+                    f"path={candidate['path']}",
+                    candidate["excerpt"],
+                )
+            )
+    else:
+        lines.append("CANDIDATE (none)")
+    return "\n".join(lines)
+
+
+def apply_context_limits(items: list[dict[str, Any]]) -> None:
+    total_bytes = 0
+    for item in items:
+        if item["status"] != "open":
+            continue
+        card = _render_item_card(item)
+        card_bytes = len(card.encode("utf-8"))
+        if card_bytes > ITEM_CONTEXT_LIMIT and item["candidates"]:
+            item["candidates"] = []
+            item["verification"] = "git-unavailable"
+            card = _render_item_card(item)
+            card_bytes = len(card.encode("utf-8"))
+        if card_bytes > ITEM_CONTEXT_LIMIT:
+            raise TrackerError(f"item context limit exceeded for {item['id']}")
+        separator_bytes = 2 if total_bytes else 0
+        if total_bytes + separator_bytes + card_bytes + 1 > TOTAL_CONTEXT_LIMIT:
+            if item["candidates"]:
+                item["candidates"] = []
+                item["verification"] = "git-unavailable"
+                card = _render_item_card(item)
+                card_bytes = len(card.encode("utf-8"))
+            if total_bytes + separator_bytes + card_bytes + 1 > TOTAL_CONTEXT_LIMIT:
+                raise TrackerError("total resolution context limit exceeded")
+        total_bytes += separator_bytes + card_bytes
 
 
 def render_context(items: list[dict[str, Any]]) -> str:
@@ -242,17 +568,7 @@ def render_context(items: list[dict[str, Any]]) -> str:
     for item in items:
         if item["status"] != "open":
             continue
-        cards.append(
-            "\n".join(
-                (
-                    f"ITEM {item['id']}",
-                    "ORIGINAL "
-                    f"- [ ] {item['text']} — {item['project']} — {item['priority']}",
-                    f"STATUS {item['verification']}",
-                    "CANDIDATE (none)",
-                )
-            )
-        )
+        cards.append(_render_item_card(item))
     return "\n\n".join(cards) + ("\n" if cards else "")
 
 
@@ -287,8 +603,13 @@ def prepare(args: argparse.Namespace) -> None:
     except (OSError, UnicodeError) as error:
         raise TrackerError(f"cannot read summary: {error}") from error
 
+    repositories = validate_repositories(args.repo)
     summary_items = parse_summary(markdown)
-    items = recover_items(summary_items, load_state(Path(args.state)))
+    items = recover_items(
+        summary_items, load_state(Path(args.state)), repositories
+    )
+    attach_candidates(items, repositories)
+    apply_context_limits(items)
     open_count = sum(item["status"] == "open" for item in items)
     if open_count > OPEN_LIMIT:
         raise TrackerError(
@@ -298,7 +619,10 @@ def prepare(args: argparse.Namespace) -> None:
     manifest = {
         "schema": SCHEMA,
         "prepared_on": date.today().isoformat(),
-        "repositories": [],
+        "repositories": [
+            {"path": str(repo.path), "name": repo.name, "head": repo.head}
+            for repo in repositories
+        ],
         "items": items,
     }
     manifest_bytes = (

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -205,6 +206,347 @@ class ResolutionTrackerPrepareTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(0o600, self.manifest.stat().st_mode & 0o777)
         self.assertEqual(0o600, self.context.stat().st_mode & 0o777)
+
+
+class ResolutionTrackerGitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.summary = self.root / "summary.md"
+        self.state = self.root / "unresolved-items.json"
+        self.manifest = self.root / "manifest.json"
+        self.context = self.root / "context.txt"
+
+    def git(
+        self,
+        repo: Path,
+        *args: str,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result
+
+    def init_repo(self, repo: Path) -> Path:
+        repo.mkdir(parents=True)
+        self.git(repo, "init", "-q")
+        self.git(repo, "config", "user.name", "Resolution Test")
+        self.git(repo, "config", "user.email", "resolution@example.test")
+        return repo
+
+    def create_repo(self, name: str = "gstApp") -> Path:
+        return self.init_repo(self.root / name)
+
+    def commit(
+        self,
+        repo: Path,
+        message: str,
+        content: str,
+        when: str,
+        relative_path: str = "src/config.c",
+    ) -> str:
+        target = repo / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        self.git(repo, "add", relative_path)
+        commit_env = {
+            **os.environ,
+            "GIT_AUTHOR_DATE": when,
+            "GIT_COMMITTER_DATE": when,
+        }
+        self.git(repo, "commit", "-q", "-m", message, env=commit_env)
+        return self.git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def write_open_summary(self, text: str = "bps 배열 길이 불일치") -> None:
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            f"- [ ] {text} — gstApp — 중\n",
+            encoding="utf-8",
+        )
+
+    def write_marked_summary(self, marker_id: str) -> None:
+        self.summary.write_text(
+            "# Claude 세션 요약\n\n"
+            "## 2026-05-09 (2026-05-08 ~ 2026-05-09)\n\n"
+            "### 미완료 항목\n"
+            "- [ ] bps 배열 길이 불일치 — gstApp — 중\n"
+            f"<!-- unresolved-id:{marker_id} -->\n",
+            encoding="utf-8",
+        )
+
+    def write_state(self, marker_id: str, repo: Path, baseline: str) -> None:
+        payload = {
+            "schema": 1,
+            "items": [
+                {
+                    "id": marker_id,
+                    "text": "bps 배열 길이 불일치",
+                    "project": "gstApp",
+                    "priority": "중",
+                    "opened_on": "2026-05-09",
+                    "identity_repo_key": str(repo.resolve()),
+                    "repo_path": str(repo.resolve()),
+                    "baseline_head": baseline,
+                    "status": "open",
+                    "resolution": None,
+                    "verification": "ready",
+                }
+            ],
+        }
+        self.state.write_text(
+            json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+    def run_prepare(self, *repos: Path) -> subprocess.CompletedProcess[str]:
+        command = [
+            "python3",
+            str(TRACKER),
+            "prepare",
+            "--summary",
+            str(self.summary),
+            "--state",
+            str(self.state),
+            "--manifest",
+            str(self.manifest),
+            "--context",
+            str(self.context),
+        ]
+        for repo in repos:
+            command.extend(("--repo", str(repo)))
+        return subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_generic_subject_with_matching_patch_is_candidate(self) -> None:
+        repo = self.create_repo()
+        baseline = self.commit(
+            repo,
+            "feat: initial camera config",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        fix = self.commit(
+            repo,
+            "chore: build directory cleanup",
+            "void configure(void) { arg.cam[i].bps = json_array_length(node); }\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.write_open_summary()
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        item = manifest["items"][0]
+        self.assertEqual(str(repo.resolve()), item["repo_path"])
+        self.assertEqual(baseline, item["baseline_head"])
+        self.assertEqual("ready", item["verification"])
+        self.assertEqual([fix], [candidate["commit"] for candidate in item["candidates"]])
+        candidate = item["candidates"][0]
+        self.assertEqual(fix[:7], candidate["short"])
+        self.assertEqual("chore: build directory cleanup", candidate["subject"])
+        self.assertEqual(["bps"], candidate["matched_tokens"])
+        self.assertEqual("src/config.c", candidate["path"])
+        self.assertIn("arg.cam[i].bps", candidate["excerpt"])
+
+    def test_relevant_subject_without_patch_token_is_not_candidate(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: initial camera config",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n"
+            "void unrelated(void) { retries = 1; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        self.commit(
+            repo,
+            "fix: resolve bps array length",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n"
+            "void unrelated(void) { retries = 3; }\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.write_open_summary()
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual([], item["candidates"])
+        self.assertEqual("ready", item["verification"])
+
+    def test_project_name_is_not_patch_evidence(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: initial camera config",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n"
+            "// old product documentation\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        self.commit(
+            repo,
+            "docs: rename product comment",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n"
+            "// gstApp project documentation changed\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.write_open_summary("gstApp bps 추적")
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual([], item["candidates"])
+
+    def test_same_basename_repositories_remain_ambiguous(self) -> None:
+        first = self.init_repo(self.root / "first" / "gstApp")
+        second = self.init_repo(self.root / "second" / "gstApp")
+        for repo in (first, second):
+            self.commit(
+                repo,
+                "feat: baseline",
+                "void configure(void) { arg.cam[i].bps = 4096; }\n",
+                "2026-05-09T12:00:00+0900",
+            )
+        self.write_open_summary()
+
+        result = self.run_prepare(first, second)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertIsNone(item["repo_path"])
+        self.assertIsNone(item["baseline_head"])
+        self.assertEqual("repo-ambiguous", item["verification"])
+        self.assertEqual([], item["candidates"])
+
+    def test_nested_or_unlisted_repository_is_not_mapped(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        nested = repo / "src"
+        self.write_open_summary()
+
+        result = self.run_prepare(nested)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.assertEqual([], manifest["repositories"])
+        self.assertEqual("repo-unmapped", manifest["items"][0]["verification"])
+
+    def test_invalid_baseline_is_history_diverged(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        marker_id = "unresolved-444444444444"
+        self.write_marked_summary(marker_id)
+        self.write_state(marker_id, repo, "f" * 40)
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual("history-diverged", item["verification"])
+        self.assertEqual([], item["candidates"])
+
+    def test_more_than_two_hundred_later_commits_discards_history(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        commit_env = {
+            **os.environ,
+            "GIT_AUTHOR_DATE": "2026-05-11T12:00:00+0900",
+            "GIT_COMMITTER_DATE": "2026-05-11T12:00:00+0900",
+        }
+        for index in range(201):
+            self.git(
+                repo,
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                f"chore: unrelated {index:03d}",
+                env=commit_env,
+            )
+        self.write_open_summary()
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual([], item["candidates"])
+        self.assertEqual("git-unavailable", item["verification"])
+
+    def test_oversized_patch_discards_partial_candidate(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        self.commit(
+            repo,
+            "chore: large generated config",
+            "bps " + ("x" * (1024 * 1024 + 100)) + "\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.write_open_summary()
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual([], item["candidates"])
+        self.assertEqual("git-unavailable", item["verification"])
+
+    def test_item_context_over_four_kib_discards_candidate(self) -> None:
+        repo = self.create_repo()
+        self.commit(
+            repo,
+            "feat: baseline",
+            "void configure(void) { arg.cam[i].bps = 4096; }\n",
+            "2026-05-09T12:00:00+0900",
+        )
+        self.commit(
+            repo,
+            "chore: verbose config line",
+            "bps " + ("x" * 5000) + "\n",
+            "2026-05-11T12:00:00+0900",
+        )
+        self.write_open_summary()
+
+        result = self.run_prepare(repo)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        item = json.loads(self.manifest.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual([], item["candidates"])
+        self.assertEqual("git-unavailable", item["verification"])
+        self.assertLessEqual(len(self.context.read_bytes()), 4096)
 
 
 if __name__ == "__main__":
