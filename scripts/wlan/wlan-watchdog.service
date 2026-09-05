@@ -1,0 +1,17 @@
+[Unit]
+Description=wlan0 auto-recovery watchdog (rtw88 RTL8822CU firmware hang mitigation)
+Documentation=https://github.com/lwfinger/rtw88/issues/377
+After=network.target netplan-wpa-wlan0.service
+Wants=netplan-wpa-wlan0.service
+
+[Service]
+Type=simple
+ExecStart=/home/jhw/ai/opencode/projects/personal-ops/scripts/wlan/wlan_watchdog.sh
+Restart=always
+RestartSec=10
+# 로그는 journalctl -u wlan-watchdog 로 확인
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
