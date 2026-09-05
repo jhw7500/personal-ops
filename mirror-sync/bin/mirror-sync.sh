@@ -40,7 +40,8 @@
 # 종료 코드
 #   0  성공 (--help 포함)
 #   1  사용법·인자 오류
-#   2  설정 오류 (pairs.tsv / curation conf — 축 누락·타입 오류·빈 배열 포함)
+#   2  설정 오류 (pairs.tsv / curation conf — 축 누락·타입 오류·빈 배열 포함.
+#                 빈 축은 conf 가 AXES_INTENTIONALLY_EMPTY 로 선언한 것만 통과한다)
 #   3  저장소 상태 오류 (경로·git repo 동일성·sha·조상관계·dirty 워킹트리·
 #                        브랜치 불일치·미러 .gitignore 와 복사 대상 충돌)
 #   4  어서션 실패 (--apply 시. 커밋하지 않는다)
@@ -89,6 +90,18 @@ readonly ACT_PROTECT_WARN="보호경고"
 # 전량 복사된다 — 이슈 #34 가 지적한 그 실패 방식이다.
 # load_curation() 이 source 직전에 unset 하고 source 직후에 타입·길이를 검사한다.
 readonly CURATION_AXES=(KEEP_MIRROR UPSTREAM_ONLY MIRROR_ONLY FORBID MUST_SURVIVE)
+
+# 선택 축 AXES_INTENTIONALLY_EMPTY (이슈 #41): 위 다섯 축 중 **조사한 뒤 비우기로 한**
+# 축의 이름을 담는다. 스크립트는 "축이 비어 있다"(조사 결과)와 "축을 채우지 않았다"
+# (조사 안 함)를 구분할 방법이 없어 둘 다 종료 코드 2 로 거부해 왔다. 이 표식은 conf 가
+# 전자를 **명시적으로 선언**할 때만 그 축의 빈 배열을 통과시킨다. 기본 동작은 그대로다 —
+# 표식에 없는 빈 축은 여전히 종료 코드 2 다.
+# 표식은 "안전하다"가 아니라 "사람이 알고 있다"는 뜻이므로, 통과시킨 축이 무엇을
+# 무력화하는지 warn_intentionally_empty_axes() 가 매 실행 출력에 경고로 찍는다.
+# load_curation() 이 오타(축 이름이 아닌 값)·중복(같은 축을 두 번 적음)·모순(비어 있지
+# 않은 축을 표식에 넣음)을 전부 종료 코드 2 로 거부하고, main() 이 load_curation() 반환
+# 직후 이 변수가 **전역에 남았는지**를 한 번 더 확인한다(conf 가 `declare` 를 쓰면 함수
+# 지역 변수가 되어 사라지기 때문 — 자세한 이유는 그 자리 주석 참조).
 
 # 컴파일된 정규식 (compile_patterns 가 채운다)
 declare -a KEEP_MIRROR_RE=()
@@ -192,6 +205,12 @@ $SCRIPT_NAME — 큐레이션 미러 싱크 (personal-ops 이슈 #34)
     ASSERT_E_STAGED_AS_REPORTED     '쓰기/삭제' 로 보고한 대로 인덱스가 바뀌었는가
     ASSERT_F_NEW_FILE_INFLOW        미러에 없던 파일이 승인 없이 새로 들어왔는가
   하나라도 실패하면 커밋하지 않고 종료 코드 4 로 끝낸다. 경고로 넘기지 않는다.
+
+  큐레이션 축이 통째로 비면 종료 코드 2 로 거부한다. **조사한 뒤 비우기로 한** 축은
+  conf 에 AXES_INTENTIONALLY_EMPTY=( <축이름> ... ) 로 선언하면 통과한다. 그 축이 무엇을
+  무력화하는지는 dry-run·--apply 양쪽에서 [주의] 로 찍히고 미러 커밋 메시지에도 남는다
+  (축 이름 오타·중복, "표식에 있는데 비어 있지 않은 축", declare 로 선언해 전역에 남지
+  않은 표식은 전부 종료 코드 2 로 거부한다).
 
   A~D 는 큐레이션 규칙을, E~F 는 **규칙과 독립된 오라클**을 쓴다.
   A 는 UPSTREAM_ONLY 패턴으로 검사하므로 "어느 패턴에도 안 걸려 기본값(복사)으로
@@ -338,13 +357,16 @@ var_kind() {
 load_curation() {
     local base="$1"
     local conf="$CURATION_DIR/$base.conf"
-    local ax kind n
+    local ax kind n marked known m
+    local -A seen_marked=()
 
     [[ -f "$conf" ]] || die 2 "큐레이션 규칙 파일이 없다: $conf"
 
     # source 전에 반드시 지운다. 남아 있으면 conf 가 스칼라로 대입해도 배열로 보인다
     # (자세한 이유는 위 CURATION_AXES 선언부 주석 참조).
-    unset -v "${CURATION_AXES[@]}" MUST_SURVIVE_IN
+    # AXES_INTENTIONALLY_EMPTY 도 같이 지운다 — 남아 있으면 직전 conf 의 표식이
+    # 이번 conf 의 빈 축을 통과시킨다.
+    unset -v "${CURATION_AXES[@]}" MUST_SURVIVE_IN AXES_INTENTIONALLY_EMPTY
 
     # shellcheck source=/dev/null
     if ! source "$conf"; then
@@ -366,13 +388,66 @@ $ax=( \"a\" \"b\" ) 형식이어야 한다 — 공백 구분 문자열 하나로
         esac
     done
 
+    # ── AXES_INTENTIONALLY_EMPTY (선택 축, 이슈 #41) ─────────────────────────
+    # 아래 빈 축 검사보다 **먼저** 검증한다. 표식 자체가 틀린 상태로 빈 축을 통과시키면
+    # 표식이 사고를 막는 장치가 아니라 새 사고 경로가 된다.
+    kind="$(var_kind AXES_INTENTIONALLY_EMPTY)"
+    case "$kind" in
+        a) ;;
+        unset)
+            AXES_INTENTIONALLY_EMPTY=()
+            ;;
+        *)
+            die 2 "$conf: AXES_INTENTIONALLY_EMPTY 는 bash 배열이어야 한다(선언 타입 '$kind') — \
+AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY FORBID ) 형식이다. 선언하지 않으면 빈 배열로 취급한다"
+            ;;
+    esac
+
+    # 오타·중복 차단 — 축 이름이 아닌 값은 거부한다. UPSTEAM_ONLY 같은 오타를 그냥 두면
+    # 정작 비어 있는 축은 여전히 막히고, 더 나쁘게는 의도와 다른 축이 열린다.
+    for marked in ${AXES_INTENTIONALLY_EMPTY[@]+"${AXES_INTENTIONALLY_EMPTY[@]}"}; do
+        known=0
+        for ax in "${CURATION_AXES[@]}"; do
+            if [[ "$marked" == "$ax" ]]; then
+                known=1
+                break
+            fi
+        done
+        (( known == 1 )) || die 2 "$conf: AXES_INTENTIONALLY_EMPTY 에 축 이름이 아닌 값이 있다: \
+'$marked' — 쓸 수 있는 이름은 ${CURATION_AXES[*]} 뿐이다"
+
+        # 중복도 같은 이유로 거부한다. 이 표식의 산출물은 "방어선 **몇 개**가 꺼졌는가"
+        # 라는 숫자인데, 같은 축을 두 번 적으면 [주의] 블록의 개수(표식 원소 수)가 실제
+        # 빈 축 수보다 커지고 같은 설명이 두 번 찍힌다. 줄을 복사하다 나오는 흔한 형태다.
+        [[ -z "${seen_marked[$marked]:-}" ]] || die 2 "$conf: AXES_INTENTIONALLY_EMPTY 에 \
+같은 축 이름이 두 번 있다: '$marked' — 축마다 한 번만 적어라(중복은 '[주의] 의도적으로 비운 축 N개' \
+의 N 을 실제로 꺼진 축 수보다 부풀린다)"
+        seen_marked["$marked"]=1
+    done
+
     # 축이 통째로 비면 "미반입 0건 / 보존 0건" 으로 조용히 전량 복사된다.
-    # 그것이 이슈 #34 가 지적한 실패 방식이므로 여기서 막는다.
-    (( ${#KEEP_MIRROR[@]}   > 0 )) || die 2 "$conf: KEEP_MIRROR 가 비었다"
-    (( ${#UPSTREAM_ONLY[@]} > 0 )) || die 2 "$conf: UPSTREAM_ONLY 가 비었다"
-    (( ${#MIRROR_ONLY[@]}   > 0 )) || die 2 "$conf: MIRROR_ONLY 가 비었다"
-    (( ${#FORBID[@]}        > 0 )) || die 2 "$conf: FORBID 가 비었다"
-    (( ${#MUST_SURVIVE[@]}  > 0 )) || die 2 "$conf: MUST_SURVIVE 가 비었다"
+    # 그것이 이슈 #34 가 지적한 실패 방식이므로 여기서 막는다. 표식이 있는 축만
+    # 예외로 통과시킨다("조사한 뒤 이 축을 비우기로 했다" 라는 선언).
+    # 모순 차단도 같은 루프에서 한다 — 비어 있지 **않은** 축이 표식에 있으면 conf 가
+    # 낡았다는 신호다. 조용히 무시하면 나중에 그 축이 실제로 비었을 때 경고 없이 통과한다.
+    for ax in "${CURATION_AXES[@]}"; do
+        declare -n _axv="$ax"
+        marked=0
+        for m in ${AXES_INTENTIONALLY_EMPTY[@]+"${AXES_INTENTIONALLY_EMPTY[@]}"}; do
+            if [[ "$m" == "$ax" ]]; then
+                marked=1
+                break
+            fi
+        done
+        if (( ${#_axv[@]} == 0 )); then
+            (( marked == 1 )) || die 2 "$conf: $ax 가 비었다 — 조사한 뒤 이 축을 비우기로 했다면 \
+AXES_INTENTIONALLY_EMPTY=( $ax ) 로 명시해라(그 축의 방어선이 꺼졌다는 경고가 매 실행에 출력된다)"
+        else
+            (( marked == 0 )) || die 2 "$conf: $ax 가 AXES_INTENTIONALLY_EMPTY 에 있는데 \
+비어 있지 않다(${#_axv[@]}개) — conf 가 낡았다. 표식을 지우거나 축을 비워라"
+        fi
+        unset -n _axv
+    done
 
     # MUST_SURVIVE_IN 은 선택 축이다. MUST_SURVIVE 와 **같은 길이의 병렬 배열**로,
     # i 번째 원소는 MUST_SURVIVE[i] 문자열이 반드시 살아 있어야 하는 경로다.
@@ -396,6 +471,73 @@ $ax=( \"a\" \"b\" ) 형식이어야 한다 — 공백 구분 문자열 하나로
             die 2 "$conf: MUST_SURVIVE_IN 은 bash 배열이어야 한다(선언 타입 '$kind') — MUST_SURVIVE 와 같은 길이의 병렬 배열"
             ;;
     esac
+}
+
+# 의도적으로 비운 축이 **무엇을 무력화하는지** 매 실행 출력에 남긴다 (이슈 #41).
+# AXES_INTENTIONALLY_EMPTY 는 "안전하다" 가 아니라 "사람이 조사한 뒤 비우기로 했다" 는
+# 선언이다. 그 축이 담당하던 방어선은 실제로 꺼져 있으므로, 죽은 패턴 경고와 같은 자리·
+# 같은 톤으로 dry-run 과 --apply 양쪽에 찍는다(호출 지점이 --apply 분기보다 앞이다).
+warn_intentionally_empty_axes() {
+    (( ${#AXES_INTENTIONALLY_EMPTY[@]} > 0 )) || return 0
+    local ax
+    msg "  [주의] 의도적으로 비운 축 ${#AXES_INTENTIONALLY_EMPTY[@]}개 (conf 의 AXES_INTENTIONALLY_EMPTY):"
+    for ax in "${AXES_INTENTIONALLY_EMPTY[@]}"; do
+        case "$ax" in
+            KEEP_MIRROR)
+                msg "         KEEP_MIRROR — 보존 대상이 없다. upstream 에서 바뀐 공통 파일은 전부 미러를 덮어쓴다."
+                msg "                       '수동 이식 필요' 목록은 항상 비어서 나온다."
+                ;;
+            UPSTREAM_ONLY)
+                msg "         UPSTREAM_ONLY — 반입 금지 목록이 없다. upstream 전용 파일이 전부 복사 대상이 된다."
+                msg "                         ASSERT_A 는 패턴이 0개라 아무것도 검사하지 않는다(항상 통과)."
+                msg "                         미러에 없던 파일은 ASSERT_F 가 --allow-new 승인을 요구하므로 무방비는"
+                msg "                         아니다. 다만 그 방어선은 사람이 '신규 반입' 목록을 눈으로 읽는 것이 전부다."
+                ;;
+            MIRROR_ONLY)
+                msg "         MIRROR_ONLY — 삭제 보호 목록이 없다. upstream 에서 지워진 파일은 미러에서도 지워진다."
+                msg "                       ASSERT_D 는 아무것도 검사하지 않는다."
+                ;;
+            FORBID)
+                msg "         FORBID — 금지 문자열이 없다. ASSERT_B 는 아무것도 검사하지 않는다."
+                msg "                  내부 전용 문구가 미러 추적 파일로 새어 들어와도 어서션이 잡지 않는다."
+                ;;
+            MUST_SURVIVE)
+                msg "         MUST_SURVIVE — 필수 문자열이 없다. ASSERT_C 는 아무것도 검사하지 않는다."
+                msg "                        KEEP_MIRROR 파일이 upstream 판으로 덮여도 어서션이 전부 통과한다."
+                ;;
+        esac
+    done
+    msg "         '조사한 뒤 비우기로 했다' 는 선언이지 안전하다는 뜻이 아니다."
+    msg "         양쪽 저장소가 바뀌면 전제가 바뀐다 — 그때 conf 와 이 표식을 같이 갱신해라."
+}
+
+# 커밋 메시지에 남길 "의도적으로 비운 축" 목록 (이슈 #41).
+# 위 [주의] 블록은 실행 화면에만 남고 사라진다. 반면 미러 커밋 메시지는 사람이 나중에
+# push 여부를 판단할 때(그리고 미러 쪽 리뷰어가) 읽는 **유일한 영속 기록**이다. 거기에
+# "어서션 6종 통과" 만 적으면, 검사 대상이 0건이라 반복문이 한 번도 돌지 않은 어서션까지
+# 실질적 통과로 기록된다 — #41 이전에는 축이 빌 수 없었으므로 그 문장이 항상 참이었지만
+# 표식이 그것을 거짓으로 만들 수 있게 했다. 그래서 같은 사실을 커밋 메시지에도 적는다.
+# 빈 축이 없으면 "없음" 한 줄을 적는다(줄의 부재와 '없음' 을 구분하기 위해 항상 찍는다).
+intentionally_empty_axes_commit_body() {
+    if (( ${#AXES_INTENTIONALLY_EMPTY[@]} == 0 )); then
+        printf '  없음\n'
+        return 0
+    fi
+    local ax
+    for ax in "${AXES_INTENTIONALLY_EMPTY[@]}"; do
+        case "$ax" in
+            KEEP_MIRROR)
+                printf '  - KEEP_MIRROR — 보존 분류가 없다(수동 이식 대기는 항상 비어 있다)\n' ;;
+            UPSTREAM_ONLY)
+                printf '  - UPSTREAM_ONLY — ASSERT_A 는 패턴 0종이라 검사한 것이 없다\n' ;;
+            MIRROR_ONLY)
+                printf '  - MIRROR_ONLY — ASSERT_D 는 패턴 0종이라 검사한 것이 없다\n' ;;
+            FORBID)
+                printf '  - FORBID — ASSERT_B 는 문자열 0종이라 검사한 것이 없다\n' ;;
+            MUST_SURVIVE)
+                printf '  - MUST_SURVIVE — ASSERT_C 는 문자열 0종이라 검사한 것이 없다\n' ;;
+        esac
+    done
 }
 
 # 어느 트리에서도 매칭되지 않는 경로 패턴을 경고한다.
@@ -534,6 +676,11 @@ run_assertions() {
     msg "어서션 6종 (대상: 미러 인덱스, 파일 ${#index_paths[@]}개)"
 
     # A. 반입 금지 유입 — UPSTREAM_ONLY 매칭 파일이 미러에 생겼는가
+    # A·B 의 [PASS] 문구에는 **검사 기준의 종수**를 함께 찍는다. 축이
+    # AXES_INTENTIONALLY_EMPTY 로 비어 있으면 이 두 어서션은 반복문이 한 번도 돌지 않은
+    # 채 통과하는데, 개수가 없으면 화면에서 '진짜 통과' 와 구분되지 않는다. 사람이
+    # go/no-go 를 판단하는 마지막 화면이 이 블록이므로 여기에 0종이 드러나야 한다
+    # (C·D 는 이미 종수를 찍고 있다).
     local -a a_hits=()
     for p in "${index_paths[@]}"; do
         if matches_any_re "$p" "${UPSTREAM_ONLY_RE[@]}"; then
@@ -541,7 +688,7 @@ run_assertions() {
         fi
     done
     if (( ${#a_hits[@]} == 0 )); then
-        msg "  [PASS] ASSERT_A_UPSTREAM_ONLY_INFLOW   반입 금지 파일 유입 없음"
+        msg "  [PASS] ASSERT_A_UPSTREAM_ONLY_INFLOW   반입 금지 패턴 ${#UPSTREAM_ONLY_RE[@]}종 기준 유입 없음"
     else
         msg "  [FAIL] ASSERT_A_UPSTREAM_ONLY_INFLOW   반입 금지 파일 ${#a_hits[@]}개가 미러에 있다"
         for p in "${a_hits[@]}"; do msg "         - $p"; done
@@ -560,7 +707,7 @@ run_assertions() {
         fi
     done
     if (( ${#b_hits[@]} == 0 )); then
-        msg "  [PASS] ASSERT_B_FORBID_INFLOW          금지 문자열 유입 없음"
+        msg "  [PASS] ASSERT_B_FORBID_INFLOW          금지 문자열 ${#FORBID[@]}종 기준 유입 없음"
     else
         failed=$(( failed + 1 ))
     fi
@@ -716,6 +863,21 @@ main() {
 
     load_pair "$ARG_PAIR"
     load_curation "$PAIR_BASE"
+
+    # conf 는 load_curation() **안에서** source 된다. 그래서 conf 가
+    # `declare -a AXES_INTENTIONALLY_EMPTY=( ... )` 로 쓰면 그 변수는 함수 지역 변수가
+    # 되고, 검증 4종(타입·오타·중복·빈 축/모순)을 전부 통과한 뒤 함수가 반환하는 순간
+    # 사라진다. 그대로 두면 아래 warn_intentionally_empty_axes() 가 set -u 의
+    # unbound variable 로 죽는다 — 종료 코드가 설정 오류(2)가 아니라 1 이고, bash 내부
+    # 메시지라 어느 conf 가 문제인지도 나오지 않는다. 검증이 OK 라고 말한 conf 가 그
+    # 직후 죽는 셈이라 여기서 잡는다.
+    # (다섯 축·MUST_SURVIVE_IN 도 같은 함정을 갖는다 — load_curation() 의
+    #  MUST_SURVIVE_IN 주석 참조. 그쪽은 bash 가 빈 배열처럼 봐줘서 조용히 죽는다.)
+    [[ "$(var_kind AXES_INTENTIONALLY_EMPTY)" == "a" ]] || die 2 \
+        "$CURATION_DIR/$PAIR_BASE.conf: AXES_INTENTIONALLY_EMPTY 가 전역에 남지 않았다 — \
+conf 는 함수 안에서 source 되므로 declare 를 쓰면 지역 변수가 되어 사라진다. \
+declare 없이 AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY ) 형식으로 대입해라"
+
     compile_patterns
 
     require_repo "upstream" "$UP_REPO"
@@ -874,6 +1036,7 @@ main() {
         fi
     done
 
+    warn_intentionally_empty_axes
     warn_unmatched_patterns "$to_sha"
 
     # ── 표 출력 ────────────────────────────────────────────────────────────
@@ -1092,6 +1255,8 @@ main() {
     if (( ${#new_write_path[@]} > 0 )); then
         new_body="$(printf '  + %s\n' "${new_write_path[@]}")"
     fi
+    local empty_axes_body
+    empty_axes_body="$(intentionally_empty_axes_commit_body)"
 
     if ! git -C "$MI_REPO" commit -q -F - <<EOF
 chore: sync curated mirror — upstream $from_short..$to_short
@@ -1109,6 +1274,10 @@ mirror-sync.sh 자동 싱크 (personal-ops mirror-sync, 이슈 #34).
   ASSERT_D_MIRROR_ONLY_DELETED
   ASSERT_E_STAGED_AS_REPORTED
   ASSERT_F_NEW_FILE_INFLOW
+
+의도적으로 비운 축 (conf 의 AXES_INTENTIONALLY_EMPTY — 아래 축의 어서션은 검사 대상이
+0건이라 위 '통과' 가 실질적 주장이 아니다):
+$empty_axes_body
 
 신규 반입 (미러에 없던 파일 — --allow-new 로 승인됨):
 $new_body

@@ -12,8 +12,9 @@
 #   7 mirror_branch   mirror 기준 브랜치   (--apply 는 이 브랜치가 체크아웃돼 있어야 진행)
 #
 # 4쌍 실측일 2026-09-05. 아래 4행은 전부 upstream master → mirror main 이다
-# (max9296 과 같은 형태). upstream_branch 는 표시용이고, --apply 가 실제로 검사하는
-# 것은 mirror_branch 뿐이다.
+# (max9296 과 같은 형태). 다섯 번째 행 pim-summit-backports 는 mirror 브랜치가
+# develop 이다 — 아래 이슈 #41 문단 참조. upstream_branch 는 표시용이고, --apply 가
+# 실제로 검사하는 것은 mirror_branch 뿐이다.
 #
 # base	github_remote	gitlab_remote	upstream_path	mirror_path	upstream_branch	mirror_branch
 max9296	https://github.com/jhw7500/max9296.git	http://192.168.10.2:31406/hwjo/max9296	/home/jhw/ai/opencode/projects/max9296	/home/jhw/ai/opencode/projects/max9296-gitlab	master	main
@@ -21,29 +22,47 @@ gstApp	https://github.com/jhw7500/gstApp.git	http://192.168.10.2:31406/hwjo/gstA
 imx-vpu	https://github.com/jhw7500/imx-vpu.git	http://192.168.10.2:31406/hwjo/imx-vpu	/home/jhw/ai/opencode/projects/imx-vpu	/home/jhw/ai/opencode/projects/imx-vpu-gitlab	master	main
 sc16is7xx	https://github.com/jhw7500/sc16is7xx.git	http://192.168.10.2:31406/hwjo/sc16is7xx	/home/jhw/ai/opencode/projects/sc16is7xx	/home/jhw/ai/opencode/projects/sc16is7xx-gitlab	master	main
 
-# ── 부적합 쌍 — 조사했으나 현재 스크립트로 처리할 수 없다 ─────────────────────
-# pim-summit-backports 는 2026-09-05 에 **실측했고, 그 결과 부적합으로 판정했다.**
-# "조사하지 않았다" 가 아니다. 큐레이션 축 자체는 실재하지만(내용이 다른 공통 파일
-# 3개 · 미러 전용 2개), 스크립트가 요구하는 다섯 축 중 **두 축의 실측 후보가 0개**다:
+# ── pim-summit-backports — 한때 '부적합' 이었고 이슈 #41 로 해소됐다 ──────────
+# 왜 한때 부적합이었는지는 이 쌍을 이해하는 데 필요한 정보라 지우지 않고 남긴다.
+#
+# 2026-09-05 실측 결과 큐레이션 축 자체는 실재했다(내용이 다른 공통 파일 3개 ·
+# 미러 전용 2개). 막힌 것은 당시 **두 축의 실측 후보가 0개**라고 판정한 점이었다.
+# 재실측 결과 그중 하나는 오기록이었다 — 진짜 후보 0 인 축은 UPSTREAM_ONLY 하나다:
 #
 #   UPSTREAM_ONLY 후보 0 — upstream 전용 파일은 `.clangd` 하나뿐인데, 이 파일은
 #     2026-08-25 clangd 커밋들이 추가한 upstream 신기능이고 미러가 아직 못 받은
 #     것이다(미러의 .gitignore·make-for-imx8 은 분기점 6605bac 와 바이트 동일).
 #     "미러에 두지 않는다" 는 정책적 사유가 없으므로 UPSTREAM_ONLY 가 아니다.
-#   FORBID 후보 0 — upstream 에 있고 미러에 0건인 문자열은 clangd 계열뿐인데
-#     (실측 upstream/mirror 파일 수: "compile_commands.json" 3/0, "clangd" 3/0,
-#     ".clangd" 1/0), 그 문자열을 담은 upstream make-for-imx8 이 정상 복사되는
-#     순간 ASSERT_B 가 확정적으로 실패해 --apply 가 영구히 불가능해진다.
-#     max9296 선례 문자열은 전부 upstream 0건이라 애초에 후보가 아니다
-#     ("PR #" 0/0, "pull/" 0/0, ".github" 0/0, "docs/superpowers/" 0/0).
+#   FORBID 후보 0 — **정정: 후보 0 이 아니었다.** 당시 실측한 문자열은 셋이다
+#     (upstream/mirror 파일 수: "compile_commands.json" 3/0, "clangd" 3/0,
+#     ".cache/" 1/0). 앞의 두 문자열은 upstream `.clangd` 가 담고 있어, UPSTREAM_ONLY
+#     없이 그 파일이 복사되는 순간 ASSERT_B 가 확정적으로 실패한다 — 그래서 실격이다.
+#     그러나 세 번째 ".cache/" 는 `.clangd` 에 없고 upstream 에서는 `.gitignore` 에만
+#     있어 **처음부터 유효한 앵커였다.** 실격 사유 없이 결론에 함께 묻어 "후보 0" 이라고
+#     적은 것이 오기록이다. 2026-09-05 재실측으로 정정하고 conf 는 FORBID=( ".cache/" )
+#     를 채택했다 — KEEP_MIRROR 의 .gitignore 가 덮이는 순간 ASSERT_B 가 잡는다.
+#     (이슈 #41 본문은 이 자리에 `.clangd` 1/0 을 적었는데, 그 문자열은 KEEP_MIRROR 인
+#      make-for-imx8 에만 있어 실제로는 앵커 가치가 없는 항목이었다. 차단 요인을
+#      make-for-imx8 로 적은 것도 같은 착오다 — 그 파일은 애초에 복사되지 않는다.)
 #
-# 두 축을 추측으로 채우는 것 말고는 방법이 없고, 그 추측 자체가 오류다. 그래서
-# config/curation/pim-summit-backports.conf 를 만들지 않았다. 축이 비면 스크립트가
-# 종료 코드 2 로 거부하므로(bin/mirror-sync.sh 의 빈 배열 검사) 억지로 통과시킬 수도 없다.
-# 참고: 이 쌍의 미러 기본 브랜치는 main 이 아니라 develop 이다(develop == main == badf083).
+# 당시에는 두 축을 추측으로 채우는 것 말고는 방법이 없다고 봤고 그 추측 자체가 오류였다.
+# 축이 비면 스크립트가 종료 코드 2 로 거부하므로 억지로 통과시킬 수도 없어서,
+# config/curation/pim-summit-backports.conf 를 만들지 않고 이 행을 주석으로 두었다.
 #
-# 주석 상태로 두는 이유: 행이 살아 있으면 없는 conf 를 참조하거나 빈 규칙으로
-# "미반입 0건 / 보존 0건" 을 출력해 **조용히 전량 복사**하게 된다. 이슈 #34 가 지적한
-# 사고와 정확히 같은 실패 방식이다.
+# ── 어떻게 해소했나 (이슈 #41, 방향 (A)) ─────────────────────────────────────
+# bin/mirror-sync.sh 에 선택 축 AXES_INTENTIONALLY_EMPTY 를 도입했다. 스크립트가
+# "축이 비어 있다"(조사 결과)와 "축을 채우지 않았다"(조사 안 함)를 구분하지 못한 것이
+# 부적합 판정의 직접 원인이었으므로, conf 가 전자를 명시적으로 선언하면 그 축만
+# 통과시킨다. 기본 동작은 그대로다 — 표식에 없는 빈 축은 여전히 종료 코드 2 다.
+# 축 이름 오타·중복과 "표식에 있는데 비어 있지 않은 축"도 종료 코드 2 로 거부한다.
+# 통과시킨 축이 무엇을 무력화하는지는 dry-run·--apply 양쪽 출력에 [주의] 로 찍히고,
+# 미러 커밋 메시지에도 같은 줄이 남는다.
 #
-# pim-summit-backports	https://github.com/jhw7500/pim-summit-backports.git	http://192.168.10.2:31406/hwjo/pim-summit-backports	<부적합-conf없음>	<부적합-conf없음>	<부적합-conf없음>	<부적합-conf없음>
+# 이 쌍의 conf 가 그 표식으로 비운 축은 UPSTREAM_ONLY 하나다. 그 대가로 upstream 전용
+# 파일이 전부 복사 대상이 되고 ASSERT_A 가 아무것도 검사하지 않는다. 남는 방어선은
+# ASSERT_F 다 — 미러에 없던 파일의 신규 반입에 --allow-new 승인을 요구한다.
+# FORBID 는 위 정정대로 ".cache/" 한 줄을 쓴다(KEEP_MIRROR 의 .gitignore 앵커).
+# 자세한 근거와 알려진 공백은 conf 주석에 있다.
+#
+# 미러 기본 브랜치는 main 이 아니라 develop 이다 (develop == main == badf083).
+pim-summit-backports	https://github.com/jhw7500/pim-summit-backports.git	http://192.168.10.2:31406/hwjo/pim-summit-backports	/home/jhw/ai/opencode/projects/pim-summit-backports	/home/jhw/ai/opencode/projects/pim-summit-backports-gitlab	master	develop
