@@ -2,12 +2,12 @@ name: ShellCheck
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - '**.sh'
       - '.github/workflows/shellcheck.yml'
   pull_request:
-    branches: [master]
+    branches: [main]
     paths:
       - '**.sh'
       - '.github/workflows/shellcheck.yml'
@@ -39,17 +39,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          files=(
-            build.sh
-          )
+          # 검사 대상은 저장소가 추적하는 모든 셸 스크립트다.
+          # 이전에는 build.sh / tools / upgrade_file / docker 를 봤는데
+          # personal-ops 에는 그 경로가 하나도 없어, 트리거가 걸리면
+          # shellcheck 가 "파일 없음" 으로 항상 실패했다.
+          mapfile -d '' -t files < <(git ls-files -z '*.sh')
 
-          for dir in tools upgrade_file docker; do
-            if [ -d "$dir" ]; then
-              while IFS= read -r -d '' f; do
-                files+=("$f")
-              done < <(find "$dir" -name '*.sh' -type f -print0)
-            fi
-          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "검사할 셸 스크립트가 없다."
+            exit 0
+          fi
 
           echo "Checking ${#files[@]} files..."
           shellcheck -x -s bash -S error -f gcc "${files[@]}"
