@@ -297,7 +297,7 @@ git -C /home/jhw/ai/opencode/projects/max9296-gitlab push        # 사람이 직
 |---|---|
 | `bin/mirror-sync.sh` | **본체**. 분류 · dry-run 출력 · 복사 · 어서션 · 미러 로컬 커밋 (push 없음) |
 | `config/pairs.tsv` | **대상 쌍 단일 소스**. 탭 7컬럼 (base / github remote / gitlab remote / upstream 경로 / mirror 경로 / upstream 브랜치 / mirror 브랜치) |
-| `config/curation/max9296.conf` | max9296 쌍의 큐레이션 규칙. 다섯 축을 **bash 배열**로 정의하고 `bin/mirror-sync.sh` 가 source 한다 (선택 축 `MUST_SURVIVE_IN` 포함) |
+| `config/curation/<base>.conf` | 쌍별 큐레이션 규칙. 다섯 축을 **bash 배열**로 정의하고 `bin/mirror-sync.sh` 가 source 한다 (선택 축 `MUST_SURVIVE_IN` 포함). 현재 `max9296` · `gstApp` · `imx-vpu` · `sc16is7xx` 4장 |
 | `tests/mirror-sync-test.sh` | mock git 저장소 기반 테스트. 어서션 6종이 **되돌리면 실패하는지**까지 확인하고, 실제 쌍이 있는 호스트에서는 배포 conf 를 dry-run 으로 스모크한다 |
 | `install.sh` | `~/.local/bin` 심링크 + 실행 비트. 재실행 안전 |
 | `README.md` | 이 문서 |
@@ -328,45 +328,172 @@ git -C /home/jhw/ai/opencode/projects/max9296-gitlab push        # 사람이 직
 2. `config/curation/<base>.conf` 를 만들고 다섯 축을 **전부** 채운다. 하나라도 비거나 배열이
    아니면 스크립트가 종료 코드 2 로 거부한다. `max9296.conf` 를 형식 참고용으로 복사해 쓰되
    항목마다 근거 주석을 남긴다.
-   **`KEEP_MIRROR` 항목마다 그 파일의 미러 전용 문장 하나씩을 `MUST_SURVIVE` 에 대응시키고
-   `MUST_SURVIVE_IN` 으로 경로를 묶는다.** `KEEP_MIRROR` 의 보존은 "복사하지 않는다"로만
-   구현돼 있어 목록에서 한 줄이 빠지면 아무 어서션도 울지 않는다. 고른 문장이 정말 미러
-   전용인지(= upstream 판에는 0건인지) `git show HEAD:<path> | grep -Fc` 로 양쪽을 확인한다.
+   **`KEEP_MIRROR` 항목마다 `MUST_SURVIVE` 또는 `FORBID` 중 하나로 반드시 앵커한다.**
+   `KEEP_MIRROR` 의 보존은 "복사하지 않는다"로만 구현돼 있어 목록에서 한 줄이 빠지면 아무
+   어서션도 울지 않는다. 기본은 그 파일의 미러 전용 문장 하나를 `MUST_SURVIVE` 에
+   대응시키고 `MUST_SURVIVE_IN` 으로 경로를 묶는 것이다. 고른 문장이 정말 미러 전용인지
+   (= upstream 판에는 0건인지) `git show HEAD:<path> | grep -Fc` 로 양쪽을 확인한다.
+   **미러 판이 upstream 판의 진부분집합이면 그 방법을 쓸 수 없다** — 미러에만 있는 문장이
+   원리적으로 없어서 무엇을 넣어도 첫 실행부터 `ASSERT_C` 가 빨개진다(2026-09-05 실측: 4쌍의
+   `KEEP_MIRROR` 15개 중 3개가 이 경우다). 그때는 반대로 **upstream 판에만 있고 미러에 0건인
+   문자열**을 `FORBID` 에 넣어 "덮이면 그 문자열이 나타난다"를 `ASSERT_B` 로 잡는다.
 3. `config/pairs.tsv` 의 해당 행 주석을 풀고 로컬 클론 절대 경로와 양쪽 브랜치명을 채운다.
    (upstream 과 mirror 의 브랜치 이름은 서로 다를 수 있다 — max9296 은 `master` / `main`.)
 4. `UPSTREAM_ONLY` 패턴이 upstream 전용 파일을 **빠짐없이** 덮는지, 그리고 미러 파일을 **오매치하지
    않는지** 확인한다. 어느 쪽이 틀려도 조용히 실패한다.
 5. dry-run 을 먼저 돌려 4분류를 눈으로 확인한 뒤에만 `--apply` 로 넘어간다.
 
-## 나머지 4쌍 — 미조사
+## 쌍별 상태 (2026-09-05)
 
-큐레이션 미러 쌍은 5개(`gstApp`, `imx-vpu`, `max9296`, `pim-summit-backports`, `sc16is7xx`)지만
-**이번 범위에서 채운 것은 `max9296` 하나뿐이다.** 나머지 4쌍은 `config/pairs.tsv` 에 **주석 처리된
-자리만** 있고 큐레이션 규칙은 조사하지 않았다. `config/curation/` 에도 conf 가 없다.
+큐레이션 미러 쌍은 5개다. 2026-09-04 에는 `max9296` 하나만 채웠고, **2026-09-05 에 나머지 4쌍을
+실측했다.** 결과는 사용 가능 4 · 부적합 1 이다.
 
-주석 상태로 둔 이유: 행이 살아 있으면 없는 conf 를 참조하거나 빈 규칙으로 "미반입 0건 / 보존 0건"을
-출력해 **조용히 전량 복사**하게 된다. 이슈 #34 가 지적한 사고와 정확히 같은 실패 방식이다. 없는
-pair 를 `--pair` 로 주면 종료 코드 2 와 함께 사용 가능한 pair 목록이 표시된다.
+| 쌍 | 상태 | `config/curation/<base>.conf` | `config/pairs.tsv` |
+|---|---|---|---|
+| `max9296` | 사용 가능 | 있음 (2026-09-04 실측) | 유효 행 |
+| `gstApp` | 사용 가능 | 있음 (2026-09-05 실측) | 유효 행 |
+| `imx-vpu` | 사용 가능 | 있음 (2026-09-05 실측) | 유효 행 |
+| `sc16is7xx` | 사용 가능 | 있음 (2026-09-05 실측) | 유효 행 |
+| `pim-summit-backports` | **부적합** — 조사했으나 현재 스크립트로 표현할 수 없다 | 없음 (의도적) | 주석 유지 |
 
-**표본 하나로 5쌍 공용 추상화를 만들지 않았다.** 규칙을 아는 쌍이 하나뿐인 상태에서 일반화하면
-max9296 전용 로직에 `--pair` 인자만 붙인 것이 되고, 실제 두 번째 쌍이 그 모양에 맞지 않으면 잘못된
-추상화를 유지하는 비용이 더 든다. 두 번째 쌍을 **실제로 싱크할 때** 공통점이 드러나면 그때
-일반화한다. 지금 구조는 그때까지 쌍마다 conf 한 장을 추가하는 것으로 확장된다.
+사용 가능한 4쌍은 전부 upstream `master` → mirror `main` 이다. 네 쌍 모두 전 범위 dry-run
+(`--from <root 커밋> --to master`)이 **종료 코드 0 · 죽은 패턴 경고 0 · 신규 반입 0** 이다
+(2026-09-05 실측, 아래 기준값 표).
 
-## max9296 실측 기준값 (2026-09-04)
+`pairs.tsv` 의 `upstream_branch` 는 표시용이다. `--apply` 가 실제로 검사하는 것은 **미러 쪽
+브랜치와 워킹트리 clean 여부뿐**이고, upstream 은 `--from`/`--to` refspec 으로만 읽는다. 그래서
+upstream 로컬 클론이 다른 브랜치에 체크아웃돼 있거나 dirty 해도 dry-run·`--apply` 는 영향을 받지
+않는다(2026-09-05 현재 `gstApp` 로컬이 그 상태다 — feature 브랜치 + dirty). 대신 `--from`/`--to`
+를 `HEAD` 로 주면 그 체크아웃된 브랜치를 가리키므로, **기준 브랜치를 쓰려면 `master` 처럼 이름을
+명시**한다.
 
-아래는 **2026-09-04 시점 측정값**이다. 두 저장소가 바뀌면 달라지므로, 규칙을 손볼 때는 그 시점에
-다시 측정한다.
+### `pim-summit-backports` 가 부적합인 이유
 
-| 항목 | 값 |
-|---|---|
-| upstream 파일 수 | 341 |
-| mirror 파일 수 | 65 |
-| 공통 파일 | 64 (내용 동일 58 / **내용 다름 6**) |
-| `KEEP_MIRROR` | 6 (= 내용 다른 공통 파일 전부) |
-| `MIRROR_ONLY` | 1 (`docs/pim-package-binary.md`) |
-| `UPSTREAM_ONLY` | 277개 파일을 19개 패턴으로 표현 (upstream 전용 277/277 매치, 미러 65개 중 오매치 0) |
-| 경로에 공백·괄호·`&`·`=` 가 든 파일 | 3 (전부 `docs/` 의 벤더 PDF) |
+"조사하지 않았다"가 아니라 **조사한 결과 부적합**이다. 큐레이션 축 자체는 실재한다 — 내용이 다른
+공통 파일 3개(`.gitignore` · `README.md` · `make-for-imx8`)와 미러 전용 2개
+(`docs/pim-package-binary.md` · `docs/team-sharing-build-guide.md`)가 있다. 문제는 다섯 축 중
+**두 축의 실측 후보가 0개**라는 것이다.
+
+- **`UPSTREAM_ONLY` 후보 0** — upstream 전용 파일은 `.clangd` 하나뿐인데, 이 파일은 2026-08-25
+  clangd 커밋들이 추가한 **upstream 신기능**이고 미러가 아직 받지 못한 것이다(미러의 `.gitignore`
+  와 `make-for-imx8` 은 분기점 `6605bac` 와 바이트 단위로 같다). "미러에 두지 않는다"는 정책적
+  사유가 없으므로 `UPSTREAM_ONLY` 가 아니다. `.clangd` 만 막으면 그 파일을 읽는 배선만 들어가고
+  정작 `.clangd` 는 없는 반쪽 상태가 된다.
+- **`FORBID` 후보 0** — upstream 에 있고 미러에 0건인 문자열은 clangd 계열뿐이다(2026-09-05 실측,
+  upstream/mirror 파일 수: `compile_commands.json` 3/0, `clangd` 3/0, `.clangd` 1/0). 그런데 그
+  문자열을 담은 upstream `make-for-imx8` 이 정상 복사되는 순간 `ASSERT_B` 가 확정적으로 실패해
+  `--apply` 가 영구히 불가능해진다. max9296 선례 문자열은 전부 upstream 0건이라 애초에 후보가
+  아니다(`PR #` 0/0, `pull/` 0/0, `.github` 0/0, `docs/superpowers/` 0/0).
+
+두 축을 추측으로 채우는 것 말고는 방법이 없고 **그 추측 자체가 오류**이므로 conf 를 만들지 않았다.
+축이 비면 스크립트가 종료 코드 2 로 거부하므로 억지로 통과시킬 수도 없다. 이 쌍의 미러 기본
+브랜치는 `main` 이 아니라 `develop` 이라는 점도 기록해 둔다(현재 `develop` == `main` == `badf083`).
+
+`pairs.tsv` 에서 이 행을 **주석 상태로 두는 이유**는 처음과 같다: 행이 살아 있으면 없는 conf 를
+참조하거나 빈 규칙으로 "미반입 0건 / 보존 0건"을 출력해 **조용히 전량 복사**하게 된다. 이슈 #34 가
+지적한 사고와 정확히 같은 실패 방식이다. 없는 pair 를 `--pair` 로 주면 종료 코드 2 와 함께 사용
+가능한 pair 목록이 표시된다.
+
+### "표본 하나로 추상화하지 않는다" — 4쌍을 재보니
+
+이슈 #34 는 표본 하나로 5쌍 공용 추상화를 만들지 않기로 못박고, 두 번째 쌍을 실제로 싱크할 때
+공통점이 드러나면 그때 일반화하기로 했다. 4쌍을 실측한 결과는 **그 판단을 지지한다.** 근거는
+세 가지이고 전부 2026-09-05 실측이다.
+
+**첫째, 내용 축(`FORBID`)은 쌍 간에 옮겨 쓸 수 없다.** max9296 의 세 문자열을 나머지 세 쌍에
+그대로 적용했을 때의 실측값이다(`git grep -lF`, upstream `master` / mirror `main` 파일 수).
+
+| 문자열 | max9296 | gstApp | imx-vpu | sc16is7xx |
+|---|---|---|---|---|
+| `PR #` | up 2 / mi 0 ✅ | up 10 / **mi 2** ❌ | up 1 / **mi 1** ❌ | up 0 / mi 0 (죽은 항목) |
+| `pull/` | up 1 / mi 0 ✅ | up 0 / mi 0 (죽은 항목) | up 0 / mi 0 (죽은 항목) | up 0 / mi 0 (죽은 항목) |
+| `docs/superpowers/` | up 6 / mi 0 ✅ | up 3 / mi 0 ✅ | up 0 / mi 0 (죽은 항목) | up 0 / mi 0 (죽은 항목) |
+
+공용 `FORBID` 목록을 만들어 그대로 복사했다면 **gstApp 과 imx-vpu 는 첫 `--apply` 부터
+`ASSERT_B` 실패**였고(미러에 이미 있는 문자열이므로 고칠 방법도 없다), sc16is7xx 에서는 세 항목이
+전부 아무것도 지키지 않는 죽은 문자열이었다. `FORBID` 는 죽은 패턴 경고 대상이 아니라서 그
+무효화는 조용하다. 네 conf 의 `FORBID` 는 3 / 5 / 4 / 5 = 17개이고 **고유 문자열은 13종**이다.
+두 쌍에 함께 나타나는 것은 4종뿐이며(`docs/superpowers/` 는 max9296·gstApp, `clangd` ·
+`compile_commands.json` · `.github/` 는 imx-vpu·sc16is7xx), **네 쌍 모두에 들어가는 문자열은
+하나도 없다.**
+
+**둘째, 경로 축에서 공통인 것은 "규칙"이 아니라 "모양"뿐이다.** 네 conf 전부 `.gitignore` 를
+`KEEP_MIRROR` 에 갖고, `.github/**` 를 `UPSTREAM_ONLY` 에 가지며, `MIRROR_ONLY` 는 정확히 1개다
+(그 1개가 `docs/pim-package-binary.md` 인 쌍이 4쌍 중 3쌍이고, pim 의 미러 전용 파일에도 같은
+경로가 있다). 하지만 규모는 `UPSTREAM_ONLY` 277개/19패턴 ↔ 14개/3패턴으로 20배 가까이 벌어지고
+`KEEP_MIRROR` 도 6 ↔ 1 이다. 공용화할 수 있는 것은 새 conf 를 시작할 때 붙여 넣을 **두세 줄짜리
+출발점**이지 규칙 엔진이 아니다.
+
+**셋째, max9296 에서 규칙처럼 보였던 관행 하나는 표본의 우연이었다.** max9296 conf 는
+`KEEP_MIRROR` 6개 **전부**에 `MUST_SURVIVE` 문자열을 1:1 로 대응시켰고, 이 문서도 그것을 새 쌍
+추가 절차에 규칙으로 적어 두었다. 4쌍의 `KEEP_MIRROR` 15개를 실측하니 **12개만 그렇게 앵커할 수
+있다.** 나머지 3개(imx-vpu `.gitignore`, sc16is7xx `.gitignore`·`make-for-imx8`)는 미러 판이
+upstream 판의 **진부분집합**이라(줄 단위 비교에서 미러에만 있는 줄 0) 미러 전용 문자열이 원리적으로
+존재하지 않는다. 두 conf 는 그 세 자리를 `FORBID` 로 대신 덮었고, 실측으로 그것이 동작한다 —
+세 파일 모두 upstream 판에는 `clangd`·`compile_commands.json` 이 있고 미러 판에는 0건이라
+덮이는 순간 `ASSERT_B` 가 잡는다. 즉 측정에서 살아남는 불변식은 "`KEEP_MIRROR` 마다
+`MUST_SURVIVE`" 가 아니라 **"`KEEP_MIRROR` 마다 `MUST_SURVIVE` 또는 `FORBID` 중 하나로
+앵커한다"** 는 더 약한 형태다. 위 [새 쌍 추가](#새-쌍-추가) 2번을 이 형태로 고쳤다.
+
+**한편 스크립트는 한 줄도 고치지 않았다.** 새 축도, glob 문법 확장도, 우선순위 변경도 필요하지
+않았다. 파일 이름이 서로 다른 대응 쌍(imx-vpu 의 upstream `make-for-imx8.sh` ↔ 미러 `build.sh`)
+조차 `UPSTREAM_ONLY` 한 줄 + `MIRROR_ONLY` 한 줄로 정확히 표현되고 dry-run 으로 확인됐다 —
+`RENAME_MAP` 같은 새 축은 필요 없었다. 반대로 스크립트 쪽에서 다시 볼 만한 것으로 **다섯 축이
+전부 비어 있지 않아야 한다는 제약**이 드러났다. 그 제약이 `pim-summit-backports` 를 부적합으로
+만든 유일한 원인이고, 축이 빈 것과 축을 조사하지 않은 것은 다른 상태다. 이것과 위 셋째 항목의
+불변식 강제 여부는 **판단이 필요한 사안이라 이번 범위에서 구현하지 않았다.**
+
+결론: 네 번째 쌍까지 재본 지금도 **일반화할 것은 규칙이 아니라 규약이다.** 쌍마다 conf 한 장을
+추가하는 현재 구조를 유지한다.
+
+## 실측 기준값
+
+아래는 **측정 시점의 값**이다. 두 저장소가 바뀌면 달라지므로, 규칙을 손볼 때는 그 시점에 다시
+측정한다. max9296 열은 2026-09-04 측정값이고 2026-09-05 재측정에서도 동일했다(양쪽 HEAD 불변).
+
+| 항목 | `max9296` | `gstApp` | `imx-vpu` | `sc16is7xx` | `pim-summit-backports` |
+|---|---|---|---|---|---|
+| upstream 기준 (`master`) | `4fa9881` | `77a2635` | `87deeb7` | `093e069` | `28997d8` |
+| mirror 기준 | `main` `ec3bad4` | `main` `cfaf40b` | `main` `f9e5699` | `main` `6c09f62` | `develop` `badf083` |
+| upstream 파일 수 | 341 | 131 | 312 | 22 | 7 |
+| mirror 파일 수 | 65 | 77 | 288 | 9 | 8 |
+| 공통 파일 | 64 | 76 | 287 | 8 | 6 |
+| 공통 중 **내용 다름** | 6 | 1 | 5 | 3 | 3 |
+| upstream 전용 | 277 | 55 | 25 | 14 | **1** |
+| 미러 전용 | 1 | 1 | 1 | 1 | 2 |
+| `KEEP_MIRROR` | 6 | 1 | 5 | 3 | — |
+| `UPSTREAM_ONLY` (파일 / 패턴) | 277 / 19 | 55 / 20 | 25 / 4 | 14 / 3 | **후보 0** |
+| `MIRROR_ONLY` | 1 | 1 | 1 | 1 | — |
+| `FORBID` | 3 | 5 | 4 | 5 | **후보 0** |
+| `MUST_SURVIVE` | 6 | 2 | 4 | 4 | — |
+
+`KEEP_MIRROR` 개수는 네 쌍 모두 "공통 중 내용 다름" 과 정확히 같다 — 내용이 다른 공통 파일을
+빠짐없이 보존 대상으로 잡았다는 뜻이다.
+
+**`UPSTREAM_ONLY` 패턴 검증 (2026-09-05, 스크립트의 `glob_to_ere()` 를 그대로 잘라 재현):**
+네 쌍 모두 **upstream 전용 파일 전량 매치 · 미러 파일 오매치 0** 이다
+(max9296 277/277·0, gstApp 55/55·0, imx-vpu 25/25·0, sc16is7xx 14/14·0).
+
+**전 범위 dry-run (2026-09-05, `--from <root 커밋> --to master`, 순수 읽기):** 네 쌍 모두 종료
+코드 0 · 죽은 패턴 경고 0 · 신규 반입 0.
+
+| 쌍 | 범위 | 합계 |
+|---|---|---|
+| `max9296` | `c555c59..4fa9881` | 복사 58 (쓰기 58) · 보존 6 · 미반입 277 · 미삭제 1 |
+| `gstApp` | `46fd6fa..77a2635` | 복사 84 (쓰기 75 / 삭제생략 9) · 보존 1 · 미반입 54 · 미삭제 1 |
+| `imx-vpu` | `d8e9590..87deeb7` | 복사 6 (쓰기 6) · 보존 5 · 미반입 18 · 미삭제 1 |
+| `sc16is7xx` | `9f71cb9..093e069` | 복사 4 (쓰기 3 / 삭제생략 1) · 보존 3 · 미반입 14 · 미삭제 1 |
+
+`--from` 은 범위에 포함되지 않으므로 **root 커밋에서 만들어진 뒤 한 번도 바뀌지 않은 파일은 이
+dry-run 에 나오지 않는다.** 그래서 "미반입" 합계가 upstream 전용 파일 수보다 작을 수 있다
+(gstApp 54 vs 55 — `.vscode/c_cpp_properties.json`, imx-vpu 18 vs 25). 규칙의 문제가 아니라 diff
+의 의미다. 그 파일들도 위 패턴 검증에서는 정상적으로 매칭된다.
+
+경로에 공백·괄호·`&`·`=` 가 든 파일은 upstream `master` 기준으로 max9296 3개(전부 `docs/` 의 벤더
+PDF, 전부 `UPSTREAM_ONLY`) · imx-vpu 1개(`imx-gst1.0-plugin/doc/design/v4l2 source.jpg`, 양쪽에
+있는 복사 대상) · gstApp 0 · sc16is7xx 0 이다. 후자 셋에서는 축에 그런 경로를 적을 일이 없지만
+축은 그래도 배열로 쓴다 — 스크립트의 `declare -p` 타입 검사가 배열이 아닌 축을 종료 코드 2 로
+거부한다.
 
 이슈 #34 본문의 `UPSTREAM_ONLY` 예시 목록은 **불완전하다** — PDF 6개와 `docs/` 직속 md 6개,
 `docs/examples/**` 가 빠져 있다. `config/curation/max9296.conf` 는 이슈 본문이 아니라 위 실측을
@@ -394,6 +521,10 @@ clean 한 미러에서만 시작하므로 **싱크 자신이 A·D 위반을 만�
 배포 conf(`config/curation/max9296.conf`) 스모크는 실제 두 저장소와 기준 커밋이 있는 호스트에서만
 돌고, 없으면 `SKIP` 으로 집계에 남는다(조용히 빠지지 않는다). 나머지 검사는 전부 mock 전용 conf 를
 주입하므로 이 스모크가 없으면 배포 conf 의 오타·패턴 누락은 회귀 테스트로 하나도 걸러지지 않는다.
+
+**이 스모크는 `max9296` 하나만 대상으로 한다.** 2026-09-05 에 추가한 `gstApp` · `imx-vpu` ·
+`sc16is7xx` conf 는 위 [실측 기준값](#실측-기준값)의 dry-run 으로 한 번 확인했을 뿐 **회귀
+테스트가 없다.** 그 세 conf 의 패턴이 나중에 죽어도 `./tests/mirror-sync-test.sh` 는 통과한다.
 
 ## 관련
 

@@ -1045,58 +1045,84 @@ run_sync --pair mock --from "$W_FROM" --to "$W_TO"
 check_eq "큐레이션 conf 없음 → 종료 코드 2" "2" "$RUN_RC"
 
 # ══════════════════════════════════════════════════════════════════════════
-printf -- '\n--- 10. 배포 설정(config/curation/max9296.conf) 스모크 ---\n'
+printf -- '\n--- 10. 배포 설정(config/curation/*.conf) 스모크 ---\n'
 # ══════════════════════════════════════════════════════════════════════════
 # 위 검사는 전부 mock 전용 conf 를 주입한다. 그래서 **실제로 배포되는 conf** 의
 # 오타·패턴 누락은 하나도 걸러지지 않는다(패턴 한 글자만 틀려도 그 축이 조용히
 # 죽는다). 실제 저장소가 있는 호스트에서만 도는 조건부 스모크로 그 공백을 메운다.
 # **dry-run 만 쓴다 — 실제 쌍에는 쓰기를 하지 않는다.**
-REAL_UP="/home/jhw/ai/opencode/projects/max9296"
-REAL_MI="/home/jhw/ai/opencode/projects/max9296-gitlab"
-REAL_FROM="3f5915f"   # 고정 범위. 저장소가 전진해도 결과가 변하지 않게 sha 로 못박는다
-REAL_TO="4fa9881"
+#
+# pairs.tsv 의 유효 행마다 한 벌씩 돈다. 경로는 pairs.tsv 에서 읽으므로 여기에
+# 다시 적지 않는다 — 그래야 pairs.tsv 의 경로가 틀리면 이 스모크가 먼저 걸린다.
+#
+# **새 쌍을 pairs.tsv 에 추가하면 여기에도 기대값 한 줄을 추가해야 한다.**
+# 그러지 않으면 그 conf 는 회귀 검사 밖에 남고, 패턴이 죽어도 스위트는 전부 통과한다.
+smoke_real_pair() {
+    local base="$1" from="$2" to="$3" want_copy="$4" want_rest="$5" leak_re="$6"
+    local up mi up_head mi_head up_st mi_st leaks
 
-real_pair_ready() {
-    [[ -d "$REAL_UP/.git" && -d "$REAL_MI/.git" ]] || return 1
-    git -C "$REAL_UP" rev-parse --verify -q "$REAL_FROM^{commit}" >/dev/null || return 1
-    git -C "$REAL_UP" rev-parse --verify -q "$REAL_TO^{commit}" >/dev/null || return 1
-    return 0
-}
+    up="$(awk -F'\t' -v b="$base" '$1==b {print $4; exit}' "$MODULE_DIR/config/pairs.tsv")"
+    mi="$(awk -F'\t' -v b="$base" '$1==b {print $5; exit}' "$MODULE_DIR/config/pairs.tsv")"
 
-if ! real_pair_ready; then
-    skip "배포 conf 스모크 (max9296 dry-run)" \
-         "실제 미러 쌍 또는 기준 커밋($REAL_FROM..$REAL_TO)이 이 호스트에 없다"
-else
-    REAL_UP_HEAD_BEFORE="$(git -C "$REAL_UP" rev-parse HEAD)"
-    REAL_MI_HEAD_BEFORE="$(git -C "$REAL_MI" rev-parse HEAD)"
-    REAL_UP_STATUS_BEFORE="$(git -C "$REAL_UP" status --porcelain)"
-    REAL_MI_STATUS_BEFORE="$(git -C "$REAL_MI" status --porcelain)"
+    if [[ -z "$up" || -z "$mi" ]]; then
+        skip "배포 conf 스모크 ($base)" "pairs.tsv 에 유효한 $base 행이 없다"
+        return
+    fi
+    if [[ ! -d "$up/.git" || ! -d "$mi/.git" ]] \
+       || ! git -C "$up" rev-parse --verify -q "$from^{commit}" >/dev/null \
+       || ! git -C "$up" rev-parse --verify -q "$to^{commit}" >/dev/null; then
+        skip "배포 conf 스모크 ($base)" \
+             "실제 미러 쌍 또는 기준 커밋($from..$to)이 이 호스트에 없다"
+        return
+    fi
+
+    up_head="$(git -C "$up" rev-parse HEAD)"
+    mi_head="$(git -C "$mi" rev-parse HEAD)"
+    up_st="$(git -C "$up" status --porcelain)"
+    mi_st="$(git -C "$mi" status --porcelain)"
 
     RUN_OUT="$(MIRROR_SYNC_CONFIG_DIR="$MODULE_DIR/config" \
-        bash "$SYNC" --pair max9296 --from "$REAL_FROM" --to "$REAL_TO" 2>&1)"
+        bash "$SYNC" --pair "$base" --from "$from" --to "$to" 2>&1)"
     RUN_RC=$?
 
-    check_eq "배포 conf: dry-run 종료 코드 0" "0" "$RUN_RC"
-    check_out_has "배포 conf: 보존 6 · 미삭제 1 (KEEP_MIRROR 6개가 전부 살아 있다)" \
-        "보존 6 · 미반입 278 · 미삭제 1"
-    check_out_has "배포 conf: 복사 58 (쓰기 58 / 삭제 0)" "합계: 복사 58 (쓰기 58 / 삭제 0)"
-    check_out_lacks "배포 conf: 죽은 패턴 경고가 없다" "매칭하지 않는 패턴"
-    check_out_lacks "배포 conf: 신규 반입이 없다" "신규 반입 — 미러에 없던 파일"
+    check_eq "배포 conf($base): dry-run 종료 코드 0" "0" "$RUN_RC"
+    check_out_has "배포 conf($base): $want_copy" "$want_copy"
+    check_out_has "배포 conf($base): $want_rest" "$want_rest"
+    check_out_lacks "배포 conf($base): 죽은 패턴 경고가 없다" "매칭하지 않는 패턴"
+    check_out_lacks "배포 conf($base): 신규 반입이 없다" "신규 반입 — 미러에 없던 파일"
 
-    # 보드 원시 캡처(artifacts/)와 내부 계획문서(docs/superpowers/)가 '복사' 로
-    # 분류되면 공개 미러로 새어나간다. 패턴 한 글자 오타가 정확히 이 결과를 낸다.
-    LEAK_ROWS="$(printf '%s\n' "$RUN_OUT" | grep '^  복사' | grep -cE 'artifacts/|docs/superpowers/|\.github/')"
-    check_eq "배포 conf: artifacts/ · docs/superpowers/ · .github/ 가 복사로 분류되지 않는다" "0" "$LEAK_ROWS"
+    # UPSTREAM_ONLY 로 막아 둔 경로가 '복사' 로 분류되면 공개 미러로 새어나간다.
+    # 패턴 한 글자 오타가 정확히 이 결과를 낸다.
+    leaks="$(printf '%s\n' "$RUN_OUT" | grep '^  복사' | grep -cE "$leak_re")"
+    check_eq "배포 conf($base): 반입 금지 경로가 복사로 분류되지 않는다" "0" "$leaks"
 
-    check_eq "배포 conf 스모크: upstream HEAD 불변" \
-        "$REAL_UP_HEAD_BEFORE" "$(git -C "$REAL_UP" rev-parse HEAD)"
-    check_eq "배포 conf 스모크: mirror HEAD 불변" \
-        "$REAL_MI_HEAD_BEFORE" "$(git -C "$REAL_MI" rev-parse HEAD)"
-    check_eq "배포 conf 스모크: upstream 워킹트리 불변" \
-        "$REAL_UP_STATUS_BEFORE" "$(git -C "$REAL_UP" status --porcelain)"
-    check_eq "배포 conf 스모크: mirror 워킹트리 불변" \
-        "$REAL_MI_STATUS_BEFORE" "$(git -C "$REAL_MI" status --porcelain)"
-fi
+    check_eq "배포 conf($base): upstream HEAD 불변" "$up_head" "$(git -C "$up" rev-parse HEAD)"
+    check_eq "배포 conf($base): mirror HEAD 불변" "$mi_head" "$(git -C "$mi" rev-parse HEAD)"
+    check_eq "배포 conf($base): upstream 워킹트리 불변" "$up_st" "$(git -C "$up" status --porcelain)"
+    check_eq "배포 conf($base): mirror 워킹트리 불변" "$mi_st" "$(git -C "$mi" status --porcelain)"
+}
+
+# base / from / to / 기대 복사줄 / 기대 보존·미반입·미삭제 줄 / 유출 검사 ERE
+# from·to 는 저장소가 전진해도 결과가 변하지 않도록 sha 로 못박는다(2026-09-05 실측).
+smoke_real_pair max9296 3f5915f 4fa9881 \
+    "합계: 복사 58 (쓰기 58 / 삭제 0)" \
+    "보존 6 · 미반입 278 · 미삭제 1" \
+    'artifacts/|docs/superpowers/|\.github/'
+
+smoke_real_pair gstApp 46fd6fa 77a2635 \
+    "합계: 복사 84 (쓰기 75 / 삭제 0 / 삭제생략 9)" \
+    "보존 1 · 미반입 54 · 미삭제 1" \
+    '\.github/|docs/superpowers/|todos/|\.vscode/'
+
+smoke_real_pair imx-vpu d8e9590 87deeb7 \
+    "합계: 복사 6 (쓰기 6 / 삭제 0)" \
+    "보존 5 · 미반입 18 · 미삭제 1" \
+    '\.github/|make-for-imx8\.sh'
+
+smoke_real_pair sc16is7xx 9f71cb9 093e069 \
+    "합계: 복사 4 (쓰기 3 / 삭제 0 / 삭제생략 1)" \
+    "보존 3 · 미반입 14 · 미삭제 1" \
+    '\.clangd|\.github/|sc16is7xx-ext-ko-provenance'
 
 # ══════════════════════════════════════════════════════════════════════════
 printf '\n=== 집계 ===\n'
