@@ -649,6 +649,22 @@ check_eq "--apply 커밋 subject 형식" \
     "chore: sync curated mirror — upstream $(git -C "$W_UP" rev-parse --short "$W_FROM")..$(git -C "$W_UP" rev-parse --short "$W_TO")" \
     "$(git -C "$W_MI" log -1 --format=%s)"
 check_eq "--apply 후 미러 워킹트리 clean" "" "$(git -C "$W_MI" status --porcelain)"
+
+# 커밋 메시지는 빈 축의 **유일한 영속 기록**이다(화면 [주의] 블록은 사라진다).
+# 여기서는 반대 방향을 못박는다 — 빈 축이 하나도 없는 conf 는 "없음" 으로 기록한다.
+# 절 자체가 없으면 나중에 "적히지 않은 것"과 "없는 것"을 구분할 수 없다.
+# (빈 축이 있을 때 무엇이 적히는지는 9b-6 이 검사한다.)
+APPLY_BODY="$(git -C "$W_MI" log -1 --format=%B)"
+if printf '%s\n' "$APPLY_BODY" | grep -qF "의도적으로 비운 축 (conf 의 AXES_INTENTIONALLY_EMPTY"; then
+    pass "--apply 커밋 메시지: '의도적으로 비운 축' 절이 항상 있다"
+else
+    fail "--apply 커밋 메시지: '의도적으로 비운 축' 절이 항상 있다" "절 존재" "$APPLY_BODY"
+fi
+if printf '%s\n' "$APPLY_BODY" | grep -qxF "  없음"; then
+    pass "--apply 커밋 메시지: 빈 축이 없으면 '없음' 으로 기록한다"
+else
+    fail "--apply 커밋 메시지: 빈 축이 없으면 '없음' 으로 기록한다" "  없음" "$APPLY_BODY"
+fi
 check_eq "--apply 는 upstream 을 건드리지 않는다" "$UP_SNAP_BEFORE" "$(snapshot_repo "$W_UP")"
 check_out_has "--apply 어서션 A 통과" "[PASS] ASSERT_A_UPSTREAM_ONLY_INFLOW"
 check_out_has "--apply 어서션 B 통과" "[PASS] ASSERT_B_FORBID_INFLOW"
@@ -657,6 +673,9 @@ check_out_has "--apply 어서션 D 통과" "[PASS] ASSERT_D_MIRROR_ONLY_DELETED"
 check_out_has "--apply 어서션 E 통과" "[PASS] ASSERT_E_STAGED_AS_REPORTED"
 check_out_has "--apply 어서션 F 통과" "[PASS] ASSERT_F_NEW_FILE_INFLOW"
 check_out_has "--apply 는 push 하지 않았음을 알린다" "push 는 하지 않았다"
+# A·B 의 [PASS] 문구는 검사 기준의 종수를 함께 찍는다. 축이 살아 있는 이 세계에서
+# '0종' 이 나오면 축이 죽었다는 뜻이다.
+check_out_lacks "--apply 어서션 A·B 의 기준 종수가 0이 아니다" "0종 기준"
 
 # 복사 결과
 check_eq "복사: src/app.sh 내용이 upstream head 와 일치" \
@@ -1045,6 +1064,326 @@ run_sync --pair mock --from "$W_FROM" --to "$W_TO"
 check_eq "큐레이션 conf 없음 → 종료 코드 2" "2" "$RUN_RC"
 
 # ══════════════════════════════════════════════════════════════════════════
+printf -- '\n--- 9b. AXES_INTENTIONALLY_EMPTY — 명시적으로 비운 축 (이슈 #41) ---\n'
+# ══════════════════════════════════════════════════════════════════════════
+# 이슈 #34 는 "축이 비면 조용히 전량 복사된다"를 종료 코드 2 로 막았다. 이슈 #41 은
+# 거기에 **조사한 뒤 비우기로 한 축**을 conf 가 명시 선언하는 예외를 뚫는다.
+# 그래서 이 절이 지켜야 할 것은 두 가지이고 방향이 서로 반대다:
+#   (1) 기본 동작은 그대로다 — 표식 없는 빈 축은 여전히 종료 코드 2 다.
+#       이게 깨지면 이슈 #34 의 방어가 통째로 사라지고 그 사실이 조용히 지나간다.
+#   (2) 표식 자체가 틀리면(오타·모순·타입) 거부한다. 표식이 검증 없이 통과하면
+#       사고를 막는 장치가 아니라 **새 사고 경로**가 된다.
+# 그리고 통과시킨 축이 무엇을 무력화하는지는 매 실행에 경고로 보여야 한다 —
+# 안 보이면 사람은 방어선이 꺼진 줄 모른 채 지나간다.
+
+# 다섯 축을 build_world 의 mock.conf 와 **같은 값**으로 채운 conf 를 쓰되, 인자로 준
+# 축만 비운다. 첫 인자는 표식 선언 줄(빈 문자열이면 아예 선언하지 않는다).
+axes_conf() {  # axes_conf <표식 선언 줄|""> [비울 축...]
+    local marker="$1"
+    shift
+    local -A empty=()
+    local a
+    for a in "$@"; do empty["$a"]=1; done
+    {
+        printf '# axes_conf 가 생성한 mock 큐레이션 규칙 (이슈 #41 검사용)\n'
+        if [[ -n "${empty[KEEP_MIRROR]:-}" ]]; then
+            printf 'KEEP_MIRROR=()\n'
+        else
+            printf 'KEEP_MIRROR=( "README.md" "docs/prepare (board) gate & v1.md" )\n'
+        fi
+        if [[ -n "${empty[UPSTREAM_ONLY]:-}" ]]; then
+            printf 'UPSTREAM_ONLY=()\n'
+        else
+            printf 'UPSTREAM_ONLY=( "internal/**" "docs/AND9230-D (AP1302 RR)_PointImage.pdf" "docs/GMSL2 DS & Reg Doc (rev3).pdf" "docs/x=R2_PointImage.pdf" )\n'
+        fi
+        if [[ -n "${empty[MIRROR_ONLY]:-}" ]]; then
+            printf 'MIRROR_ONLY=()\n'
+        else
+            printf 'MIRROR_ONLY=( "docs/mirror-only.md" )\n'
+        fi
+        if [[ -n "${empty[FORBID]:-}" ]]; then
+            printf 'FORBID=()\n'
+        else
+            printf 'FORBID=( "PR #" "docs/superpowers/" )\n'
+        fi
+        if [[ -n "${empty[MUST_SURVIVE]:-}" ]]; then
+            printf 'MUST_SURVIVE=()\n'
+        else
+            printf 'MUST_SURVIVE=( "증적 위치" "대상 저장소는 여기 포함되지 않으므로" )\n'
+        fi
+        if [[ -n "$marker" ]]; then
+            printf '%s\n' "$marker"
+        fi
+    } > "$W_CFG/curation/mock.conf"
+}
+
+# ── 헬퍼 자체 검사 ─────────────────────────────────────────────────────────
+# axes_conf 가 만든 conf 가 build_world 의 것과 **같은 결과**를 내지 못하면 아래
+# 검사들은 "축을 비웠기 때문"이 아니라 "conf 가 원래 달라서" 통과/실패하게 된다.
+# 축을 하나도 비우지 않은 conf 로 baseline 과 같은 합계가 나오는지부터 못박는다.
+build_world axesconf-selftest baseline
+axes_conf ""
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "axes_conf 자체 검사: 축을 하나도 비우지 않으면 종료 코드 0" "0" "$RUN_RC"
+check_out_has "axes_conf 자체 검사: 합계가 baseline 과 같다" "합계: 복사 5 (쓰기 4 / 삭제 1)"
+check_out_has "axes_conf 자체 검사: 보존·미반입·미삭제도 baseline 과 같다" "보존 2 · 미반입 5 · 미삭제 1"
+# 표식을 선언하지 않는 것은 허용이고(빈 배열 취급), 그때는 경고도 나오지 않아야 한다.
+check_out_lacks "표식 미선언: 빈 축 경고가 나오지 않는다 (경고가 무조건 찍히는 것이 아님)" \
+    "의도적으로 비운 축"
+
+# ── 1. 기본 동작 회귀 — 표식 **없이** 축이 비면 다섯 축 전부 종료 코드 2 ────
+printf -- '  1. 표식 없는 빈 축은 여전히 거부한다 (이슈 #34 의 방어선)\n'
+build_world empty-axis-regress baseline
+for AX in KEEP_MIRROR UPSTREAM_ONLY MIRROR_ONLY FORBID MUST_SURVIVE; do
+    axes_conf "" "$AX"
+    run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+    check_eq "표식 없이 $AX 가 비면 종료 코드 2" "2" "$RUN_RC"
+    check_out_has "표식 없이 $AX: 어느 축인지 지목한다" "$AX 가 비었다"
+    check_out_has "표식 없이 $AX: 표식 사용법을 알려준다" \
+        "AXES_INTENTIONALLY_EMPTY=( $AX ) 로 명시해라"
+done
+
+# ── 2. 표식이 있으면 그 축**만** 열린다 ────────────────────────────────────
+printf -- '  2. 표식은 적힌 축만 연다 (전면 해제가 아니다)\n'
+build_world marked-axis baseline
+
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY )' UPSTREAM_ONLY
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "표식에 적힌 빈 축: 종료 코드 0 으로 통과" "0" "$RUN_RC"
+
+# 두 축이 비었는데 표식에는 하나만 적혀 있다 → 나머지 하나는 여전히 막혀야 한다.
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY )' UPSTREAM_ONLY FORBID
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "표식에 없는 다른 빈 축: 여전히 종료 코드 2" "2" "$RUN_RC"
+check_out_has "표식에 없는 다른 빈 축: 막힌 축은 FORBID 다" "FORBID 가 비었다"
+check_out_lacks "표식에 적힌 축은 막힌 축으로 지목되지 않는다" "UPSTREAM_ONLY 가 비었다"
+
+# 다섯 축 전부 비우고 전부 표식에 적으면 통과한다(축별 매칭이지 특수 케이스가 아니다).
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( KEEP_MIRROR UPSTREAM_ONLY MIRROR_ONLY FORBID MUST_SURVIVE )' \
+    KEEP_MIRROR UPSTREAM_ONLY MIRROR_ONLY FORBID MUST_SURVIVE
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "다섯 축 전부 표식: 종료 코드 0" "0" "$RUN_RC"
+check_out_has "다섯 축 전부 표식: 다섯 개를 다 경고한다" "의도적으로 비운 축 5개"
+
+# ── 3. 오타 차단 ───────────────────────────────────────────────────────────
+printf -- '  3. 축 이름 오타를 거부한다 (오타는 의도한 축을 열지 못한다)\n'
+build_world marker-typo baseline
+
+# 오타 + 그 축이 실제로 비어 있는 세계. 오타 검사가 빈 축 검사보다 **먼저** 돌아야
+# 한다 — 순서가 뒤집히면 "UPSTREAM_ONLY 가 비었다" 로 죽어서, 사람은 표식을 이미
+# 적었는데 왜 안 먹는지 알 수 없는 메시지를 받는다.
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( UPSTEAM_ONLY )' UPSTREAM_ONLY
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "표식 오타: 종료 코드 2" "2" "$RUN_RC"
+check_out_has "표식 오타: 오타 값을 그대로 인용한다" "축 이름이 아닌 값이 있다: 'UPSTEAM_ONLY'"
+check_out_has "표식 오타: 쓸 수 있는 이름을 전부 보여준다" \
+    "KEEP_MIRROR UPSTREAM_ONLY MIRROR_ONLY FORBID MUST_SURVIVE 뿐이다"
+check_out_lacks "표식 오타: 빈 축 메시지로 새지 않는다 (오타 검사가 먼저다)" "UPSTREAM_ONLY 가 비었다"
+
+# 빈 축이 하나도 없어도 오타는 거부한다 — 표식이 조용히 무의미해지면 안 된다.
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( NOT_AN_AXIS )'
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "표식 오타(빈 축이 없는 conf): 그래도 종료 코드 2" "2" "$RUN_RC"
+
+# ── 4. 모순 차단 ───────────────────────────────────────────────────────────
+printf -- '  4. 비어 있지 않은 축을 표식에 적으면 거부한다 (낡은 conf 신호)\n'
+build_world marker-stale baseline
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( KEEP_MIRROR )'
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "비어 있지 않은 축을 표식에: 종료 코드 2" "2" "$RUN_RC"
+check_out_has "비어 있지 않은 축을 표식에: 원소 개수까지 알려준다" \
+    "KEEP_MIRROR 가 AXES_INTENTIONALLY_EMPTY 에 있는데 비어 있지 않다(2개)"
+
+# ── 5. 표식 자신의 타입 검사 ───────────────────────────────────────────────
+printf -- '  5. 표식이 배열이 아니면 거부한다 (다섯 축과 같은 함정)\n'
+build_world marker-type baseline
+
+# 공백 구분 문자열로 쓰면 원소 1개짜리 스칼라가 된다. 다섯 축이 이미 밟은 함정이라
+# 표식도 같은 방식으로 막아야 한다. 타입 검사는 빈 축 검사보다 먼저여야 한다.
+axes_conf 'AXES_INTENTIONALLY_EMPTY="UPSTREAM_ONLY"' UPSTREAM_ONLY
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "스칼라 표식: 종료 코드 2" "2" "$RUN_RC"
+check_out_has "스칼라 표식: 선언 타입을 인용해 알린다" "bash 배열이어야 한다(선언 타입 '-')"
+check_out_lacks "스칼라 표식: 빈 축 메시지로 새지 않는다 (타입 검사가 먼저다)" "UPSTREAM_ONLY 가 비었다"
+
+# 연관 배열도 인덱스 배열이 아니다 — 원소 순회 의미가 달라지므로 거부한다.
+axes_conf 'declare -A AXES_INTENTIONALLY_EMPTY=( [UPSTREAM_ONLY]=1 )' UPSTREAM_ONLY
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "연관 배열 표식: 종료 코드 2" "2" "$RUN_RC"
+check_out_has "연관 배열 표식: 선언 타입 'A' 를 인용한다" "bash 배열이어야 한다(선언 타입 'A')"
+
+# ── 5b. 중복 차단 ──────────────────────────────────────────────────────────
+printf -- '  5b. 같은 축을 두 번 적으면 거부한다 (개수가 곧 산출물이다)\n'
+# 이 표식의 산출물은 "방어선 **몇 개**가 꺼졌는가" 라는 숫자다. 머리줄의 개수는 표식의
+# 원소 수라서, 중복을 흘려보내면 실제로 꺼진 축 수보다 큰 숫자가 보고되고 같은 설명이
+# 두 번 찍힌다 — 사람이 세는 눈금이 어긋난다. 줄을 복사하다 나오는 흔한 형태다.
+build_world marker-dup baseline
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY UPSTREAM_ONLY FORBID )' UPSTREAM_ONLY FORBID
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "중복 표식: 종료 코드 2" "2" "$RUN_RC"
+check_out_has "중복 표식: 어느 이름이 중복인지 인용한다" \
+    "같은 축 이름이 두 번 있다: 'UPSTREAM_ONLY'"
+check_out_lacks "중복 표식: 부풀려진 개수로 경고를 찍고 넘어가지 않는다" "의도적으로 비운 축 3개"
+
+# ── 5c. conf 가 declare 를 쓰면 거부한다 (검증만 통과하고 죽는 경로) ────────
+printf -- '  5c. declare 로 선언한 표식을 거부한다 (지역 변수가 되어 사라진다)\n'
+# conf 는 load_curation() **안에서** source 되므로 `declare -a` 는 함수 지역 변수를
+# 만든다. 타입·오타·중복·빈 축 검사는 그 지역 변수를 보고 전부 통과하는데, 함수가
+# 반환하면 변수가 사라져 소비 지점이 set -u 의 unbound variable 로 죽는다.
+# 그 죽음은 종료 코드 2(설정 오류)가 아니라 1(사용법 오류)이고 conf 이름도 나오지
+# 않는다 — "검증이 OK 라고 말한 conf 가 그 직후 죽는" 최악의 형태다.
+build_world marker-declare baseline
+axes_conf 'declare -a AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY )' UPSTREAM_ONLY
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "declare 표식: 종료 코드 1(bash 크래시)이 아니라 2(설정 오류)" "2" "$RUN_RC"
+check_out_has "declare 표식: 무엇이 잘못됐는지 conf 이름과 함께 알린다" \
+    "AXES_INTENTIONALLY_EMPTY 가 전역에 남지 않았다"
+check_out_has "declare 표식: 고치는 법을 알려준다" \
+    "declare 없이 AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY ) 형식으로 대입해라"
+check_out_lacks "declare 표식: bash 내부 unbound variable 로 죽지 않는다" "unbound variable"
+
+# ── 6. 경고 가시성 — dry-run 과 --apply **양쪽**에 실제로 나온다 ───────────
+printf -- '  6. 꺼진 방어선을 매 실행에 알린다 (이 작업의 핵심)\n'
+build_world warn-visible baseline
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( FORBID )' FORBID
+
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "경고 가시성: dry-run 종료 코드 0" "0" "$RUN_RC"
+check_out_has "경고 가시성: dry-run 머리줄" \
+    "[주의] 의도적으로 비운 축 1개 (conf 의 AXES_INTENTIONALLY_EMPTY):"
+check_out_has "경고 가시성: dry-run 이 무엇이 꺼졌는지 설명한다" \
+    "FORBID — 금지 문자열이 없다. ASSERT_B 는 아무것도 검사하지 않는다."
+check_out_has "경고 가시성: dry-run 이 '안전하다는 뜻이 아님'을 못박는다" \
+    "'조사한 뒤 비우기로 했다' 는 선언이지 안전하다는 뜻이 아니다."
+
+# --apply 분기 안쪽에서 찍으면 실제로 적용하는 실행에서만 보인다. 사람은 dry-run 을
+# 읽고 판단하므로 dry-run 에도, 적용 로그에도 남아야 한다.
+WARN_BEFORE="$(commit_count "$W_MI")"
+run_sync --pair mock --from "$W_FROM" --to "$W_TO" --apply --allow-new
+check_eq "경고 가시성: --apply 종료 코드 0" "0" "$RUN_RC"
+check_eq "경고 가시성: --apply 커밋 1개 생성" "$(( WARN_BEFORE + 1 ))" "$(commit_count "$W_MI")"
+check_out_has "경고 가시성: --apply 출력에도 같은 머리줄" "[주의] 의도적으로 비운 축 1개"
+check_out_has "경고 가시성: --apply 출력에도 축별 설명" \
+    "FORBID — 금지 문자열이 없다. ASSERT_B 는 아무것도 검사하지 않는다."
+
+# 화면 경고는 실행이 끝나면 사라진다. 사람이 나중에 push 여부를 판단할 때(그리고 미러
+# 쪽 리뷰어가) 읽는 유일한 영속 기록은 커밋 메시지다. 거기에 "어서션 6종 통과" 만
+# 남으면, 검사 대상이 0건이라 한 번도 돌지 않은 어서션까지 실질적 통과로 기록된다.
+WARN_BODY="$(git -C "$W_MI" log -1 --format=%B)"
+if printf '%s\n' "$WARN_BODY" | grep -qF "ASSERT_B 는 문자열 0종이라 검사한 것이 없다"; then
+    pass "경고 가시성: 커밋 메시지에도 무력화된 어서션이 남는다"
+else
+    fail "경고 가시성: 커밋 메시지에도 무력화된 어서션이 남는다" \
+         "FORBID/ASSERT_B 줄 존재" "$WARN_BODY"
+fi
+if printf '%s\n' "$WARN_BODY" | grep -qF "FORBID"; then
+    pass "경고 가시성: 커밋 메시지가 어느 축을 비웠는지 이름으로 적는다"
+else
+    fail "경고 가시성: 커밋 메시지가 어느 축을 비웠는지 이름으로 적는다" "FORBID" "$WARN_BODY"
+fi
+
+# 축 출력 순서는 CURATION_AXES 순서가 아니라 **conf 에 적은 배열 순서**다.
+# (CURATION_AXES 순서라면 UPSTREAM_ONLY 가 FORBID 보다 먼저 나온다)
+build_world warn-order baseline
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( FORBID UPSTREAM_ONLY )' FORBID UPSTREAM_ONLY
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "경고 순서: 종료 코드 0" "0" "$RUN_RC"
+check_out_has "경고 순서: 개수는 표식 원소 수다" "의도적으로 비운 축 2개"
+check_eq "경고 순서: conf 배열 순서를 그대로 따른다 (CURATION_AXES 순서가 아니다)" \
+    "FORBID UPSTREAM_ONLY" \
+    "$(printf '%s\n' "$RUN_OUT" | sed -nE 's/^ +(FORBID|UPSTREAM_ONLY) —.*/\1/p' | paste -sd' ' -)"
+
+# ── 7. 빈 UPSTREAM_ONLY 의 실제 동작 — 방어선이 정말 꺼지고, ASSERT_F 만 남는다 ─
+printf -- '  7. 빈 UPSTREAM_ONLY: 반입 금지가 사라지고 ASSERT_F 가 마지막 방어선이 된다\n'
+build_world empty-upstream-only baseline
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY )' UPSTREAM_ONLY
+
+run_sync --pair mock --from "$W_FROM" --to "$W_TO"
+check_eq "빈 UPSTREAM_ONLY: dry-run 종료 코드 0" "0" "$RUN_RC"
+check_row "빈 UPSTREAM_ONLY: internal/plan.md 가 '미반입' 이 아니라 '복사' 로 분류된다" \
+    "복사" "internal/plan.md"
+check_out_has "빈 UPSTREAM_ONLY: 미반입이 0건이 된다 (축이 통째로 꺼졌다)" \
+    "보존 2 · 미반입 0 · 미삭제 1"
+check_out_has "빈 UPSTREAM_ONLY: 반입 금지였던 파일이 '신규 반입' 목록에 뜬다" \
+    "+ internal/newplan.md"
+
+# 남은 방어선이 실제로 작동하는가 — 승인 없이 --apply 하면 ASSERT_F 가 거부해야 한다.
+UO_BEFORE="$(commit_count "$W_MI")"
+run_sync --pair mock --from "$W_FROM" --to "$W_TO" --apply
+check_eq "빈 UPSTREAM_ONLY: --allow-new 없는 --apply 는 종료 코드 4" "4" "$RUN_RC"
+check_out_has "빈 UPSTREAM_ONLY: 거부한 것은 ASSERT_F 다" "[FAIL] ASSERT_F_NEW_FILE_INFLOW"
+check_out_has "빈 UPSTREAM_ONLY: 반입 금지였던 경로를 지목한다" "+ internal/plan.md"
+check_out_has "빈 UPSTREAM_ONLY: ASSERT_A 는 패턴이 0개라 아무것도 못 잡는다" \
+    "[PASS] ASSERT_A_UPSTREAM_ONLY_INFLOW"
+# [주의] 블록은 분류 표 **앞**에 찍혀 긴 쌍에서는 화면 밖으로 밀린다. 사람이 go/no-go
+# 를 판단하는 마지막 화면은 어서션 블록이므로, 거기에도 '0종' 이 드러나야 한다.
+check_out_has "빈 UPSTREAM_ONLY: 어서션 블록 자체가 기준 0종임을 보여준다" \
+    "반입 금지 패턴 0종 기준 유입 없음"
+check_eq "빈 UPSTREAM_ONLY: 승인 없으면 커밋하지 않는다" "$UO_BEFORE" "$(commit_count "$W_MI")"
+
+# 표식은 **적힌 축만** 끈다 — 나머지 어서션까지 끄지 않는다. 이 세계에서 승인해
+# 반입되는 internal/plan.md 는 FORBID 문자열("PR #7")을 담고 있어 ASSERT_B 가 잡는다.
+build_world empty-upstream-only-approved baseline
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY )' UPSTREAM_ONLY
+UO_BEFORE="$(commit_count "$W_MI")"
+run_sync --pair mock --from "$W_FROM" --to "$W_TO" --apply --allow-new
+check_eq "빈 UPSTREAM_ONLY + --allow-new: 살아 있는 FORBID 가 잡아 종료 코드 4" "4" "$RUN_RC"
+check_out_has "빈 UPSTREAM_ONLY + --allow-new: 잡은 것은 ASSERT_B 다" "[FAIL] ASSERT_B_FORBID_INFLOW"
+check_out_has "빈 UPSTREAM_ONLY + --allow-new: 유입된 금지 문자열을 인용한다" \
+    "금지 문자열 발견: \"PR #\""
+check_eq "빈 UPSTREAM_ONLY + --allow-new: 커밋하지 않는다" "$UO_BEFORE" "$(commit_count "$W_MI")"
+
+# UPSTREAM_ONLY 와 FORBID 를 **둘 다** 비운 세계다(배포 conf 중에는 이런 형태가 없다 —
+# pim-summit-backports 는 UPSTREAM_ONLY 하나만 비우고 FORBID 로 KEEP_MIRROR 를 앵커한다).
+# 여기서는 남는 방어선이 ASSERT_F 하나뿐이고, 승인하면 반입 금지였던 파일이 미러 커밋에
+# 실제로 들어간다. "방어선이 꺼졌다"는 경고가 수사가 아님을 실물로 확인한다.
+build_world empty-uo-and-forbid baseline
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY FORBID )' UPSTREAM_ONLY FORBID
+UO_BEFORE="$(commit_count "$W_MI")"
+run_sync --pair mock --from "$W_FROM" --to "$W_TO" --apply --allow-new
+check_eq "UPSTREAM_ONLY·FORBID 둘 다 빔: --allow-new 로 종료 코드 0" "0" "$RUN_RC"
+check_eq "UPSTREAM_ONLY·FORBID 둘 다 빔: 커밋 1개 생성" \
+    "$(( UO_BEFORE + 1 ))" "$(commit_count "$W_MI")"
+if git -C "$W_MI" ls-files --error-unmatch -- "internal/plan.md" >/dev/null 2>&1; then
+    pass "UPSTREAM_ONLY·FORBID 둘 다 빔: internal/plan.md 가 실제로 미러에 반입된다 (꺼진 방어선의 실물 증거)"
+else
+    fail "UPSTREAM_ONLY·FORBID 둘 다 빔: internal/plan.md 가 실제로 미러에 반입된다 (꺼진 방어선의 실물 증거)" \
+         "미러 인덱스에 존재" "없음"
+fi
+if git -C "$W_MI" grep --cached -q -F -e "PR #7"; then
+    pass "UPSTREAM_ONLY·FORBID 둘 다 빔: 내부 참조 문자열까지 미러 커밋에 들어간다"
+else
+    fail "UPSTREAM_ONLY·FORBID 둘 다 빔: 내부 참조 문자열까지 미러 커밋에 들어간다" \
+         "미러 인덱스에 \"PR #7\" 존재" "없음"
+fi
+
+# ── 8. 빈 FORBID 의 실제 동작 — ASSERT_B 가 통과하되 아무것도 검사하지 않는다 ─
+printf -- '  8. 빈 FORBID: ASSERT_B 가 [PASS] 인데 금지 문자열은 그대로 들어온다\n'
+# 최소 쌍이다. 같은 B_bad 세계(upstream 이 "PR #12" 를 내려보낸다)에서
+#   FORBID 가 살아 있으면      → 종료 4, 커밋 없음
+#   FORBID 를 비우고 표식을 달면 → 종료 0, 금지 문자열이 미러 커밋에 실제로 들어간다
+# 두 세계의 차이는 FORBID 축 하나뿐이다.
+build_world empty-forbid-control B_bad
+run_sync --pair mock --from "$W_FROM" --to "$W_TO" --apply --allow-new
+check_eq "빈 FORBID 대조군: FORBID 가 살아 있으면 같은 세계가 종료 코드 4" "4" "$RUN_RC"
+
+build_world empty-forbid B_bad
+axes_conf 'AXES_INTENTIONALLY_EMPTY=( FORBID )' FORBID
+EF_BEFORE="$(commit_count "$W_MI")"
+run_sync --pair mock --from "$W_FROM" --to "$W_TO" --apply --allow-new
+check_eq "빈 FORBID: 같은 세계가 종료 코드 0 이 된다" "0" "$RUN_RC"
+check_out_has "빈 FORBID: ASSERT_B 는 [PASS] 로 보고된다" "[PASS] ASSERT_B_FORBID_INFLOW"
+check_out_has "빈 FORBID: 그 [PASS] 가 0종을 세는 통과임이 같은 줄에 드러난다" \
+    "금지 문자열 0종 기준 유입 없음"
+check_eq "빈 FORBID: 커밋 1개 생성" "$(( EF_BEFORE + 1 ))" "$(commit_count "$W_MI")"
+if git -C "$W_MI" grep --cached -q -F -e "PR #12"; then
+    pass "빈 FORBID: 금지 문자열이 실제로 미러 커밋에 들어간다 (ASSERT_B 가 무엇도 검사하지 않는다는 증거)"
+else
+    fail "빈 FORBID: 금지 문자열이 실제로 미러 커밋에 들어간다 (ASSERT_B 가 무엇도 검사하지 않는다는 증거)" \
+         "미러 인덱스에 \"PR #12\" 존재" "없음"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
 printf -- '\n--- 10. 배포 설정(config/curation/*.conf) 스모크 ---\n'
 # ══════════════════════════════════════════════════════════════════════════
 # 위 검사는 전부 mock 전용 conf 를 주입한다. 그래서 **실제로 배포되는 conf** 의
@@ -1057,9 +1396,19 @@ printf -- '\n--- 10. 배포 설정(config/curation/*.conf) 스모크 ---\n'
 #
 # **새 쌍을 pairs.tsv 에 추가하면 여기에도 기대값 한 줄을 추가해야 한다.**
 # 그러지 않으면 그 conf 는 회귀 검사 밖에 남고, 패턴이 죽어도 스위트는 전부 통과한다.
+#
+# 인자 7·8 은 선택이다. 대부분의 쌍은 '신규 반입' 이 0건인 것이 정상이라 기본값이
+# "없어야 한다" 지만, UPSTREAM_ONLY 를 의도적으로 비운 쌍(이슈 #41)은 신규 반입이
+# 나오는 것이 **정상이자 설계 의도**다. 그런 쌍은 기대 문구를 넘겨 못박는다.
+# 9번째 이후 인자는 "출력에 반드시 있어야 할 문자열" 을 추가로 검사한다.
 smoke_real_pair() {
     local base="$1" from="$2" to="$3" want_copy="$4" want_rest="$5" leak_re="$6"
-    local up mi up_head mi_head up_st mi_st leaks
+    local want_new="${7:-}" want_new_path="${8:-}"
+    local -a extra_has=()
+    if (( $# > 8 )); then
+        extra_has=("${@:9}")
+    fi
+    local up mi up_head mi_head up_st mi_st leaks e
 
     up="$(awk -F'\t' -v b="$base" '$1==b {print $4; exit}' "$MODULE_DIR/config/pairs.tsv")"
     mi="$(awk -F'\t' -v b="$base" '$1==b {print $5; exit}' "$MODULE_DIR/config/pairs.tsv")"
@@ -1089,12 +1438,25 @@ smoke_real_pair() {
     check_out_has "배포 conf($base): $want_copy" "$want_copy"
     check_out_has "배포 conf($base): $want_rest" "$want_rest"
     check_out_lacks "배포 conf($base): 죽은 패턴 경고가 없다" "매칭하지 않는 패턴"
-    check_out_lacks "배포 conf($base): 신규 반입이 없다" "신규 반입 — 미러에 없던 파일"
 
-    # UPSTREAM_ONLY 로 막아 둔 경로가 '복사' 로 분류되면 공개 미러로 새어나간다.
+    if [[ -z "$want_new" ]]; then
+        check_out_lacks "배포 conf($base): 신규 반입이 없다" "신규 반입 — 미러에 없던 파일"
+    else
+        check_out_has "배포 conf($base): 신규 반입이 기대대로다 ($want_new)" "$want_new"
+        if [[ -n "$want_new_path" ]]; then
+            check_out_has "배포 conf($base): 신규 반입 목록에 $want_new_path" "+ $want_new_path"
+        fi
+    fi
+
+    # 축이 지키는 경로가 '복사' 로 분류되면 그 축이 죽은 것이다 — UPSTREAM_ONLY 면
+    # 내부 파일이 공개 미러로 새어나가고, KEEP_MIRROR 면 미러 판이 덮여 사라진다.
     # 패턴 한 글자 오타가 정확히 이 결과를 낸다.
     leaks="$(printf '%s\n' "$RUN_OUT" | grep '^  복사' | grep -cE "$leak_re")"
-    check_eq "배포 conf($base): 반입 금지 경로가 복사로 분류되지 않는다" "0" "$leaks"
+    check_eq "배포 conf($base): 축이 지키는 경로가 복사로 분류되지 않는다" "0" "$leaks"
+
+    for e in ${extra_has[@]+"${extra_has[@]}"}; do
+        check_out_has "배포 conf($base): $e" "$e"
+    done
 
     check_eq "배포 conf($base): upstream HEAD 불변" "$up_head" "$(git -C "$up" rev-parse HEAD)"
     check_eq "배포 conf($base): mirror HEAD 불변" "$mi_head" "$(git -C "$mi" rev-parse HEAD)"
@@ -1123,6 +1485,25 @@ smoke_real_pair sc16is7xx 9f71cb9 093e069 \
     "합계: 복사 4 (쓰기 3 / 삭제 0 / 삭제생략 1)" \
     "보존 3 · 미반입 14 · 미삭제 1" \
     '\.clangd|\.github/|sc16is7xx-ext-ko-provenance'
+
+# 다섯 번째 쌍 (이슈 #41). 앞의 네 쌍과 두 가지가 다르다.
+#   ① **미러 브랜치가 develop 이다** (main 이 아니다). pairs.tsv 7번 컬럼을 쓴다.
+#   ② UPSTREAM_ONLY 를 AXES_INTENTIONALLY_EMPTY 로 비운 conf 다. 그래서
+#      `.clangd` 1건이 '신규 반입' 으로 나오는 것이 **정상이자 설계 의도**다 —
+#      앞의 네 쌍처럼 "신규 반입 없음" 을 요구하면 이 쌍은 구조적으로 통과할 수 없다.
+#      FORBID 는 비어 있지 않다(".cache/" 한 줄로 KEEP_MIRROR 의 .gitignore 를 앵커한다).
+# 유출 검사(6번째 인자)의 오라클도 다르다. UPSTREAM_ONLY 가 비어 있으므로 대신
+# **KEEP_MIRROR 3개**를 본다 — 이 쌍에서 축 오타가 나면 정확히 그 세 파일이 '복사'
+# 로 흘러 미러 판(= 사람이 이식해야 할 차이)을 조용히 덮어쓴다.
+# 9번째 이후 인자로 빈 축 경고가 **배포 conf 실행에서도** 실제로 찍히는지 못박는다.
+smoke_real_pair pim-summit-backports 280e882 28997d8 \
+    "합계: 복사 2 (쓰기 2 / 삭제 0)" \
+    "보존 3 · 미반입 0 · 미삭제 2" \
+    '\.gitignore|README\.md|make-for-imx8' \
+    "신규 반입 — 미러에 없던 파일 1개" \
+    ".clangd" \
+    "[주의] 의도적으로 비운 축 1개 (conf 의 AXES_INTENTIONALLY_EMPTY):" \
+    "UPSTREAM_ONLY — 반입 금지 목록이 없다. upstream 전용 파일이 전부 복사 대상이 된다."
 
 # ══════════════════════════════════════════════════════════════════════════
 printf '\n=== 집계 ===\n'
