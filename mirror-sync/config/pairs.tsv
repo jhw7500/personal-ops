@@ -11,22 +11,39 @@
 #   6 upstream_branch upstream 기준 브랜치 (표시·검증용. 두 쪽 브랜치 이름이 서로 다르다)
 #   7 mirror_branch   mirror 기준 브랜치   (--apply 는 이 브랜치가 체크아웃돼 있어야 진행)
 #
+# 4쌍 실측일 2026-09-05. 아래 4행은 전부 upstream master → mirror main 이다
+# (max9296 과 같은 형태). upstream_branch 는 표시용이고, --apply 가 실제로 검사하는
+# 것은 mirror_branch 뿐이다.
+#
 # base	github_remote	gitlab_remote	upstream_path	mirror_path	upstream_branch	mirror_branch
 max9296	https://github.com/jhw7500/max9296.git	http://192.168.10.2:31406/hwjo/max9296	/home/jhw/ai/opencode/projects/max9296	/home/jhw/ai/opencode/projects/max9296-gitlab	master	main
+gstApp	https://github.com/jhw7500/gstApp.git	http://192.168.10.2:31406/hwjo/gstApp	/home/jhw/ai/opencode/projects/gstApp	/home/jhw/ai/opencode/projects/gstApp-gitlab	master	main
+imx-vpu	https://github.com/jhw7500/imx-vpu.git	http://192.168.10.2:31406/hwjo/imx-vpu	/home/jhw/ai/opencode/projects/imx-vpu	/home/jhw/ai/opencode/projects/imx-vpu-gitlab	master	main
+sc16is7xx	https://github.com/jhw7500/sc16is7xx.git	http://192.168.10.2:31406/hwjo/sc16is7xx	/home/jhw/ai/opencode/projects/sc16is7xx	/home/jhw/ai/opencode/projects/sc16is7xx-gitlab	master	main
 
-# ── 미조사 쌍 (이슈 #34 범위 밖) ───────────────────────────────────────────────
-# 아래 4쌍은 자리만 만들어 둔 것이다. **큐레이션 규칙(KEEP_MIRROR / UPSTREAM_ONLY /
-# MIRROR_ONLY / FORBID / MUST_SURVIVE)을 아직 조사하지 않았다.** 이슈 #34 는 표본
-# 하나(max9296)로 5쌍 공용 추상화를 만들지 않기로 못박았으므로, 두 번째 쌍을 실제로
-# 싱크할 때 규칙을 실측한 뒤 주석을 풀고 config/curation/<base>.conf 를 만든다.
+# ── 부적합 쌍 — 조사했으나 현재 스크립트로 처리할 수 없다 ─────────────────────
+# pim-summit-backports 는 2026-09-05 에 **실측했고, 그 결과 부적합으로 판정했다.**
+# "조사하지 않았다" 가 아니다. 큐레이션 축 자체는 실재하지만(내용이 다른 공통 파일
+# 3개 · 미러 전용 2개), 스크립트가 요구하는 다섯 축 중 **두 축의 실측 후보가 0개**다:
+#
+#   UPSTREAM_ONLY 후보 0 — upstream 전용 파일은 `.clangd` 하나뿐인데, 이 파일은
+#     2026-08-25 clangd 커밋들이 추가한 upstream 신기능이고 미러가 아직 못 받은
+#     것이다(미러의 .gitignore·make-for-imx8 은 분기점 6605bac 와 바이트 동일).
+#     "미러에 두지 않는다" 는 정책적 사유가 없으므로 UPSTREAM_ONLY 가 아니다.
+#   FORBID 후보 0 — upstream 에 있고 미러에 0건인 문자열은 clangd 계열뿐인데
+#     (실측 upstream/mirror 파일 수: "compile_commands.json" 3/0, "clangd" 3/0,
+#     ".clangd" 1/0), 그 문자열을 담은 upstream make-for-imx8 이 정상 복사되는
+#     순간 ASSERT_B 가 확정적으로 실패해 --apply 가 영구히 불가능해진다.
+#     max9296 선례 문자열은 전부 upstream 0건이라 애초에 후보가 아니다
+#     ("PR #" 0/0, "pull/" 0/0, ".github" 0/0, "docs/superpowers/" 0/0).
+#
+# 두 축을 추측으로 채우는 것 말고는 방법이 없고, 그 추측 자체가 오류다. 그래서
+# config/curation/pim-summit-backports.conf 를 만들지 않았다. 축이 비면 스크립트가
+# 종료 코드 2 로 거부하므로(bin/mirror-sync.sh 의 빈 배열 검사) 억지로 통과시킬 수도 없다.
+# 참고: 이 쌍의 미러 기본 브랜치는 main 이 아니라 develop 이다(develop == main == badf083).
 #
 # 주석 상태로 두는 이유: 행이 살아 있으면 없는 conf 를 참조하거나 빈 규칙으로
-# "미반입 0건 / 보존 0건" 을 출력해 **조용히 전량 복사**하게 된다. 이슈가 지적한
+# "미반입 0건 / 보존 0건" 을 출력해 **조용히 전량 복사**하게 된다. 이슈 #34 가 지적한
 # 사고와 정확히 같은 실패 방식이다.
 #
-# 로컬 클론 경로도 미확인이므로 아래 경로는 자리표시자(placeholder)다.
-#
-# gstApp	https://github.com/jhw7500/gstApp.git	http://192.168.10.2:31406/hwjo/gstApp	<미조사>	<미조사>	<미조사>	<미조사>
-# imx-vpu	https://github.com/jhw7500/imx-vpu.git	http://192.168.10.2:31406/hwjo/imx-vpu	<미조사>	<미조사>	<미조사>	<미조사>
-# pim-summit-backports	https://github.com/jhw7500/pim-summit-backports.git	http://192.168.10.2:31406/hwjo/pim-summit-backports	<미조사>	<미조사>	<미조사>	<미조사>
-# sc16is7xx	https://github.com/jhw7500/sc16is7xx.git	http://192.168.10.2:31406/hwjo/sc16is7xx	<미조사>	<미조사>	<미조사>	<미조사>
+# pim-summit-backports	https://github.com/jhw7500/pim-summit-backports.git	http://192.168.10.2:31406/hwjo/pim-summit-backports	<부적합-conf없음>	<부적합-conf없음>	<부적합-conf없음>	<부적합-conf없음>
