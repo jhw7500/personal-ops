@@ -52,6 +52,17 @@ BACKOFF_MAX=300             # 복구 연속 실패 시 최대 대기(초)
 # AP가 장시간 꺼져 있는 경우에도 걸리지만, 동글 하나만 재인식하므로 피해는 없다.
 LAST_RESORT_DOWN=1800
 
+# --- 도달성 프로브 (무증상 행 감지) ---
+# 실측 2026-09-07: 데이터 경로가 죽은 뒤 커널이 rtw88 오류를 뱉기까지 17분이 걸렸다.
+#   11:18:14 데이터 사망 -> (17분 무반응) -> 11:35:20 "펌웨어 행 확인" -> 11:35:35 복구.
+# 그 17분 동안 operstate=up · iw Connected · inet 존재가 모두 참이라 아래 판정은 전부
+# '정상'이었고, 최후 안전망(LAST_RESORT_DOWN)도 "계속 끊겨 있으면"이 조건이라 걸리지 않았다.
+# 링크 상태가 아니라 '프레임이 실제로 오가는가'를 봐야 이 구간을 덮는다.
+PROBE_TARGET=""             # 비우면 IFACE 서브넷의 .1 을 자동 사용
+PROBE_FAIL_THRESHOLD=4      # 연속 N회 실패해야 판정(POLL=7 -> 약 28초). 일시 혼잡과 구분
+PROBE_TIMEOUT=2             # 프로브 1회 대기(초)
+probe_enabled=1             # 자가점검에서 대상이 무응답이면 0 으로 꺼진다(무한 리셋 방지)
+
 # 로그는 journal 과 일반 파일 양쪽에 남긴다.
 # 파일에도 남기는 이유: journal 은 adm/systemd-journal 그룹이 아니면 못 읽어서
 # 상태 확인 때마다 sudo 가 필요하다. 파일은 누구나 읽을 수 있게 해 둔다.
@@ -94,6 +105,27 @@ link_is_up() {
 
 has_ip() {
     ip -4 addr show "$IFACE" 2>/dev/null | grep -q "inet "
+}
+
+# 프로브 대상 — 명시값이 없으면 IFACE 서브넷의 .1 (라우터/AP 관례).
+# 이 인터페이스에는 default 라우트가 없어서(default 는 유선으로 나간다) 게이트웨이를
+# 라우팅 테이블에서 얻을 수 없다. 그래서 서브넷 관례를 쓰고, 틀린 환경이면 아래
+# 자가점검이 프로브를 통째로 끈다.
+probe_target() {
+    if [ -n "$PROBE_TARGET" ]; then echo "$PROBE_TARGET"; return 0; fi
+    local cidr addr
+    cidr=$(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{print $4}' | head -1)
+    [ -n "$cidr" ] || return 1
+    addr=${cidr%/*}
+    echo "${addr%.*}.1"
+}
+
+# 링크가 붙어 있어도 프레임이 실제로 오가는가.
+# 이 호스트에 arping 이 없어 ICMP 로 본다 — 대상이 ICMP 를 막는 환경이면 자가점검이 걸러낸다.
+reachable() {
+    local t
+    t=$(probe_target) || return 0        # 대상을 정할 수 없으면 판정 보류(정상 취급)
+    ping -I "$IFACE" -c 1 -W "$PROBE_TIMEOUT" -n -q "$t" >/dev/null 2>&1
 }
 
 # 최근 FW_ERROR_WINDOW 초 안에 rtw88 펌웨어 오류가 찍혔는가?
@@ -179,6 +211,20 @@ fi
 command -v networkctl >/dev/null || log "!! networkctl 없음 — 복구 후 IP 할당 불가"
 find_usb_path >/dev/null      || log "!! USB 트리에 $VIDPID 없음 — 복구 대상 장치를 못 찾음"
 
+# 도달성 프로브 자가점검 — 대상이 원래 응답하지 않는 환경(ICMP 차단, .1 부재)이면
+# 프로브가 상시 실패해 멀쩡한 동글을 계속 리셋하게 된다. 그런 환경에서는 아예 끈다.
+# 링크가 아직 안 붙은 상태로 시작했으면 판정을 미루고 켜 둔다(붙은 뒤 정상 동작).
+_pt=$(probe_target 2>/dev/null || true)
+if [ -z "$_pt" ]; then
+    probe_enabled=0
+    log "!! 도달성 프로브 비활성 — 프로브 대상을 정할 수 없음(${IFACE} 주소 없음)"
+elif link_is_up && has_ip && ! reachable; then
+    probe_enabled=0
+    log "!! 도달성 프로브 비활성 — 시작 시점에 ${_pt} 무응답(ICMP 차단 등). 오탐 방지를 위해 끈다"
+else
+    log "도달성 프로브 활성 — 대상 ${_pt} / 연속 ${PROBE_FAIL_THRESHOLD}회 실패 시 무증상 행으로 판정"
+fi
+
 fails=0
 backoff=0
 recover_count=0
@@ -186,6 +232,7 @@ last_reset=0
 down_since=0
 ap_absent_logged=0
 reconf_tries=0
+probe_fails=0
 last_beat=$(date +%s)
 
 while true; do
@@ -197,7 +244,25 @@ while true; do
         last_beat=$now
     fi
 
+    # 링크·IP 가 정상이어도 실제 도달성이 없으면 '무증상 행'이다(상단 PROBE 주석 참고).
+    # 임계 미만이면 아직 정상으로 취급한다 — 일시 혼잡·로밍으로 한두 번 빠지는 것과 구분.
+    healthy=0
     if link_is_up && has_ip; then
+        if [ "$probe_enabled" -eq 0 ] || reachable; then
+            healthy=1
+            probe_fails=0
+        else
+            probe_fails=$(( probe_fails + 1 ))
+            if [ "$probe_fails" -eq 1 ]; then
+                log "도달성 프로브 실패 — $(probe_target) 무응답 (링크·IP 는 정상)"
+            fi
+            if [ "$probe_fails" -lt "$PROBE_FAIL_THRESHOLD" ]; then
+                healthy=1
+            fi
+        fi
+    fi
+
+    if [ "$healthy" -eq 1 ]; then
         if [ "$down_since" -ne 0 ]; then
             log "정상 복귀 — IP: $(ip -4 -br addr show "$IFACE" | awk '{print $3}')"
         fi
@@ -227,7 +292,7 @@ while true; do
         sleep 5
         if has_ip; then
             log "reconfigure 복구 성공 — IP: $(ip -4 -br addr show "$IFACE" | awk '{print $3}')"
-            fails=0; backoff=0; down_since=0; ap_absent_logged=0; reconf_tries=0
+            fails=0; backoff=0; down_since=0; ap_absent_logged=0; reconf_tries=0; probe_fails=0
         fi
         sleep "$POLL"
         continue
@@ -236,6 +301,10 @@ while true; do
     # 펌웨어 행인가, 아니면 그냥 AP가 없는 것인가?
     if firmware_wedged; then
         reason="펌웨어 행 확인 (커널 rtw_8822cu 오류 검출)"
+    elif [ "$probe_fails" -ge "$PROBE_FAIL_THRESHOLD" ]; then
+        # 커널 오류가 아직 안 찍혔지만 프레임이 오가지 않는 상태 — 실측상 이 구간이
+        # 17분까지 갔다. 펌웨어 오류를 기다리지 않고 여기서 끊는다.
+        reason="도달성 상실 — 링크·IP 정상인데 $(probe_target) 무응답 ${probe_fails}회 (무증상 행)"
     elif link_is_up && ! has_ip; then
         reason="association 정상·IP 미할당 — reconfigure ${RECONF_MAX_TRIES}회로 복구 안 됨"
     elif [ "$down_for" -ge "$LAST_RESORT_DOWN" ]; then
@@ -261,7 +330,7 @@ while true; do
     last_reset=$now
 
     if recover; then
-        fails=0; backoff=0; down_since=0; ap_absent_logged=0; reconf_tries=0
+        fails=0; backoff=0; down_since=0; ap_absent_logged=0; reconf_tries=0; probe_fails=0
     else
         backoff=$(( backoff == 0 ? 30 : backoff * 2 ))
         [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff=$BACKOFF_MAX
