@@ -72,6 +72,10 @@ probe_next_validate=0       # 다음 검증 시도 가능 시각(epoch)
 probe_target_seen=""        # 검증에 성공한 대상. 주소·서브넷이 바뀌면 재검증한다.
 probe_reset_armed=1         # 프로브 사유 USB 리셋 허용. 리셋했는데 도달성이 안 돌아오면 내려서
                             #   반복 리셋을 막고, 도달성이 회복되면 다시 올린다.
+                            #   내리는 시점은 '리셋을 실제로 실행할 때'다 — rate-limit 에 걸려
+                            #   실행되지 않은 판정으로 arm 을 소비하면 안 된다.
+probe_disarm_logged=0       # disarm 관망 로그는 1회만
+probe_reason=0              # 이번 틱의 리셋 사유가 프로브인가(arm 소비 대상 판별)
 
 # 로그는 journal 과 일반 파일 양쪽에 남긴다.
 # 파일에도 남기는 이유: journal 은 adm/systemd-journal 그룹이 아니면 못 읽어서
@@ -265,9 +269,11 @@ while true; do
                     if reachable; then _ok=1; break; fi
                     sleep 1
                 done
+                # 시도한 대상은 성공·실패 무관하게 기록한다. 보류(pending) 중에 주소가
+                # 바뀌어도 아래 재검증 감지가 걸리도록 하기 위해서다.
+                probe_target_seen="$_pt"
                 if [ "$_ok" -eq 1 ]; then
                     probe_ok=1
-                    probe_target_seen="$_pt"
                     log "도달성 프로브 활성 — 대상 ${_pt} / 연속 ${PROBE_FAIL_THRESHOLD}회 실패 시 무증상 행으로 판정"
                 else
                     probe_next_validate=$(( now + PROBE_REVALIDATE_AFTER ))
@@ -277,11 +283,12 @@ while true; do
         fi
 
         # 주소·서브넷이 바뀌면 옛 대상 기준으로 리셋하지 않도록 다시 검증한다.
-        if [ "$probe_ok" -eq 1 ]; then
+        if [ -n "$probe_target_seen" ]; then
             _pt=$(probe_target 2>/dev/null || true)
             if [ "$_pt" != "$probe_target_seen" ]; then
                 log "도달성 프로브 재검증 — 대상이 ${probe_target_seen} → ${_pt:-?} 로 바뀜"
-                probe_ok=0; probe_fails=0; probe_next_validate=0
+                # 보류 중이었더라도 남은 대기시간을 버리고 즉시 재검증한다.
+                probe_ok=0; probe_fails=0; probe_next_validate=0; probe_target_seen=""
             fi
         fi
 
@@ -289,6 +296,7 @@ while true; do
             healthy=1
             probe_fails=0
             probe_reset_armed=1          # 도달성 회복 → 프로브 사유 리셋을 다시 허용
+            probe_disarm_logged=0
         else
             probe_fails=$(( probe_fails + 1 ))
             if [ "$probe_fails" -eq 1 ]; then
@@ -296,6 +304,18 @@ while true; do
             fi
             if [ "$probe_fails" -lt "$PROBE_FAIL_THRESHOLD" ]; then
                 healthy=1
+            elif [ "$probe_reset_armed" -eq 0 ]; then
+                # 이미 프로브 사유로 리셋했는데 도달성이 안 돌아왔다. 동글이 아니라 대상
+                # 장비 쪽 문제일 가능성이 크다. 여기서 down 으로 흘리면 down_since 가 쌓여
+                # 30분 뒤 최후 안전망이 다시 리셋하고("회복까지 1회"가 실제로는 "30분마다"가
+                # 된다), 링크·IP 가 정상인데 'AP 부재' 로 오분류된 로그까지 남는다.
+                # 그래서 관망한다 — 진짜 펌웨어 행이면 커널 오류 경로가 잡고, 도달성이
+                # 돌아오면 위에서 재무장한다.
+                healthy=1
+                if [ "$probe_disarm_logged" -eq 0 ]; then
+                    probe_disarm_logged=1
+                    log "프로브 사유 리셋 1회 후에도 도달성 미회복 — 대상(${probe_target_seen}) 장애로 보고 관망(커널 오류가 나면 그 경로로 복구)"
+                fi
             else
                 # 프로브가 자체 임계를 채웠다. 공통 카운터에서 한 틱 더 기다리면 설정값과
                 # 실제 동작이 어긋나므로(4회 설정인데 5회째 진입) 여기서 맞춰 둔다.
@@ -345,6 +365,7 @@ while true; do
     fi
 
     # 펌웨어 행인가, 아니면 그냥 AP가 없는 것인가?
+    probe_reason=0
     if firmware_wedged; then
         reason="펌웨어 행 확인 (커널 rtw_8822cu 오류 검출)"
     elif [ "$probe_fails" -ge "$PROBE_FAIL_THRESHOLD" ] && link_is_up && has_ip \
@@ -354,9 +375,10 @@ while true; do
         # 링크·IP 를 여기서 다시 보는 이유: 그 사이 AP 가 사라졌다면 이건 무증상 행이 아니라
         # AP 부재이고, 그때 리셋하면 멀쩡한 동글을 두들기게 된다.
         reason="도달성 상실 — 링크·IP 정상인데 ${probe_target_seen} 무응답 ${probe_fails}회 (무증상 행)"
-        # 리셋해도 도달성이 안 돌아오면(대상 장비가 죽은 경우 등) 반복 리셋하지 않는다.
-        # 도달성 회복이 관측되면 위 healthy 분기에서 다시 무장한다.
-        probe_reset_armed=0
+        # arm 은 여기서 소비하지 않는다 — 아래 rate-limit(MIN_RESET_INTERVAL)에 걸려 리셋이
+        # 실행되지 않을 수 있고, 그때 arm 만 잃으면 도달성이 죽은 채로 프로브 복구 경로가
+        # 막힌다. 실제로 recover 를 부르는 지점에서 소비한다.
+        probe_reason=1
     elif link_is_up && ! has_ip; then
         reason="association 정상·IP 미할당 — reconfigure ${RECONF_MAX_TRIES}회로 복구 안 됨"
     elif [ "$down_for" -ge "$LAST_RESORT_DOWN" ]; then
@@ -380,9 +402,14 @@ while true; do
     recover_count=$(( recover_count + 1 ))
     log "복구 트리거 [#${recover_count}] — $reason (끊긴 지 ${down_for}초)"
     last_reset=$now
+    # rate-limit 을 통과해 실제로 리셋하는 지금 arm 을 소비한다.
+    [ "$probe_reason" -eq 1 ] && probe_reset_armed=0
 
     if recover; then
         fails=0; backoff=0; down_since=0; ap_absent_logged=0; reconf_tries=0; probe_fails=0
+        # 복구 직후에는 보류 대기시간을 버리고 즉시 재검증한다 — 보류에 빠진 원인이
+        # 이번 복구로 해소됐을 수 있는데 최대 300초를 더 기다릴 이유가 없다.
+        probe_next_validate=0
     else
         backoff=$(( backoff == 0 ? 30 : backoff * 2 ))
         [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff=$BACKOFF_MAX
