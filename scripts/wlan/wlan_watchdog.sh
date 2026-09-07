@@ -61,7 +61,13 @@ LAST_RESORT_DOWN=1800
 PROBE_TARGET=""             # 비우면 IFACE 서브넷의 .1 을 자동 사용
 PROBE_FAIL_THRESHOLD=4      # 연속 N회 실패해야 판정(POLL=7 -> 약 28초). 일시 혼잡과 구분
 PROBE_TIMEOUT=2             # 프로브 1회 대기(초)
-probe_enabled=1             # 자가점검에서 대상이 무응답이면 0 으로 꺼진다(무한 리셋 방지)
+PROBE_VALIDATE_TRIES=3      # 자가검증 재시도 — 1회라도 성공하면 활성.
+                            #   메인 루프가 4회 연속 실패를 요구하는데 검증만 1회로 끊으면
+                            #   연결 직후의 일시 손실 하나로 기능이 통째로 꺼진다.
+probe_enabled=1             # 자가검증에서 대상이 무응답이면 0 으로 꺼진다(무한 리셋 방지)
+probe_validated=0           # 자가검증은 '링크·IP 가 처음 정상이 된 시점'에 1회 수행한다.
+                            #   시작 시점에 하면 부팅 중 IP 미할당 상태를 '대상 없음'으로 읽어
+                            #   프로브가 데몬 수명 내내 꺼진 채로 남는다.
 
 # 로그는 journal 과 일반 파일 양쪽에 남긴다.
 # 파일에도 남기는 이유: journal 은 adm/systemd-journal 그룹이 아니면 못 읽어서
@@ -211,19 +217,11 @@ fi
 command -v networkctl >/dev/null || log "!! networkctl 없음 — 복구 후 IP 할당 불가"
 find_usb_path >/dev/null      || log "!! USB 트리에 $VIDPID 없음 — 복구 대상 장치를 못 찾음"
 
-# 도달성 프로브 자가점검 — 대상이 원래 응답하지 않는 환경(ICMP 차단, .1 부재)이면
-# 프로브가 상시 실패해 멀쩡한 동글을 계속 리셋하게 된다. 그런 환경에서는 아예 끈다.
-# 링크가 아직 안 붙은 상태로 시작했으면 판정을 미루고 켜 둔다(붙은 뒤 정상 동작).
-_pt=$(probe_target 2>/dev/null || true)
-if [ -z "$_pt" ]; then
-    probe_enabled=0
-    log "!! 도달성 프로브 비활성 — 프로브 대상을 정할 수 없음(${IFACE} 주소 없음)"
-elif link_is_up && has_ip && ! reachable; then
-    probe_enabled=0
-    log "!! 도달성 프로브 비활성 — 시작 시점에 ${_pt} 무응답(ICMP 차단 등). 오탐 방지를 위해 끈다"
-else
-    log "도달성 프로브 활성 — 대상 ${_pt} / 연속 ${PROBE_FAIL_THRESHOLD}회 실패 시 무증상 행으로 판정"
-fi
+# 도달성 프로브 자가검증은 여기서 하지 않는다 — 시작 시점에는 부팅 중이라 IP 가 아직 없을 수
+# 있고(유닛은 network.target 뒤에 올 뿐 IP 할당을 보장하지 않는다), 그 상태를 '대상 없음'으로
+# 읽으면 프로브가 데몬 수명 내내 꺼진 채로 남는다. 검증은 메인 루프에서 링크·IP 가 처음
+# 정상이 된 시점에, 재시도와 함께 1회 수행한다.
+log "도달성 프로브 — 링크·IP 가 처음 정상이 되는 시점에 대상 도달성을 확인한다(무응답이면 자동 비활성)"
 
 fails=0
 backoff=0
@@ -248,6 +246,31 @@ while true; do
     # 임계 미만이면 아직 정상으로 취급한다 — 일시 혼잡·로밍으로 한두 번 빠지는 것과 구분.
     healthy=0
     if link_is_up && has_ip; then
+        # 자가검증 1회 — 링크·IP 가 처음 정상이 된 지금 한다. 시작 시점에 하면 부팅 중
+        # IP 미할당을 '대상 없음'으로 읽어 프로브가 영영 꺼진다. 재시도를 주는 이유는
+        # 아래 판정이 4회 연속 실패를 요구하는데 검증만 1회로 끊으면 연결 직후의 일시
+        # 손실 하나로 기능이 통째로 꺼지기 때문이다(기준 불일치).
+        if [ "$probe_enabled" -eq 1 ] && [ "$probe_validated" -eq 0 ]; then
+            probe_validated=1
+            _pt=$(probe_target 2>/dev/null || true)
+            if [ -z "$_pt" ]; then
+                probe_enabled=0
+                log "!! 도달성 프로브 비활성 — 대상을 정할 수 없음(${IFACE} 주소 없음)"
+            else
+                _ok=0
+                for _i in $(seq 1 "$PROBE_VALIDATE_TRIES"); do
+                    if reachable; then _ok=1; break; fi
+                    sleep 1
+                done
+                if [ "$_ok" -eq 1 ]; then
+                    log "도달성 프로브 활성 — 대상 ${_pt} / 연속 ${PROBE_FAIL_THRESHOLD}회 실패 시 무증상 행으로 판정"
+                else
+                    probe_enabled=0
+                    log "!! 도달성 프로브 비활성 — ${_pt} 가 ${PROBE_VALIDATE_TRIES}회 모두 무응답(ICMP 차단 등). 오탐 방지를 위해 끈다"
+                fi
+            fi
+        fi
+
         if [ "$probe_enabled" -eq 0 ] || reachable; then
             healthy=1
             probe_fails=0
