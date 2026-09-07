@@ -19,6 +19,9 @@ session-summary/state/
 *.swp
 .DS_Store
 
+# 세션 핸드오프 스냅샷 (크래시·compact 대비 로컬 컨텍스트 — 정본이 아니다)
+HANDOFF.*.md
+
 # 도구 상태 잔재 (아카이브에 섞여 들어오면 안 됨)
 **/.omc/
 **/.bkit/
