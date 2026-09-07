@@ -10,6 +10,7 @@
 | [`session-summary/`](./session-summary/) | Claude 세션 요약 자동화 (Claude Code + opencode) | crontab (매일 09:00, 수요일 09:10 로테이트) |
 | [`email-briefing/`](./email-briefing/) | 이메일 브리핑 + 회의 준비 자료 | 수동 실행 |
 | [`mirror-sync/`](./mirror-sync/) | github → gitlab 큐레이션 미러 싱크 (4분류 + 어서션, push 제외) | 수동 실행 |
+| [`scripts/`](./scripts/) | 호스트 운영 유틸 (계정 리소스 제한, wlan0 워치독·진단) | 수동 · systemd 상주 |
 
 ## 크론 엔트리 (현재 등록)
 
