@@ -4,9 +4,11 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CLI_INIT_SCRIPT="${REPO_ROOT}/cli-init/claude-init.sh"
+CODEX_INIT_SCRIPT="${REPO_ROOT}/cli-init/codex-init.sh"
 SESSION_SUMMARY_SCRIPT="${REPO_ROOT}/session-summary/session-summary.sh"
 TEST_ROOT=$(mktemp -d /tmp/personal-ops-quota-aware.XXXXXX)
 STUB_CLAUDE="${TEST_ROOT}/claude-stub"
+STUB_CODEX="${TEST_ROOT}/codex-stub"
 FAILURES=0
 
 cleanup() {
@@ -86,6 +88,71 @@ fi
 EOF
 chmod +x "$STUB_CLAUDE"
 
+cat > "$STUB_CODEX" <<'EOF'
+#!/bin/bash
+set -u
+
+{
+    printf 'call'
+    printf '<%s>' "$@"
+    printf '\n'
+} >> "$CODEX_STUB_CALLS"
+
+has_model_flag=0
+for arg in "$@"; do
+    if [[ "$arg" == "-m" ]]; then
+        has_model_flag=1
+    fi
+done
+
+# codex exec 세션 출력을 모사한다 (배너·hook 로그·토큰 집계 포함).
+emit_session() {
+    printf '%s\n' \
+        '--------' \
+        'workdir: /home/jhw/ai/codex' \
+        'model: stub' \
+        'approval: never' \
+        'sandbox: read-only' \
+        '--------' \
+        'user' \
+        'Reply with OK only.' \
+        'hook: SessionStart' \
+        'hook: SessionStart Completed' \
+        'codex' \
+        'OK' \
+        'hook: Stop' \
+        'hook: Stop Completed' \
+        'tokens used' \
+        '9,143' \
+        'OK'
+}
+
+case "${CODEX_STUB_MODE:-success}" in
+    fail)
+        emit_session
+        printf '%s\n' 'stream error: stub failure' >&2
+        exit 1
+        ;;
+    fallback)
+        # 지정 모델만 실패하고 기본 모델은 성공한다
+        if (( has_model_flag == 1 )); then
+            emit_session
+            printf '%s\n' 'stream error: model unavailable' >&2
+            exit 1
+        fi
+        ;;
+    error-exit-zero)
+        # 실제 로그에 남은 전례: stdout 에 에러를 찍고도 exit=0
+        printf '%s\n' 'Not inside a trusted directory and --skip-git-repo-check was not specified.'
+        exit 0
+        ;;
+esac
+
+emit_session
+exit 0
+EOF
+chmod +x "$STUB_CODEX"
+
 new_case() {
     local case_dir
     case_dir=$(mktemp -d "${TEST_ROOT}/case.XXXXXX")
@@ -139,7 +206,28 @@ run_cli_init() {
         CLAUDE_INIT_MODULE_DIR="${runtime_case}/module" \
         CLAUDE_INIT_LOCK_FILE="${runtime_case}/tmp/claude-init.lock" \
         CLAUDE_INIT_TIMEOUT_SECONDS="$timeout_seconds" \
-        CLAUDE_INIT_TIMEOUT_KILL_AFTER_SECONDS="$kill_after_seconds"
+        CLAUDE_INIT_TIMEOUT_KILL_AFTER_SECONDS="$kill_after_seconds" \
+        CLAUDE_INIT_LOG_MAX_LINES="${TEST_CLI_INIT_LOG_MAX_LINES:-2000}"
+}
+
+run_codex_init() {
+    local case_dir=$1
+    local mode=${2:-success}
+    local max_lines=${3:-2000}
+    local runtime_case="/mnt/${case_dir##*/}"
+    local runtime_stub="/mnt/codex-stub"
+
+    sandbox_run "$case_dir" \
+        "$CODEX_INIT_SCRIPT" \
+        env \
+        CODEX_STUB_CALLS="${runtime_case}/codex-calls" \
+        CODEX_STUB_MODE="$mode" \
+        CODEX_BIN="$runtime_stub" \
+        CODEX_INIT_MODULE_DIR="${runtime_case}/module" \
+        CODEX_INIT_LOCK_FILE="${runtime_case}/tmp/codex-init.lock" \
+        CODEX_INIT_WORKDIR="${runtime_case}/module" \
+        CODEX_INIT_TIMEOUT_SECONDS=5 \
+        CODEX_INIT_LOG_MAX_LINES="$max_lines"
 }
 
 run_session_summary() {
@@ -364,6 +452,98 @@ test_cli_init_hard_kills_term_ignoring_process() {
         return 1
     fi
     assert_contains "${case_dir}/module/logs/claude-init.log" 'class=timeout'
+}
+
+test_cli_init_trims_log_to_max_lines() {
+    local case_dir log
+    case_dir=$(new_case)
+    log="${case_dir}/module/logs/claude-init.log"
+    seq 1 50 > "$log"
+
+    TEST_CLI_INIT_LOG_MAX_LINES=10 run_cli_init "$case_dir" success >/dev/null 2>&1 || return 1
+
+    assert_equals 10 "$(wc -l < "$log")" "trimmed claude-init log lines" || return 1
+    assert_contains "$log" 'Claude auth health check ok' || return 1
+    if [[ "$(head -n 1 "$log")" == "1" ]]; then
+        printf '  oldest claude-init log lines survived trimming\n' >&2
+        return 1
+    fi
+}
+
+test_cli_init_falls_back_to_default_trim_on_invalid_config() {
+    local case_dir log
+    case_dir=$(new_case)
+    log="${case_dir}/module/logs/claude-init.log"
+
+    TEST_CLI_INIT_LOG_MAX_LINES=abc run_cli_init "$case_dir" success >/dev/null 2>&1 || return 1
+
+    assert_contains "$log" 'invalid CLAUDE_INIT_LOG_MAX_LINES=abc' || return 1
+    assert_contains "$log" 'Claude auth health check ok'
+}
+
+test_codex_init_summarizes_successful_session() {
+    local case_dir log
+    case_dir=$(new_case)
+    log="${case_dir}/module/logs/codex-init.log"
+
+    run_codex_init "$case_dir" success >/dev/null 2>&1 || return 1
+
+    assert_contains "$log" 'codex exit=0 reply="OK"' || return 1
+    assert_not_contains "$log" 'hook: SessionStart' || return 1
+    assert_not_contains "$log" 'tokens used' || return 1
+    assert_equals 2 "$(wc -l < "$log")" "successful codex run log lines"
+}
+
+test_codex_init_records_reply_when_error_exits_zero() {
+    local case_dir log
+    case_dir=$(new_case)
+    log="${case_dir}/module/logs/codex-init.log"
+
+    run_codex_init "$case_dir" error-exit-zero >/dev/null 2>&1 || return 1
+
+    assert_contains "$log" 'Not inside a trusted directory' || return 1
+    assert_contains "$log" 'codex exit=0'
+}
+
+test_codex_init_keeps_full_output_when_run_fails() {
+    local case_dir log
+    case_dir=$(new_case)
+    log="${case_dir}/module/logs/codex-init.log"
+
+    run_codex_init "$case_dir" fail >/dev/null 2>&1 && return 1
+
+    assert_contains "$log" 'gpt-5.4-mini 실패' || return 1
+    assert_contains "$log" 'hook: SessionStart' || return 1
+    assert_contains "$log" 'stream error: stub failure'
+}
+
+test_codex_init_falls_back_to_default_model() {
+    local case_dir log calls
+    case_dir=$(new_case)
+    log="${case_dir}/module/logs/codex-init.log"
+    calls="${case_dir}/codex-calls"
+
+    run_codex_init "$case_dir" fallback >/dev/null 2>&1 || return 1
+
+    assert_equals 2 "$(call_count "$calls")" "codex invocations" || return 1
+    assert_contains "$log" 'gpt-5.4-mini 실패' || return 1
+    assert_contains "$log" 'codex exit=0 reply="OK"'
+}
+
+test_codex_init_trims_log_to_max_lines() {
+    local case_dir log
+    case_dir=$(new_case)
+    log="${case_dir}/module/logs/codex-init.log"
+    seq 1 50 > "$log"
+
+    run_codex_init "$case_dir" success 10 >/dev/null 2>&1 || return 1
+
+    assert_equals 10 "$(wc -l < "$log")" "trimmed codex-init log lines" || return 1
+    assert_contains "$log" 'codex exit=0' || return 1
+    if [[ "$(head -n 1 "$log")" == "1" ]]; then
+        printf '  oldest codex-init log lines survived trimming\n' >&2
+        return 1
+    fi
 }
 
 test_summary_uses_one_bounded_low_effort_call() {
@@ -766,6 +946,13 @@ run_test test_cli_init_uses_non_generative_auth_status
 run_test test_cli_init_serializes_overlapping_runs
 run_test test_cli_init_classifies_timeout_without_generation
 run_test test_cli_init_hard_kills_term_ignoring_process
+run_test test_cli_init_trims_log_to_max_lines
+run_test test_cli_init_falls_back_to_default_trim_on_invalid_config
+run_test test_codex_init_summarizes_successful_session
+run_test test_codex_init_records_reply_when_error_exits_zero
+run_test test_codex_init_keeps_full_output_when_run_fails
+run_test test_codex_init_falls_back_to_default_model
+run_test test_codex_init_trims_log_to_max_lines
 run_test test_summary_uses_one_bounded_low_effort_call
 run_test test_summary_serializes_overlapping_runs
 run_test test_summary_quota_creates_six_hour_backoff
