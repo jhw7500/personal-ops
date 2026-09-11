@@ -14,9 +14,10 @@ rm -f "$UNIT_DIR/claude-token-sync.service" \
       "$UNIT_DIR/claude-token-sync-health.timer" \
       "$BIN_DIR/claude-token-sync.sh" \
       "$BIN_DIR/claude-token-sync-health.sh" \
+      "$BIN_DIR/claude-token-sync-set-token.sh" \
       "$CRED_DIR/.token_sync_repos"
 
 systemctl --user daemon-reload
 
 echo "[uninstall] 심링크·유닛 제거 완료."
-echo "[uninstall] 보존: $CRED_DIR/token_sync.log, $CRED_DIR/.token_sync_health.sha, $CRED_DIR/.credentials.json"
+echo "[uninstall] 보존: $CRED_DIR/token_sync.log, $CRED_DIR/.token_sync_health.sha, $CRED_DIR/.ci-oauth-token.json, $CRED_DIR/.credentials.json"

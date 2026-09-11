@@ -1,82 +1,85 @@
 # claude-token-sync
 
-Claude OAuth accessToken을 GitHub 레포 시크릿(`CLAUDE_CODE_OAUTH_TOKEN`)에 자동 동기화하는 systemd 모듈.
+CI 전용 장기 OAuth 토큰을 GitHub 저장소 Secret `CLAUDE_CODE_OAUTH_TOKEN`에 동기화한다.
+원본은 `~/.claude/.ci-oauth-token.json` 하나이며, Claude Code의 대화용
+`~/.claude/.credentials.json`은 읽거나 수정하지 않는다.
 
-Claude Code가 토큰을 갱신(만료 ~4.5분 전 자동)하면, 그 새 토큰을 등록된 GitHub 레포들에
-일괄로 밀어넣어 GitHub Actions가 항상 유효한 토큰을 쓰도록 유지한다.
+`claude setup-token`은 Claude 구독용 CI 토큰을 발급하며 기본 유효기간은 1년이다.
+브라우저 인증이 필요하고 토큰은 터미널에 한 번 표시된다.
+[공식 문서](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)
 
-## 구성
+## 발급 및 전환
 
-| 경로 | 역할 |
-|---|---|
-| `bin/claude-token-sync.sh` | **데몬**. `~/.claude/.credentials.json`을 30초 주기로 폴링하고 토큰 변경 시 최신 repo 목록을 다시 읽어 동기화 |
-| `bin/claude-token-sync-health.sh` | **헬스체크 백스톱**. 10분 주기로 ①데몬 생존 확인 ②토큰 또는 repo 목록이 마지막 성공 상태와 다르면 강제 동기화 |
-| `bin/claude-token-sync-common.sh` | 공용 `flock`, repo 검증, GitHub secret 갱신, 성공 marker 기록을 daemon/health가 공유 |
-| `systemd/claude-token-sync.service` | 데몬 user 서비스 (`Restart=on-failure`) |
-| `systemd/claude-token-sync-health.service` | 헬스체크 oneshot 서비스 |
-| `systemd/claude-token-sync-health.timer` | 헬스체크 10분 타이머 |
-| `config/repos.txt` | **대상 레포 단일 소스**. 데몬·헬스체크가 함께 읽음 |
-| `install.sh` / `uninstall.sh` | 심링크 기반 설치/제거 |
-
-### 설치 후 심링크 (정본 → 사용자 환경)
-```
-~/.local/bin/claude-token-sync.sh         -> bin/claude-token-sync.sh
-~/.local/bin/claude-token-sync-health.sh  -> bin/claude-token-sync-health.sh
-~/.claude/.token_sync_repos               -> config/repos.txt
-~/.config/systemd/user/claude-token-sync.service        -> systemd/...
-~/.config/systemd/user/claude-token-sync-health.service -> systemd/...
-~/.config/systemd/user/claude-token-sync-health.timer   -> systemd/...
-```
-
-### 런타임 파일 (git 비추적, `~/.claude/`)
-- `token_sync.log` — 동기화 로그
-- `.token_sync_health.sha` — 마지막으로 전부 성공한 토큰+repo 목록 상태의 sha256 마커
-- `.token_sync.lock` — daemon과 health의 동기화를 직렬화하는 공용 lock
-- `.credentials.json` — Claude 토큰 원본 (Claude Code 관리)
-
-## 설치 / 제거
+1. 사용자 터미널에서 `claude setup-token`을 실행하고 브라우저 인증을 완료한다.
+2. 출력된 유효기간보다 이른 로컬 교체 기한을 정한다. 기본 1년 토큰은 발급 시각에서
+   364일 뒤를 사용하면 하루의 여유가 있다. 실제 출력이 더 짧다면 그에 맞춰 앞당긴다.
+3. 토큰은 명령 인자/셸 기록에 넣지 않고 숨김 입력으로 가져온다.
 
 ```bash
-./install.sh      # 심링크 + daemon-reload + enable --now + 데몬 재시작
-./uninstall.sh    # 심링크/유닛 제거 (런타임·credentials 보존)
+read -rsp 'CI token: ' ci_token; echo
+printf '%s' "$ci_token" | ./bin/claude-token-sync-set-token.sh \
+  --expires-at "$(date -u -d '+364 days' +%FT%TZ)"
+unset ci_token
+./install.sh
 ```
 
-## 대상 레포 추가/삭제
+`set-token`은 stdin을 검증하고 공용 lock 안에서 mode `0600` 파일로 원자 교체한다.
+만료되었거나 잘못된 입력은 기존 파일을 보존한다. 토큰은 출력하지 않는다.
+`install.sh`는 CI 파일을 먼저 검증하므로 발급 전에 실행해도 기존 설치를 바꾸지 않는다.
 
-`config/repos.txt` 한 곳만 편집하면 데몬·헬스체크 모두 반영된다 (한 줄에 레포 하나, `#` 주석 가능).
-데몬은 다음 토큰 변경 시 최신 목록을 다시 읽고, 토큰이 그대로여도 헬스체크가
-목록 상태 변화를 감지해 다음 주기(최대 10분)에 동기화한다. 파일이 없거나 비었거나
-잘못된 repo 이름이 있으면 오래된 내장 목록으로 진행하지 않고 실패한다.
-즉시 반영하려면 `systemctl --user restart claude-token-sync` 또는 health 스크립트를
-수동 실행한다. daemon은 시작할 때도 현재 token+repo 상태를 marker와 대조한다.
+전환 후 CI 파일이 없어지거나 잘못되어도 대화용 단기 토큰으로 돌아가지 않는다.
+새로 발급한 토큰도 같은 명령으로 교체하면 다음 10분 타이머 주기에 배포된다.
+즉시 배포하려면 `~/.local/bin/claude-token-sync-health.sh`를 실행한다.
+`setup-token` 결과의 실제 수명이나 폐기 여부를 로컬 검사로 확인할 수는 없다.
+JSON의 `expiresAt`은 운영자가 정한 보수적인 교체 기한이다.
 
-## 운영
+## 동작
+
+- 상시 데몬은 기본 비활성이다. 설치·재설치 시에도 중지하고 자동 시작을 해제한다.
+- 10분 타이머가 헬스체크를 한 번씩 실행해 CI 토큰과 저장소 목록을 확인한다.
+  헬스체크는 데몬을 다시 켜지 않는다. 설치 직후에도 한 번 실행한다.
+- 마지막 전체 성공 상태와 같으면 GitHub API를 호출하지 않는다.
+- 일부 저장소 갱신이 실패하면 성공 marker를 갱신하지 않고 다음 주기에 재시도한다.
+- 파일 누락, 파싱 오류, 잘못된 형식, 다른 소유자, symlink, `0600` 이외 권한,
+  교체 기한 경과는 실패다. 헬스체크도 non-zero로 종료한다.
+- 헬스체크는 교체 기한 14일 전부터 `token_sync.log`에 경고한다.
+  자동 재발급은 하지 않으며 브라우저 인증으로 새 토큰을 발급해야 한다.
+- OAuth 원문 대신 SHA-256 기반 12자 `token_id`만 로그에 기록한다.
+
+```text
+claude setup-token
+    |
+~/.claude/.ci-oauth-token.json
+    |
+10-minute timer -> claude-token-sync-health.sh
+    +-- repository secret A
+    +-- repository secret B
+    +-- repository secret ...
+```
+
+## 구성 및 런타임
+
+`bin/claude-token-sync-common.sh`가 원본 검증, 공용 lock, GitHub 배포, 성공 marker를
+공유한다. `config/repos.txt`는 `jhw7500/*` 대상 저장소의 단일 소스다.
+목록 변경도 다음 타이머 주기 또는 수동 헬스체크에서 반영된다. 파일이 없거나 비어 있거나
+잘못된 이름이 있으면 실패한다.
+
+사용자 환경의 스크립트와 systemd 유닛은 모듈 정본에 대한 symlink로 설치된다.
+런타임 파일은 `~/.claude/`에 있고 Git에 포함하지 않는다.
+
+- `.ci-oauth-token.json`: CI 전용 원본 (`source`, `accessToken`, `expiresAt`)
+- `.token_sync_repos`: `config/repos.txt` symlink
+- `.token_sync_health.sha`: 마지막 전체 성공 상태의 token+repos hash
+- `.token_sync.lock`: importer/daemon/health 공유 lock
+- `token_sync.log`: 성공·실패·교체 기한 경고
 
 ```bash
-systemctl --user status claude-token-sync                 # 데몬 상태
-systemctl --user list-timers claude-token-sync-health.timer  # 다음 헬스체크 시각
-tail -f ~/.claude/token_sync.log                          # 로그
-~/.local/bin/claude-token-sync-health.sh                  # 헬스체크 수동 1회
+systemctl --user is-active claude-token-sync.service  # inactive
+systemctl --user list-timers claude-token-sync-health.timer
+~/.local/bin/claude-token-sync-health.sh
+bash tests/test-token-sync.sh
+./uninstall.sh
 ```
 
-## 인증
-
-`gh` CLI의 `hosts.yml` 토큰(`repo`, `workflow` scope)을 사용한다 (`GITHUB_TOKEN` 환경변수는 unset).
-`gh auth status`로 scope 확인 가능.
-
-## 이중화 설계 메모
-
-- **데몬(token 폴링 30초)** = 빠른 경로. credentials JSON의 access token을 30초마다
-  읽고 이전 값과 비교해 변경 시 동기화. 초기 설계는 `inotifywait`였으나 Claude Code의
-  credentials 갱신이 inotify 이벤트로 안정적으로 도착하지 않음을 측정(2026-05:
-  `--include` 필터 + `create/close_write/moved_to/modify` 다 걸어도 0건 캡처,
-  그러나 주기적 파일 읽기는 변경을 포착). 그래서 단순 폴링으로 전환.
-- **헬스체크(타이머 10분)** = 프로세스 생존 + 토큰 sha 비교 백스톱. 데몬이 죽거나
-  sync에 부분 실패한 경우를 잡는다. marker에는 repo 목록도 포함되므로 대상 추가·삭제도
-  감지한다. 부분 실패 시 non-zero로 종료하고 marker를 갱신하지 않아 다음 타이머에서
-  재시도한다. daemon과 health는 공용 `flock`을 획득한 뒤 token과 repo 목록을 다시
-  읽으므로 서로 다른 상태를 동시에 쓰지 않는다. (systemd `WatchdogSec`는 프로세스가 살아 ping을 보내면 이 케이스를 못
-  잡으므로 타이머 방식 채택.)
-
-로그에는 OAuth token 원문이나 prefix를 기록하지 않고 SHA-256 기반 12자 `token_id`만
-남긴다.
+제거 시 유닛과 symlink만 정리하고 CI 토큰, CLI 로그인, 로그와 marker는 보존한다.
+GitHub 인증에는 `gh`의 로그인 토큰을 사용한다 (`GITHUB_TOKEN`은 unset).

@@ -1,5 +1,33 @@
 #!/bin/bash
 
+# Never fall back to Claude Code's interactive login credentials.
+load_ci_token() {
+    local record
+    if [ ! -f "$CRED_FILE" ] || [ -L "$CRED_FILE" ] ||
+       [ "$(stat -c '%u:%a' "$CRED_FILE" 2>/dev/null)" != "$(id -u):600" ]; then
+        log "[ERROR] CI token source must be a current-user-owned regular file with mode 0600: $CRED_FILE"
+        return 1
+    fi
+    record=$(jq -ers '
+        select(length == 1) | .[0] |
+        select(.source == "claude-setup-token") |
+        select(.accessToken | type == "string") |
+        select(.accessToken | test("^sk-ant-oat01-[A-Za-z0-9_-]{20,}\\z")) |
+        select(.expiresAt | type == "number") |
+        select(.expiresAt > 0 and .expiresAt < 9007199254740991 and
+               (.expiresAt | floor) == .expiresAt) |
+        [.accessToken, .expiresAt] | @tsv
+    ' "$CRED_FILE" 2>/dev/null) || {
+        log "[ERROR] CI token source is invalid: $CRED_FILE"
+        return 1
+    }
+    IFS=$'\t' read -r CURRENT_TOKEN CURRENT_EXPIRES <<< "$record"
+    if [ "$CURRENT_EXPIRES" -le "$(($(date +%s) * 1000))" ]; then
+        log "[ERROR] CI token has reached its renewal deadline; run claude setup-token and import a replacement"
+        return 1
+    fi
+}
+
 load_repos() {
     if [ ! -f "$REPO_FILE" ]; then
         log "[ERROR] repository config missing: $REPO_FILE"
@@ -72,7 +100,7 @@ sync_loaded_repos() {
 sync_current_state() {
     local label="$1"
     local skip_if_current="${2:-false}"
-    local lock_fd token current_sha previous_sha expires expires_date rc
+    local lock_fd token current_sha previous_sha expires_date rc
 
     umask 077
     if ! exec {lock_fd}> "$LOCK_FILE"; then
@@ -85,14 +113,16 @@ sync_current_state() {
         return 1
     fi
 
-    # Credentials and repository configuration must be read only after taking
-    # the lock; otherwise a waiting process could apply stale state.
-    token=$(jq -r '.claudeAiOauth.accessToken // empty' "$CRED_FILE" 2>/dev/null) || token=""
-    if [ -z "$token" ]; then
-        log "[$label] accessToken unavailable"
+    # Validate before comparing markers: an unchanged token can have expired.
+    if ! load_ci_token; then
         flock -u "$lock_fd"
         exec {lock_fd}>&-
         return 1
+    fi
+    token="$CURRENT_TOKEN"
+    if [ "$label" = HEALTH-SYNC ] &&
+       [ "$CURRENT_EXPIRES" -le "$((($(date +%s) + 14 * 86400) * 1000))" ]; then
+        log "[WARN] CI token renewal deadline is within 14 days; issue and import a replacement"
     fi
     if ! load_repos; then
         flock -u "$lock_fd"
@@ -110,9 +140,8 @@ sync_current_state() {
         return 0
     fi
 
-    expires=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CRED_FILE" 2>/dev/null)
-    expires_date=$(date -d @$((expires / 1000)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
-    log "[$label] sync state changed token_id=$(token_id "$token") expires=${expires_date}"
+    expires_date=$(date -d @$((CURRENT_EXPIRES / 1000)) '+%Y-%m-%d %H:%M:%S')
+    log "[$label] source=ci sync state changed token_id=$(token_id "$token") renew_by=${expires_date}"
 
     if sync_loaded_repos "$token" "$label"; then
         # shellcheck disable=SC2034 # output variable consumed by sourcing caller
