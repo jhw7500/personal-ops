@@ -269,6 +269,37 @@ else
     pass 'multiline token import is rejected'
 fi
 
+# Installation must keep the sourced helper non-executable while enabling entrypoints.
+IFS='|' read -r HOME_INSTALL BIN_INSTALL < <(make_home install-mode)
+INSTALL_MODULE="$TMP_ROOT/install-mode/module"
+mkdir -p "$INSTALL_MODULE"
+cp -R "$MODULE_DIR"/. "$INSTALL_MODULE"/
+chmod 644 "$INSTALL_MODULE"/bin/*.sh
+write_credentials "$HOME_INSTALL" 'sk-ant-oat01-TEST_INSTALL_abcdefghijklmnopqrstuvwxyz'
+cat > "$BIN_INSTALL/systemctl" <<'SH'
+#!/bin/bash
+if [ "${1:-}" = --user ]; then
+    shift
+fi
+if [ "${1:-}" = is-active ]; then
+    if [ "${2:-}" = claude-token-sync-health.timer ]; then
+        printf 'active\n'
+    else
+        printf 'inactive\n'
+    fi
+fi
+SH
+chmod +x "$BIN_INSTALL/systemctl"
+if HOME="$HOME_INSTALL" PATH="$BIN_INSTALL:$PATH" bash "$INSTALL_MODULE/install.sh" >/dev/null 2>&1 &&
+    [ "$(stat -c %a "$INSTALL_MODULE/bin/claude-token-sync-common.sh")" = 644 ] &&
+    [ "$(stat -c %a "$INSTALL_MODULE/bin/claude-token-sync.sh")" = 755 ] &&
+    [ "$(stat -c %a "$INSTALL_MODULE/bin/claude-token-sync-health.sh")" = 755 ] &&
+    [ "$(stat -c %a "$INSTALL_MODULE/bin/claude-token-sync-set-token.sh")" = 755 ]; then
+    pass 'installation preserves helper mode and enables entrypoint modes'
+else
+    fail 'installation preserves helper mode and enables entrypoint modes'
+fi
+
 IFS='|' read -r HOME_H BIN_H < <(make_home install-preflight)
 mkdir -p "$HOME_H/.local/bin"
 printf '%s\n' existing-installation > "$HOME_H/.local/bin/claude-token-sync.sh"

@@ -21,7 +21,9 @@ load_ci_token
 mkdir -p "$BIN_DIR" "$UNIT_DIR" "$CRED_DIR"
 
 # 1) 실행 스크립트 심링크
-chmod +x "$MODULE_DIR"/bin/*.sh
+chmod +x "$MODULE_DIR"/bin/claude-token-sync.sh \
+    "$MODULE_DIR"/bin/claude-token-sync-health.sh \
+    "$MODULE_DIR"/bin/claude-token-sync-set-token.sh
 ln -sf "$MODULE_DIR/bin/claude-token-sync.sh"        "$BIN_DIR/claude-token-sync.sh"
 ln -sf "$MODULE_DIR/bin/claude-token-sync-health.sh" "$BIN_DIR/claude-token-sync-health.sh"
 ln -sf "$MODULE_DIR/bin/claude-token-sync-set-token.sh" "$BIN_DIR/claude-token-sync-set-token.sh"
