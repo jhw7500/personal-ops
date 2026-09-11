@@ -22,3 +22,4 @@ cts-ta-mcp-server
 cts-ta-webapp
 claude-config
 imx-vpu
+tossApp
