@@ -23,6 +23,9 @@ imx-vpu	https://github.com/jhw7500/imx-vpu.git	http://192.168.10.2:31406/hwjo/im
 sc16is7xx	https://github.com/jhw7500/sc16is7xx.git	http://192.168.10.2:31406/hwjo/sc16is7xx	/home/jhw/ai/opencode/projects/sc16is7xx	/home/jhw/ai/opencode/projects/sc16is7xx-gitlab	master	main
 
 # ── pim-summit-backports — 한때 '부적합' 이었고 이슈 #41 로 해소됐다 ──────────
+# 아래 해소 경위는 2026-09-05 기록이다. 2026-09-12 빌드 변경 반영 후에는
+# .gitignore / make-for-imx8 도 일반 복사하고 UPSTREAM_ONLY / FORBID 를 비운다.
+# 현재 규칙과 남는 검사는 curation/pim-summit-backports.conf 를 따른다.
 # 왜 한때 부적합이었는지는 이 쌍을 이해하는 데 필요한 정보라 지우지 않고 남긴다.
 #
 # 2026-09-05 실측 결과 큐레이션 축 자체는 실재했다(내용이 다른 공통 파일 3개 ·
@@ -64,5 +67,5 @@ sc16is7xx	https://github.com/jhw7500/sc16is7xx.git	http://192.168.10.2:31406/hwj
 # FORBID 는 위 정정대로 ".cache/" 한 줄을 쓴다(KEEP_MIRROR 의 .gitignore 앵커).
 # 자세한 근거와 알려진 공백은 conf 주석에 있다.
 #
-# 미러 기본 브랜치는 main 이 아니라 develop 이다 (develop == main == badf083).
+# 미러 기본 브랜치는 main 이 아니라 develop 이다 (2026-09-05 당시 둘 다 badf083).
 pim-summit-backports	https://github.com/jhw7500/pim-summit-backports.git	http://192.168.10.2:31406/hwjo/pim-summit-backports	/home/jhw/ai/opencode/projects/pim-summit-backports	/home/jhw/ai/opencode/projects/pim-summit-backports-gitlab	master	develop

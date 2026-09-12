@@ -1466,10 +1466,16 @@ smoke_real_pair() {
 
 # base / from / to / 기대 복사줄 / 기대 보존·미반입·미삭제 줄 / 유출 검사 ERE
 # from·to 는 저장소가 전진해도 결과가 변하지 않도록 sha 로 못박는다(2026-09-05 실측).
-smoke_real_pair max9296 3f5915f 4fa9881 \
-    "합계: 복사 58 (쓰기 58 / 삭제 0)" \
-    "보존 6 · 미반입 278 · 미삭제 1" \
-    'artifacts/|docs/superpowers/|\.github/'
+# GitHub workflow 전용 테스트 제외 패턴이 생긴 현재 트리까지 검사한다.
+smoke_real_pair max9296 3f5915f fbd85f8 \
+    "합계: 복사 65 (쓰기 65 / 삭제 0)" \
+    "보존 8 · 미반입 279 · 미삭제 1" \
+    'artifacts/|docs/superpowers/|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
+
+smoke_real_pair max9296 4fa9881 fbd85f8 \
+    "합계: 복사 14 (쓰기 14 / 삭제 0)" \
+    "보존 4 · 미반입 17 · 미삭제 1" \
+    '\.gitignore|README\.md|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
 
 smoke_real_pair gstApp 46fd6fa 77a2635 \
     "합계: 복사 84 (쓰기 75 / 삭제 0 / 삭제생략 9)" \
@@ -1486,24 +1492,26 @@ smoke_real_pair sc16is7xx 9f71cb9 093e069 \
     "보존 3 · 미반입 14 · 미삭제 1" \
     '\.clangd|\.github/|sc16is7xx-ext-ko-provenance'
 
-# 다섯 번째 쌍 (이슈 #41). 앞의 네 쌍과 두 가지가 다르다.
+# .env / Kbuild 재진입 가드 반영 구간. 두 빌드 파일은 계속 수동 이식 대상이며,
+# 회사 패키지 기준 문서는 미러 전용으로 보존한다.
+smoke_real_pair sc16is7xx 093e069 0b96d5e \
+    "합계: 복사 3 (쓰기 3 / 삭제 0)" \
+    "보존 2 · 미반입 11 · 미삭제 1" \
+    '\.gitignore|make-for-imx8|\.github/|docs/'
+
+# 다섯 번째 쌍 (이슈 #41, 2026-09-12 동기화 기준).
 #   ① **미러 브랜치가 develop 이다** (main 이 아니다). pairs.tsv 7번 컬럼을 쓴다.
-#   ② UPSTREAM_ONLY 를 AXES_INTENTIONALLY_EMPTY 로 비운 conf 다. 그래서
-#      `.clangd` 1건이 '신규 반입' 으로 나오는 것이 **정상이자 설계 의도**다 —
-#      앞의 네 쌍처럼 "신규 반입 없음" 을 요구하면 이 쌍은 구조적으로 통과할 수 없다.
-#      FORBID 는 비어 있지 않다(".cache/" 한 줄로 KEEP_MIRROR 의 .gitignore 를 앵커한다).
-# 유출 검사(6번째 인자)의 오라클도 다르다. UPSTREAM_ONLY 가 비어 있으므로 대신
-# **KEEP_MIRROR 3개**를 본다 — 이 쌍에서 축 오타가 나면 정확히 그 세 파일이 '복사'
-# 로 흘러 미러 판(= 사람이 이식해야 할 차이)을 조용히 덮어쓴다.
-# 9번째 이후 인자로 빈 축 경고가 **배포 conf 실행에서도** 실제로 찍히는지 못박는다.
-smoke_real_pair pim-summit-backports 280e882 28997d8 \
-    "합계: 복사 2 (쓰기 2 / 삭제 0)" \
-    "보존 3 · 미반입 0 · 미삭제 2" \
-    '\.gitignore|README\.md|make-for-imx8' \
-    "신규 반입 — 미러에 없던 파일 1개" \
-    ".clangd" \
-    "[주의] 의도적으로 비운 축 1개 (conf 의 AXES_INTENTIONALLY_EMPTY):" \
-    "UPSTREAM_ONLY — 반입 금지 목록이 없다. upstream 전용 파일이 전부 복사 대상이 된다."
+#   ② clangd 와 .env 배선을 반영해 .gitignore / make-for-imx8 은 일반 복사다.
+#      README 만 보존하며, 기존 .clangd 와 .env.example 은 신규 반입이 아니다.
+#   ③ UPSTREAM_ONLY / FORBID 두 축을 의도적으로 비운 상태의 경고를 모두 확인한다.
+smoke_real_pair pim-summit-backports 280e882 39fb8df \
+    "합계: 복사 5 (쓰기 5 / 삭제 0)" \
+    "보존 1 · 미반입 0 · 미삭제 2" \
+    'README\.md' \
+    "" "" \
+    "[주의] 의도적으로 비운 축 2개 (conf 의 AXES_INTENTIONALLY_EMPTY):" \
+    "UPSTREAM_ONLY — 반입 금지 목록이 없다. upstream 전용 파일이 전부 복사 대상이 된다." \
+    "FORBID — 금지 문자열이 없다. ASSERT_B 는 아무것도 검사하지 않는다."
 
 # ══════════════════════════════════════════════════════════════════════════
 printf '\n=== 집계 ===\n'
