@@ -491,6 +491,18 @@ git -C /home/jhw/ai/opencode/projects/max9296-gitlab push        # 사람이 직
    않는지** 확인한다. 어느 쪽이 틀려도 조용히 실패한다.
 5. dry-run 을 먼저 돌려 4분류를 눈으로 확인한 뒤에만 `--apply` 로 넘어간다.
 
+## sc16is7xx 빌드 변경 반영 (2026-09-12)
+
+upstream `093e069..0b96d5e`에서 `.env.example`, `Makefile`, `README.md`를 반영하고,
+`.gitignore`와 `make-for-imx8`에는 `.env` 빌드 설정만 수동 이식한다. 개발도구 제외 정책과
+기존 드라이버 소스, 미러 문서 두 개는 유지한다. 이 구간은 복사 3, 보존 2, 미반입 11,
+미삭제 1이며, 이미 반입한 `.env.example`은 신규 파일로 세지 않는다.
+
+`docs/pim-package-binary.md`의 회사 패키지는 `9f71cb9` 소스 기준으로, 현재 `main`과 다르다.
+빌드 설정 동기화와 SDK 빌드 검증만으로 패키지 바이너리나 문서의 기준값을 갱신하지 않는다.
+동일 커널 재빌드와 타깃 검증을 거쳐 패키지에 반영해야 한다. 이 소스 기준값과 검증 요건도
+파일에 묶은 `MUST_SURVIVE` 검사로 보호한다. 80 MHz 조사 문서의 RTS/CTS 시험은 미완이다.
+
 ## pim-summit-backports 현재 규칙 (2026-09-12)
 
 upstream `39fb8df`의 빌드 변경을 미러 `develop`에 반영한다. `.clangd`, `.env.example`,

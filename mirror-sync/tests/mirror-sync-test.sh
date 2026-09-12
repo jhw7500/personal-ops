@@ -1486,6 +1486,13 @@ smoke_real_pair sc16is7xx 9f71cb9 093e069 \
     "보존 3 · 미반입 14 · 미삭제 1" \
     '\.clangd|\.github/|sc16is7xx-ext-ko-provenance'
 
+# .env / Kbuild 재진입 가드 반영 구간. 두 빌드 파일은 계속 수동 이식 대상이며,
+# 회사 패키지 기준 문서는 미러 전용으로 보존한다.
+smoke_real_pair sc16is7xx 093e069 0b96d5e \
+    "합계: 복사 3 (쓰기 3 / 삭제 0)" \
+    "보존 2 · 미반입 11 · 미삭제 1" \
+    '\.gitignore|make-for-imx8|\.github/|docs/'
+
 # 다섯 번째 쌍 (이슈 #41, 2026-09-12 동기화 기준).
 #   ① **미러 브랜치가 develop 이다** (main 이 아니다). pairs.tsv 7번 컬럼을 쓴다.
 #   ② clangd 와 .env 배선을 반영해 .gitignore / make-for-imx8 은 일반 복사다.
