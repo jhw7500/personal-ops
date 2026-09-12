@@ -67,8 +67,9 @@ FORBID=()
 AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY FORBID )
 ```
 
-위는 **문법 예시**이고 어느 conf 의 실제 값도 아니다(현재 표식을 쓰는 conf 는
-`pim-summit-backports` 한 장이며 비운 축은 `UPSTREAM_ONLY` 하나다).
+현재 이 표식을 쓰는 conf 는 `pim-summit-backports` 한 장이다. 2026-09-12 빌드 변경을
+반영하면서 위 예시처럼 `UPSTREAM_ONLY`와 `FORBID` 두 축을 비웠다. 이유와 남는 검사는
+아래 [현재 규칙](#pim-summit-backports-현재-규칙-2026-09-12)에 적었다.
 `declare` 를 붙이면 안 된다 — conf 는 함수 안에서 source 되므로 지역 변수가 된다(아래 표).
 
 ### 왜 그냥 허용하지 않고 표식을 요구하나
@@ -141,14 +142,15 @@ AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY FORBID )
 
 스크립트는 표식이 있는 축이 무엇을 무력화하는지 dry-run·`--apply` **양쪽**에서 찍는다(죽은 패턴
 경고와 같은 자리·같은 톤). 표식이 없는 conf 는 이 블록을 아예 출력하지 않는다.
-아래는 `pim-summit-backports` 실행 출력 그대로다.
+아래는 현재 `pim-summit-backports`의 빈 축 경고다.
 
 ```
-  [주의] 의도적으로 비운 축 1개 (conf 의 AXES_INTENTIONALLY_EMPTY):
+  [주의] 의도적으로 비운 축 2개 (conf 의 AXES_INTENTIONALLY_EMPTY):
          UPSTREAM_ONLY — 반입 금지 목록이 없다. upstream 전용 파일이 전부 복사 대상이 된다.
                          ASSERT_A 는 패턴이 0개라 아무것도 검사하지 않는다(항상 통과).
                          미러에 없던 파일은 ASSERT_F 가 --allow-new 승인을 요구하므로 무방비는
                          아니다. 다만 그 방어선은 사람이 '신규 반입' 목록을 눈으로 읽는 것이 전부다.
+         FORBID — 금지 문자열이 없다. ASSERT_B 는 아무것도 검사하지 않는다.
          '조사한 뒤 비우기로 했다' 는 선언이지 안전하다는 뜻이 아니다.
          양쪽 저장소가 바뀌면 전제가 바뀐다 — 그때 conf 와 이 표식을 같이 갱신해라.
 ```
@@ -489,7 +491,26 @@ git -C /home/jhw/ai/opencode/projects/max9296-gitlab push        # 사람이 직
    않는지** 확인한다. 어느 쪽이 틀려도 조용히 실패한다.
 5. dry-run 을 먼저 돌려 4분류를 눈으로 확인한 뒤에만 `--apply` 로 넘어간다.
 
+## pim-summit-backports 현재 규칙 (2026-09-12)
+
+upstream `39fb8df`의 빌드 변경을 미러 `develop`에 반영한다. `.clangd`, `.env.example`,
+`.gitignore`, `env.sh`, `make-for-imx8`은 upstream과 동일하게 맞추며, README의 미러 전용
+안내와 문서 두 개는 보존한다. 호스트 설정 안내도 현재 `.env` 방식에 맞춘다.
+
+`KEEP_MIRROR`는 이제 `README.md` 하나다. `.gitignore`와 `make-for-imx8`의 차이는
+뒤처짐이 해소되어 없어졌으므로 일반 복사 대상으로 바꿨다. 같은 이유로 `.cache/` 금지어와
+빌드 스크립트의 구식 `exit 1` 필수 문자열도 제거했다.
+
+`UPSTREAM_ONLY`와 `FORBID`는 모두 의도적으로 비웠다. **ASSERT_A/B는 검사 대상이 0개**다.
+README와 미러 문서 두 개는 파일에 묶은 필수 문자열 검사로 지키고, 신규 파일은 계속
+`--allow-new` 확인을 요구한다. 기존 일반 복사 파일의 새 내용은 커밋 리뷰에서 확인해야 한다.
+
+현재 스모크 범위 `280e882..39fb8df`는 복사 5, 보존 1, 미반입 0, 미삭제 2를 기대한다.
+이미 반입한 `.clangd`와 `.env.example`은 신규 파일로 세지 않는다.
+
 ## 쌍별 상태 (2026-09-05)
+
+아래는 당시 조사 기록이다. 이후 `pim-summit-backports` 규칙은 위의 2026-09-12 절을 따른다.
 
 큐레이션 미러 쌍은 5개다. 2026-09-04 에는 `max9296` 하나만 채웠고, **2026-09-05 에 나머지 4쌍을
 실측했다.** 그 시점 결과는 사용 가능 4 · 부적합 1 이었고, 남은 1쌍(`pim-summit-backports`)은
@@ -519,7 +540,7 @@ upstream 로컬 클론이 다른 브랜치에 체크아웃돼 있거나 dirty �
 ### `pim-summit-backports` 는 왜 한때 부적합이었고, 이슈 #41 로 어떻게 해소했나
 
 **이 절의 앞부분은 해소 전 상태의 기록이다.** 지우지 않는 이유는 왜 한때 부적합이었는지가 이
-쌍을 이해하는 데 필요한 정보이기 때문이다. 지금 상태는 이 절 끝의 "어떻게 해소했나" 를 봐라.
+쌍을 이해하는 데 필요한 정보이기 때문이다. 현재 상태는 위의 2026-09-12 절을 봐라.
 
 "조사하지 않았다"가 아니라 **조사한 결과 부적합**이다. 큐레이션 축 자체는 실재한다 — 내용이 다른
 공통 파일 3개(`.gitignore` · `README.md` · `make-for-imx8`)와 미러 전용 2개
@@ -733,8 +754,8 @@ clean 한 미러에서만 시작하므로 **싱크 자신이 A·D 위반을 만�
 **어느 쌍을 스모크하는지는 `tests/mirror-sync-test.sh` 가 정본이다**(`smoke_real_pair` 호출 목록).
 위 [새 쌍 추가](#새-쌍-추가) 로 쌍을 늘렸으면 그 쌍의 `smoke_real_pair` 행도 같이 추가한다.
 기대값은 [실측 기준값](#실측-기준값)의 dry-run 합계를 그대로 쓰되, **그 쌍이 무엇을 정상으로
-보는지**까지 봐야 한다 — 예컨대 `pim-summit-backports` 는 `UPSTREAM_ONLY` 를 비운 대가로 `.clangd`
-1건이 '신규 반입' 으로 나오는 것이 정상이라, 다른 네 쌍처럼 "신규 반입이 없다"를 기대하면 안 된다.
+보는지**까지 봐야 한다. `pim-summit-backports`는 2026-09-05에는 `.clangd` 신규 반입 1건을
+기대했지만, 2026-09-12 반영 후에는 신규 반입 없음과 빈 축 2개의 경고를 기대한다.
 
 ## 관련
 
