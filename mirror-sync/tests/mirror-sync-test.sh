@@ -1466,10 +1466,16 @@ smoke_real_pair() {
 
 # base / from / to / 기대 복사줄 / 기대 보존·미반입·미삭제 줄 / 유출 검사 ERE
 # from·to 는 저장소가 전진해도 결과가 변하지 않도록 sha 로 못박는다(2026-09-05 실측).
-smoke_real_pair max9296 3f5915f 4fa9881 \
-    "합계: 복사 58 (쓰기 58 / 삭제 0)" \
-    "보존 6 · 미반입 278 · 미삭제 1" \
-    'artifacts/|docs/superpowers/|\.github/'
+# GitHub workflow 전용 테스트 제외 패턴이 생긴 현재 트리까지 검사한다.
+smoke_real_pair max9296 3f5915f fbd85f8 \
+    "합계: 복사 65 (쓰기 65 / 삭제 0)" \
+    "보존 8 · 미반입 279 · 미삭제 1" \
+    'artifacts/|docs/superpowers/|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
+
+smoke_real_pair max9296 4fa9881 fbd85f8 \
+    "합계: 복사 14 (쓰기 14 / 삭제 0)" \
+    "보존 4 · 미반입 17 · 미삭제 1" \
+    '\.gitignore|README\.md|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
 
 smoke_real_pair gstApp 46fd6fa 77a2635 \
     "합계: 복사 84 (쓰기 75 / 삭제 0 / 삭제생략 9)" \
