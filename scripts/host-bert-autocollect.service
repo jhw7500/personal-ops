@@ -1,0 +1,22 @@
+# /etc/systemd/system/host-bert-autocollect.service
+[Unit]
+Description=Collect ACPI BERT hardware error record at boot (abnormal reboot evidence)
+Documentation=https://github.com/jhw7500/personal-ops/issues/57
+# journald 가 떠야 BERT 커널 메시지를 읽을 수 있고, 증거 디렉터리가 있는
+# 파일시스템이 마운트되어야 저장할 수 있다.
+After=systemd-journald.service local-fs.target
+Wants=systemd-journald.service
+# 이 호스트의 BERT 레코드는 다음 재부팅에 덮어써진다. 부팅 초기에 확보한다.
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/home/jhw/ai/opencode/projects/personal-ops/scripts/host-bert-autocollect.sh
+# 레코드가 없는 정상 부팅에서는 아무것도 하지 않고 0 으로 끝난다.
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
