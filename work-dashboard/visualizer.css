@@ -1,0 +1,39 @@
+.wd-map{border-top:3px solid #d3ac69;overflow:hidden;background:linear-gradient(135deg,#1d2730,#192230);--wd-gold:#e6bc72}
+.wd-map h2{font-size:24px}.wd-map .eyebrow{color:var(--wd-gold)}
+.wd-map .section-heading{flex-wrap:wrap}.wd-map .section-heading>div{flex:1;min-width:160px}
+.wd-pipeline{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin:14px 0 18px;border:1px solid #45515b;background:#121b25}
+.wd-node{padding:9px 12px;min-width:0;overflow-wrap:anywhere;border-right:1px solid #45515b}.wd-node:last-child{border-right:0}
+.wd-node strong{display:block;font-size:12px;color:#dfc98f}.wd-node small{display:block;font-size:10px;color:#aebcca;line-height:1.5;margin-top:3px}
+.wd-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.wd-toolbar button{margin:0;padding:8px 10px;font-size:12px}.wd-toolbar .wd-zoom{min-width:36px;font-size:16px;padding:5px}
+.wd-observation{flex:1;min-width:150px;font-size:12px;color:#b6c8b3;padding:5px 0}.wd-observation[data-replaying=true]{color:#f1cd80}
+.wd-zoom-value{font:11px ui-monospace,monospace;min-width:32px;text-align:center;color:#bccad6}
+.wd-layout{display:grid;grid-template-columns:minmax(0,1fr) 240px;gap:14px;align-items:start}
+.wd-camera{position:relative;height:640px;max-height:65vh;min-height:360px;min-width:0;overflow:auto;background:#163b34;border:3px solid #667065;box-shadow:0 0 0 1px #0d191c,inset 0 0 0 2px #2f4236;scrollbar-color:#6e7966 #1c312b;cursor:grab;touch-action:pan-x pan-y;overscroll-behavior-x:contain}
+.wd-camera:focus-visible{outline:2px solid var(--wd-gold);outline-offset:2px}.wd-camera.wd-dragging{cursor:grabbing;user-select:none}
+.wd-sizer{position:relative;margin:0;min-width:0}.wd-stage{position:absolute;left:0;top:0;transform-origin:0 0;isolation:isolate}
+.wd-scenery{display:block;position:absolute;inset:0;width:1024px;height:640px;image-rendering:pixelated;pointer-events:none}
+.wd-floor{position:absolute;inset:0;pointer-events:none}.wd-room{position:absolute;pointer-events:none}
+.wd-room-heading{position:absolute;top:12px;left:13px;right:13px;display:flex;align-items:center;justify-content:space-between;gap:6px;z-index:700}
+.wd-room-heading h3{margin:0;padding:4px 8px;border:2px solid #9b7951;box-shadow:2px 2px 0 #242326;background:#46372ddc;color:#fff0c8;font-size:14px;font-weight:600;text-shadow:1px 1px #362823}
+.wd-room-count{pointer-events:auto;min-width:30px;min-height:28px;font-size:12px;padding:2px 6px;margin:0;border-radius:2px;border:2px solid #9b7951;background:#292b2c;color:#ffdfa0}
+.wd-room-description{position:absolute;left:15px;top:45px;max-width:132px;margin:0;padding:2px 4px;background:#171f22b8;color:#d3d7bb;font-size:10px;line-height:14px;text-shadow:1px 1px #202626}
+.wd-more{position:absolute;top:47px;right:13px;pointer-events:auto;z-index:700;font-size:10px;line-height:12px;padding:3px 5px;margin:0;border-radius:1px;border-color:#917652;background:#322b25;color:#ffe5b1}
+.wd-actor{position:absolute;left:0;top:0;width:64px;height:60px;padding:0;margin:0;border:0;border-radius:0;background:transparent;text-align:center;will-change:transform}
+.wd-actor:hover{border:0;background:transparent}.wd-avatar{display:block;width:32px;height:44px;margin:0 auto;image-rendering:pixelated;pointer-events:none;filter:drop-shadow(1px 2px 0 #18202088)}
+.wd-actor-label{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;height:15px;padding:1px 3px;color:#f1efcf;background:#151d21bc;font-size:9px;line-height:13px;border:1px solid #3f4b46}
+.wd-actor-task{position:absolute;left:50%;bottom:63px;transform:translateX(-50%);max-width:138px;min-width:48px;padding:3px 5px;border:1px solid #8b7952;background:#182521e8;color:#fff1be;font-size:10px;line-height:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.wd-actor[data-state=idle][data-presentation=observed] .wd-actor-task{color:#bac8ba;border-color:#526251;background:#1a2923cc}
+.wd-task{position:absolute;width:64px;height:38px;padding:0;margin:0;border:0;border-radius:0;background:transparent;text-align:center}
+.wd-task:hover{background:#3b352a66;border:0}.wd-task-icon{display:block;width:25px;height:21px;margin:0 auto 2px;border:2px solid #876948;box-shadow:2px 2px 0 #252723;background:#e5cc89;color:#59462f;font:10px/17px ui-monospace,monospace;image-rendering:pixelated}
+.wd-task-label{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 2px;color:#efe0b9;background:#29251dbf;font-size:9px;line-height:12px}
+.wd-task[data-room=attention] .wd-task-icon{border-color:#a65046;background:#d3a07f;color:#713b30}.wd-task:focus-visible{outline:2px solid #f6ce72;outline-offset:2px}
+.wd-actor.selected .wd-actor-label{border-color:#f0c36b;color:#ffebae;background:#4b3c27}.wd-actor.selected .wd-avatar{filter:drop-shadow(0 0 3px #e5b75d)}
+.wd-actor:focus-visible{outline:2px solid #f6ce72;outline-offset:2px}.wd-actor[data-presentation=replay] .wd-actor-label{border-color:#d6aa58}
+.wd-inspector{min-width:0;padding:16px;background:#121c27;border:1px solid #4c565b;border-top:3px solid #b3945d;border-radius:4px;overflow-wrap:anywhere;max-height:640px;overflow:auto}
+.wd-inspector h3{color:#f2ddab;font-size:15px;margin:0 0 14px}.wd-inspector .eyebrow{font-size:10px}
+.wd-fields{font-size:12px;line-height:1.5}.wd-fields dt{color:#a9bdc8;margin-top:12px}.wd-fields dd{margin:3px 0 0;white-space:pre-wrap}
+.wd-detail-item{display:block;text-align:left;width:100%;font-size:12px;line-height:1.5;padding:8px}.wd-detail-motion{font-size:11px;line-height:1.6;color:#f0c776}
+.wd-hint,.wd-legend,.wd-note{font-size:11px;margin:9px 0 0}.wd-map[data-stale=true] .wd-camera{border-color:#dc9b7b}
+@media(max-width:1120px){.wd-layout{grid-template-columns:minmax(0,1fr)}.wd-inspector{max-height:260px}.wd-fields{display:grid;grid-template-columns:100px minmax(0,1fr);gap:7px}.wd-fields dt,.wd-fields dd{margin:0}}
+@media(max-width:760px){.wd-pipeline{grid-template-columns:repeat(2,minmax(0,1fr))}.wd-node{border-bottom:1px solid #45515b}.wd-camera{height:440px;max-height:65vh;min-height:320px}.wd-layout{gap:12px}.wd-map h2{font-size:21px}.wd-toolbar{gap:5px}.wd-observation{flex-basis:100%}.wd-toolbar button{padding:7px 8px}}

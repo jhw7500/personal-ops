@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Personal Ops · 작업 관리</title><link rel="stylesheet" href="/admin.css">
+<link rel="stylesheet" href="/work-dashboard/visualizer.css">
+<script src="/work-dashboard/model.js" defer></script>
+<script src="/work-dashboard/motion.js" defer></script>
+<script src="/work-dashboard/pixels.js" defer></script>
+<script src="/work-dashboard/visualizer.js" defer></script>
+<script src="/admin.js" defer></script></head>
+<body>
+<header><div><p class="eyebrow">PERSONAL OPS</p><h1>작업 관리</h1></div><span id="connection" role="status">연결 전</span></header>
+<main>
+<section id="login" class="panel"><h2>관리 화면 연결</h2>
+<p>호스트에서 발급한 관리 토큰으로 연결합니다. OpenAI API 키가 아닙니다.</p>
+<form id="login-form"><label for="token">관리 토큰</label><input id="token" type="password" autocomplete="off" required>
+<label><input id="remember" type="checkbox" checked> 이 브라우저에서 30일 유지</label><button>연결</button></form>
+<p class="muted">첫 연결 후 이 주소를 즐겨찾기에 추가하세요. 새로고침해도 로그인이 유지됩니다.</p></section>
+<p id="notice" role="status" aria-live="polite"></p>
+<div id="dashboard" hidden>
+<section class="toolbar panel"><div><label for="project">조회할 레포</label><select id="project"></select><p id="project-path" class="muted"></p></div>
+<div><button id="follow" type="button">자동 갱신 일시정지</button><button id="refresh" type="button">새로고침</button><button id="logout" type="button">연결 해제</button><p id="updated" class="muted"></p></div>
+<p class="muted full">호스트의 로컬 디렉터리입니다. 이 선택은 화면 조회에 적용됩니다. 채팅에서는 작업할 레포 이름을 지정하세요.</p></section>
+
+<section id="work-map" aria-label="업무 작업실"></section>
+
+<section class="panel work"><div class="section-heading"><div><p class="eyebrow">CURRENT WORK</p><h2 id="work-title">작업 목표 불러오는 중…</h2></div><span id="work-state" class="badge"></span></div>
+<p id="work-summary" class="preserve"></p><p id="work-updated" class="muted"></p>
+<div id="observed-work"><h3>실제 명령 실행 현황</h3><p id="observed-status" class="muted" role="status">실행 기록 불러오는 중…</p>
+<div id="recent-work" class="jobs"></div><p class="muted">최근 명령 5개를 자동 표시합니다. 명령 성공은 종료 코드 기준이며, 기능의 완성 여부는 아래 작업 보고에서 확인하세요. 항목을 누르면 원본 출력을 볼 수 있습니다.</p></div>
+<div class="equal-columns"><div><h3>완료로 기록한 항목</h3><ul id="completed" class="items"></ul></div><div><h3>다음 작업</h3><ul id="next-steps" class="items"></ul></div></div>
+<p class="muted">채팅에서 기록하거나 아래에서 편집할 수 있습니다. 실행 검증 결과는 별도로 확인하세요.</p>
+<details id="progress-editor"><summary>작업 목표와 진행 상황 편집</summary>
+<form id="progress-form"><div class="equal-columns"><div><label for="progress-title">작업 목표</label><input id="progress-title" required maxlength="200"></div>
+<div><label for="progress-state">작업 상태</label><select id="progress-state"><option value="planned">계획됨</option><option value="in_progress">진행 중</option><option value="blocked">진행 막힘</option><option value="completed">완료</option></select></div></div>
+<label for="progress-summary">현재 상황</label><textarea id="progress-summary" rows="3" maxlength="4096"></textarea>
+<div class="equal-columns"><div><label for="progress-completed">완료 항목 · 한 줄에 하나</label><textarea id="progress-completed" rows="4"></textarea></div>
+<div><label for="progress-next">다음 작업 · 한 줄에 하나</label><textarea id="progress-next" rows="4"></textarea></div></div>
+<p id="progress-status" class="muted" role="status"></p><button id="save-progress" type="submit" disabled>작업 보고 저장</button><button id="reload-progress" type="button">저장본 다시 읽기</button></form></details>
+</section>
+
+<div class="columns">
+<section class="panel"><div class="section-heading"><h2>변경 파일 <span id="change-count"></span></h2><button id="refresh-changes" type="button">Git 새로고침</button></div>
+<p id="git-status" class="muted"></p><p class="muted">현재 작업 트리의 변경입니다. 다른 터미널의 변경도 포함됩니다. 환경변수 파일과 심볼릭 링크는 제외합니다.</p>
+<div id="changes" class="file-list"></div></section>
+<section class="panel"><div class="section-heading"><h2>변경 내용</h2><div><label for="diff-mode" class="sr-only">변경 범위</label><select id="diff-mode"><option value="false">작업 트리</option><option value="true">스테이징된 변경</option></select></div></div>
+<p id="diff-status" class="muted" role="status">파일을 선택하세요.</p><pre id="diff" tabindex="0" aria-label="선택한 파일의 변경 내용"></pre></section>
+</div>
+
+<div class="equal-columns">
+<section class="panel"><h2>빌드 · 테스트 · 검사</h2><p class="muted">최근 실행의 상태와 종료 코드입니다. 항목을 누르면 아래에서 원본 출력을 확인할 수 있습니다.</p><div id="checks" class="jobs"></div></section>
+<section class="panel"><h2>새 채팅에서 이어가기</h2><p class="muted">저장된 목표·다음 작업·메모와 현재 변경 파일, 최근 명령 결과를 모아줍니다.</p>
+<button id="make-handoff" type="button">이어가기 요약 만들기</button><button id="copy-handoff" type="button" disabled>요약 복사</button>
+<label for="handoff" class="sr-only">새 채팅에 붙여 넣을 작업 요약</label><textarea id="handoff" rows="10" readonly placeholder="요약을 만든 뒤 새 ChatGPT 채팅에 붙여 넣으세요."></textarea>
+<p id="handoff-status" class="muted" role="status"></p></section>
+</div>
+
+<details id="execution-details" class="secondary"><summary>전체 실행 작업과 출력 <span id="job-count"></span></summary>
+<div class="columns"><section class="panel"><h2>실행 작업</h2><p class="muted">최근 100개 · 작업을 선택하면 출력을 볼 수 있습니다.</p><div id="jobs" class="jobs"></div></section>
+<section class="panel"><h2>작업 출력</h2><p id="log-status" class="muted">작업을 선택하세요.</p><pre id="log" tabindex="0" aria-label="작업 출력"></pre></section></div></details>
+<details id="notes-details" class="secondary"><summary>레포 메모리와 MCP 호출 기록</summary>
+<div class="equal-columns"><section class="panel"><h2>레포 메모리</h2><p class="muted">다음 채팅에서 읽을 결정 사항·검증 결과·남은 작업을 저장하세요. 비밀값은 적지 마세요.</p>
+<label for="memory">Markdown 메모</label><textarea id="memory" rows="12" spellcheck="false"></textarea>
+<p id="memory-status" role="status"></p><button id="save" type="button" disabled>메모 저장</button><button id="reload-memory" type="button">저장본 다시 읽기</button></section>
+<section class="panel"><h2>MCP 작업 타임라인</h2><p class="muted">호출 시작·완료·실패 기록입니다. 명령의 최종 결과는 실행 작업에서 확인하세요.</p><ol id="activity"></ol></section></div></details>
+</div></main><footer>Personal Ops · 호스트에 저장된 기록과 현재 작업 트리를 조회합니다.</footer>
+</body></html>

@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>작업 레포</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.6 system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; color: light-dark(#202124, #ededed); background: light-dark(#fff, #202020); }
+    main { max-width: 560px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: 22px; line-height: 1.4; }
+    p { margin: 0 0 20px; }
+    .muted { color: light-dark(#62656b, #b4b7bc); }
+    .tag { display: inline-block; margin-bottom: 12px; font-size: 12px; font-weight: 600; }
+    label { display: block; margin-bottom: 8px; font-weight: 600; }
+    select, button { font: inherit; border-radius: 8px; min-height: 44px; }
+    select { width: 100%; padding: 10px 12px; border: 1px solid light-dark(#8d9299, #74787e); background: light-dark(#fff, #292929); color: inherit; }
+    button { padding: 9px 16px; cursor: pointer; border: 1px solid transparent; font-weight: 600; }
+    button:disabled, select:disabled { cursor: default; opacity: .6; }
+    button.primary { background: light-dark(#202124, #ededed); color: light-dark(#fff, #202124); }
+    button.secondary { color: inherit; border-color: light-dark(#c4c7cc, #63676d); background: transparent; }
+    :focus-visible { outline: 3px solid light-dark(#1664d9, #82b4ff); outline-offset: 3px; }
+    .path { margin: 12px 0 20px; padding: 12px; border-radius: 8px; background: light-dark(#f2f3f5, #2d2f32); }
+    .path-label { font-size: 12px; }
+    code { display: block; overflow-wrap: anywhere; font: 13px/1.6 ui-monospace, monospace; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+    #status { min-height: 24px; margin: 16px 0; }
+    #status[data-error="true"] { color: light-dark(#a51d24, #ffacae); }
+    .note { font-size: 12px; margin-bottom: 0; }
+    @media (max-width: 360px) { body { padding: 16px; } .actions button { width: 100%; } }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="tag muted">호스트 PC · 로컬 디렉터리</span>
+    <h1>작업 레포</h1>
+    <p class="muted">이 대화에서 작업할 레포를 선택하세요.</p>
+    <form id="picker">
+      <label for="project">허용된 레포</label>
+      <select id="project" aria-describedby="path status" disabled>
+        <option value="">레포 목록을 기다리는 중…</option>
+      </select>
+      <div class="path">
+        <div class="path-label muted">호스트의 작업 경로</div>
+        <code id="path">아직 선택하지 않았습니다.</code>
+      </div>
+      <div class="actions">
+        <button id="apply" class="primary" type="submit" disabled>이 대화에서 사용</button>
+        <button id="refresh" class="secondary" type="button" disabled>목록 새로고침</button>
+      </div>
+    </form>
+    <p id="status" role="status" aria-live="polite">ChatGPT에 연결하는 중…</p>
+    <p class="note muted">허용 목록에 등록된 디렉터리만 사용할 수 있습니다. 다른 레포는 호스트에서 등록한 뒤 선택하세요. GitHub에 반영하려면 별도의 commit·push가 필요합니다.</p>
+  </main>
+  <script>
+    "use strict";
+    const select = document.querySelector("#project");
+    const apply = document.querySelector("#apply");
+    const refresh = document.querySelector("#refresh");
+    const status = document.querySelector("#status");
+    const path = document.querySelector("#path");
+    const unsupported = "이 화면에서는 선택을 대화에 전달할 수 없습니다. 채팅에 레포 이름을 직접 지정해주세요.";
+    const pending = new Map();
+    let requestId = 0;
+    let projects = [];
+    let ready = false;
+    let canUpdateContext = false;
+    let supportsContextRPC = false;
+    let legacyBridge = false;
+    let busy = false;
+    let receivedList = false;
+    let waitingForList;
+
+    function message(text, error = false) {
+      status.textContent = text;
+      status.dataset.error = String(error);
+    }
+
+    function syncControls() {
+      const selected = projects.find(item => item.project === select.value);
+      select.disabled = !ready || busy || projects.length === 0;
+      apply.disabled = !ready || !canUpdateContext || busy || !selected;
+      refresh.disabled = !ready || busy;
+      path.textContent = selected?.path ?? "아직 선택하지 않았습니다.";
+      apply.textContent = busy ? "처리 중…" : "이 대화에서 사용";
+    }
+
+    function request(method, params) {
+      if (legacyBridge && method === "tools/call") {
+        return window.openai.callTool(params.name, params.arguments);
+      }
+      return new Promise((resolve, reject) => {
+        const id = ++requestId;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error("응답이 늦어지고 있습니다. 잠시 후 다시 시도하세요."));
+        }, method === "tools/call" ? 60000 : 15000);
+        pending.set(id, { resolve, reject, timer });
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+      });
+    }
+
+    function render(result) {
+      if (result?.isError) throw new Error("레포 목록을 불러오지 못했습니다. 다시 시도하세요.");
+      const listing = result?.structuredContent?.projects;
+      if (!Array.isArray(listing) || listing.some(item => !item ||
+          typeof item.project !== "string" || !item.project || typeof item.path !== "string")) {
+        throw new Error("레포 목록의 응답 형식이 올바르지 않습니다.");
+      }
+      clearTimeout(waitingForList);
+      receivedList = true;
+      const saved = window.openai?.widgetState;
+      const previous = select.value || saved?.privateContent?.selectedProject || saved?.selectedProject;
+      projects = listing;
+      select.replaceChildren();
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = listing.length ? "작업할 레포를 선택하세요" : "허용된 레포가 없습니다";
+      select.append(placeholder);
+      for (const item of listing) {
+        const option = document.createElement("option");
+        option.value = item.project;
+        option.textContent = item.project;
+        select.append(option);
+      }
+      if (listing.some(item => item.project === previous)) select.value = previous;
+      syncControls();
+    }
+
+    function updateTheme(context) {
+      if (context?.theme === "light" || context?.theme === "dark") {
+        document.documentElement.style.colorScheme = context.theme;
+      }
+    }
+
+    window.addEventListener("message", event => {
+      if (event.source !== window.parent) return;
+      const data = event.data;
+      if (!data || data.jsonrpc !== "2.0") return;
+      if (pending.has(data.id)) {
+        const response = pending.get(data.id);
+        clearTimeout(response.timer);
+        pending.delete(data.id);
+        if (data.error) response.reject(new Error("ChatGPT 요청에 실패했습니다. 다시 시도하세요."));
+        else response.resolve(data.result);
+      } else if (data.method === "ui/notifications/tool-result") {
+        try {
+          const firstResult = !receivedList;
+          render(data.params);
+          if (firstResult && ready && !busy && canUpdateContext) {
+            message(projects.length ? "레포를 선택하고 이 대화에 적용하세요." : "호스트에 허용된 레포를 등록해주세요.");
+          }
+        } catch (error) { message(error.message, true); }
+      } else if (data.method === "ui/notifications/host-context-changed") {
+        updateTheme(data.params);
+      } else if (data.method === "ui/resource-teardown") {
+        window.parent.postMessage({ jsonrpc: "2.0", id: data.id, result: {} }, "*");
+      }
+    });
+
+    window.addEventListener("openai:set_globals", event => {
+      const globals = event.detail?.globals;
+      if (globals?.theme) updateTheme(globals);
+      if (globals?.toolOutput) {
+        try { render({ structuredContent: globals.toolOutput }); }
+        catch (error) { message(error.message, true); }
+      }
+    });
+
+    select.addEventListener("change", () => {
+      syncControls();
+      message(canUpdateContext ? "선택을 적용하려면 ‘이 대화에서 사용’을 누르세요." :
+        unsupported, !canUpdateContext);
+    });
+
+    document.querySelector("#picker").addEventListener("submit", async event => {
+      event.preventDefault();
+      if (apply.disabled) return;
+      const requested = select.value;
+      busy = true;
+      syncControls();
+      message("선택한 레포를 확인하는 중…");
+      try {
+        const result = await request("tools/call", {
+          name: "select_project", arguments: { project: requested },
+        });
+        if (result?.isError || result?.structuredContent?.selected_project !== requested) {
+          throw new Error("이 레포를 선택할 수 없습니다. 목록을 새로고침하세요.");
+        }
+        render(result);
+        const selected = projects.find(item => item.project === requested);
+        if (!selected) throw new Error("이 레포는 더 이상 허용 목록에 없습니다.");
+        const contextText =
+          `이 대화에서 선택한 호스트 로컬 레포: ${selected.project} (${selected.path}). ` +
+          `이후 파일 도구의 project 인자에는 ${selected.project}를 사용하세요. ` +
+          "사용자가 다른 레포를 명시하면 그 지시를 따르세요. GitHub에 자동 반영되지는 않습니다.";
+        const context = {
+          content: [{ type: "text", text: contextText }],
+          structuredContent: { selectedProject: selected.project, path: selected.path },
+        };
+        const widgetState = {
+          modelContent: { ...context.structuredContent, instructions: contextText },
+          privateContent: { selectedProject: selected.project },
+        };
+        if (supportsContextRPC) {
+          await request("ui/update-model-context", context);
+          try { window.openai?.setWidgetState?.(widgetState); }
+          catch (_) { /* Model context succeeded; widget persistence is optional. */ }
+        } else {
+          // ChatGPT's compatibility bridge exposes modelContent to later turns.
+          // Here state delivery is required, so failures must reach the error UI.
+          window.openai.setWidgetState(widgetState);
+        }
+        message(`${selected.project} 선택을 이 대화에 전달했습니다. 채팅에서 작업을 요청하세요.`);
+      } catch (error) {
+        message(error.message, true);
+      } finally {
+        busy = false;
+        syncControls();
+      }
+    });
+
+    refresh.addEventListener("click", async () => {
+      if (refresh.disabled) return;
+      busy = true;
+      syncControls();
+      message("레포 목록을 새로고치는 중…");
+      try {
+        render(await request("tools/call", { name: "list_projects", arguments: {} }));
+        message(canUpdateContext ? "레포 목록을 새로고쳤습니다." :
+          unsupported, !canUpdateContext);
+      } catch (error) { message(error.message, true); }
+      finally { busy = false; syncControls(); }
+    });
+
+    async function initialize() {
+      let host;
+      try {
+        host = await request("ui/initialize", {
+          appInfo: { name: "host-repository-picker", version: "1.1.0" },
+          appCapabilities: { availableDisplayModes: ["inline"] },
+          protocolVersion: "2026-01-26",
+        });
+      } catch (error) {
+        if (typeof window.openai?.callTool !== "function") {
+          message(error.message + " 채팅에서 레포 선택 카드를 다시 열어주세요.", true);
+          return;
+        }
+        legacyBridge = true;
+        host = { hostContext: { theme: window.openai.theme } };
+      }
+      try {
+        ready = true;
+        supportsContextRPC = Boolean(host?.hostCapabilities?.updateModelContext);
+        canUpdateContext = supportsContextRPC || typeof window.openai?.setWidgetState === "function";
+        updateTheme(host?.hostContext);
+        if (!legacyBridge) {
+          window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
+        }
+        if (!receivedList && window.openai?.toolOutput) {
+          render({ structuredContent: window.openai.toolOutput });
+        }
+        syncControls();
+        if (!canUpdateContext) {
+          message(unsupported, true);
+        } else {
+          message(receivedList ? (projects.length ? "레포를 선택하고 이 대화에 적용하세요." :
+            "호스트에 허용된 레포를 등록해주세요.") : "레포 목록을 기다리는 중…");
+          if (!receivedList) waitingForList = setTimeout(() => {
+            message("목록이 도착하지 않았습니다. ‘목록 새로고침’을 눌러주세요.", true);
+          }, 15000);
+        }
+      } catch (error) { message(error.message + " 채팅에서 레포 선택 카드를 다시 열어주세요.", true); }
+    }
+    initialize();
+  </script>
+</body>
+</html>
