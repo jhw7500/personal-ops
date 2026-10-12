@@ -34,8 +34,10 @@ class RuntimeInstallTest(unittest.TestCase):
         result = installer.install(self.source, self.root / "runtime", self.projects)
         release = Path(result["runtime_dir"])
         self.assertEqual((release / 'workspace_view.py').read_text(), 'original\n')
-        for name in ('codex_hooks.py', 'codex_observer.py', 'codex_hook_report.py'):
+        for name in ('codex_hooks.py', 'codex_observer.py', 'codex_hook_report.py',
+                     'claude_hooks.py', 'claude_hook_report.py'):
             self.assertTrue((release / name).is_file(), name)
+        self.assertEqual(result['file_count'], 26)
         (self.source / "server.py").write_text("changed\n")
         self.assertEqual(Path(result["server"]).read_text(), "original\n")
         self.assertEqual(stat.S_IMODE(release.stat().st_mode), 0o700)

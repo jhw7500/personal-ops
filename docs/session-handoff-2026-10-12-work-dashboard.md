@@ -15,6 +15,9 @@ worktree_path: "/home/jhw/ai/opencode/projects/personal-ops"
 
 # personal-ops 터널과 RPG 업무 작업실 인계
 
+최신 후속 상태는 아래 **실제 흐름 검증과 Claude 연결**을 우선한다. 이전 후속 상태와 본문은
+각 검증 당시의 기록이다.
+
 > 후속 상태: MCP·작업실 소스는 `cf8b6d2`로 커밋했고, 원격 `origin/main`을 기준으로
 > 해당 변경만 옮긴 `10a7232`를 `feat/personal-ops-tunnel-work-dashboard` 브랜치에 보관했다.
 > 추가 Codex 수집기 작업은 `/home/jhw/.local/state/personal-ops-worktrees/tunnel-work-dashboard-20261012`
@@ -275,3 +278,35 @@ tunnel-client runtimes connect
 이 문서와 수집 계약을 읽으면 현재 구현과 아직 없는 수집기를 구분할 수 있다.
 실사용 보고를 확인할지, CLI 수집기를 구현할지의 후속 범위는 새 세션의 사용자 요청에 따른다.
 현재 작업 폴더와 호스트 상태가 문서 작성 이후 달라졌다면 현재 지침·파일·관측 결과를 우선한다.
+
+## 실제 흐름 검증과 Claude 연결
+
+2026-10-12 후속 요청으로 아래 작업을 진행했다.
+
+- 수집기와 UI 커밋 `5ce0b7f`, 후크 활성화 문서 커밋 `f33e590`을 원격
+  `feat/personal-ops-tunnel-work-dashboard` 브랜치에 push하고 원격 SHA를 확인했다.
+- 실제 파일 조회·편집 후크의 분석실·코딩실 동작과 터널 검사 작업의 검사실 동작을 Chromium에서
+  관측했다. 성공한 검사 작업은 완료 보관함과 상세에 성공 상태로 표시됐고 root 객체는 한 명이었다.
+- 반복 검사는 `22:12:17 KST`에 터널 클라이언트가 자체 런타임을 종료·교체하면서 중단됐다.
+  새 MCP의 JobManager가 이전 실행 중 기록을 `interrupted`로 바꿨다. 교체를 시작한 주체나 이유는
+  로그에서 확인되지 않았으며, systemd 서비스의 재시작 기록은 없었다. 후속 MCP 조회 시간 초과는
+  이 연결 교체와 일치하지만 해당 요청의 도구 이름까지 로그로 입증하지는 못했다.
+- `server.py`의 SIGTERM 종료를 기존 lifespan 정리로 연결했다. 임시 실제 MCP와 샌드박스에서
+  SIGTERM/SIGINT 및 stdio 종료 시 작업 종료 기록과 샌드박스 정리를 확인했다. 정리 중 추가 취소를
+  잘못 삼키지 않는 회귀 검사까지 3개가 통과했다. SIGKILL이나 열린 stdio를 유지한 종료는 검증하지 않았다.
+- Claude CLI 후크 어댑터를 구현·리뷰하고 사용자 후크 10개를 기존 설정을 보존해 등록했다.
+  불변 reporter `9413d24e559a5901561c`와 실제 무추론 초기화 이벤트·운영 화면의 대기 객체를 확인했다.
+  자세한 수집 범위와 검증 경계는 [Claude 수집기](claude-cli-observer.md)를 따른다.
+
+종료 처리 보완은 후속 작업 폴더의 **소스 변경**이다. 운영 터널 profile은 확인 시 다른 세션에서
+배포한 host-runtime 포함 릴리스 `c57b5d4eae259396e71b`를 가리키므로 덮어쓰지 않았다.
+그 배포 소스와 통합한 뒤 적용해야 한다. 작업이 프로세스 교체를 넘어 계속 실행되는 기능은 없다.
+
+새 Claude 어댑터의 집중 검사 16개, 런타임 설치 검사 6개, 전체 Python 166개와 후속 종료 검사 3개가
+통과했다. JavaScript/화면 소스는 이번에 변경하지 않았다. 실제 흐름의 페이지 오류는 0개였으며
+로그인 전 `/api/status`의 예상 401은 따로 분류했다. 실사용 CLI의 도구/턴/실패/자식 사건과 실제
+토큰 제공 여부는 다음 해당 사건에서 확인하고, 재부팅 검증은 다음 예정된 호스트 재부팅 때 진행한다.
+
+비공개 운영 증거는 `~/.local/state/personal-ops-live-flow/20261012/`, Claude 설정 백업·등록 결과는
+`~/.local/state/personal-ops-claude-rollout/20261012/`에 있다. 이 변경은 기존 Codex 공유 서버나 세션을
+재시작하지 않았고 다른 세션의 main 작업 파일을 커밋하지 않는다. PR·merge는 수행하지 않는다.

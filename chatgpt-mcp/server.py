@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sys
 import uuid
 
@@ -732,6 +733,30 @@ async def serve(projects):
             experimental_capabilities=SETTINGS_CAPABILITY))
 
 
+async def serve_with_shutdown(projects):
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    stopping = False
+
+    def stop():
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            task.cancel()
+
+    previous = signal.getsignal(signal.SIGTERM)
+    loop.add_signal_handler(signal.SIGTERM, stop)
+    try:
+        await serve(projects)
+    except asyncio.CancelledError:
+        if not stopping or task.cancelling() != 1:
+            raise
+        task.uncancel()
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, previous)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     selection = parser.add_mutually_exclusive_group()
@@ -745,7 +770,7 @@ def main():
         binary = SERENA_ENV / "bin/python"
         os.execv(binary, [str(binary), str(Path(__file__).resolve()), *sys.argv[1:]])
     projects = load_projects(args.config)
-    asyncio.run(serve(projects))
+    asyncio.run(serve_with_shutdown(projects))
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ Browser <-> SSH local forwarding <-> admin HTTP (127.0.0.1:8765)
 
 Codex CLI의 세션 상태·모델 설정·신뢰된 도구 후크를 작업실에 연결하는 별도 로컬
 수집기도 제공한다. 설치·수집 범위·신뢰 절차는 [Codex 수집기](../docs/codex-cli-observer.md)를 참고한다.
+Claude Code의 네이티브 후크를 같은 작업실에 연결하는 [Claude 수집기](../docs/claude-cli-observer.md)도 제공한다.
 
 ```bash
 python3 chatgpt-mcp/server.py
@@ -591,7 +592,7 @@ UI는 최근 100개 작업과 최근 호출만 표시하며, 개별 명령 로�
 Host/Origin 검사를 받는다. 본문은 `{"events":[...]}`이며 원격 입력의 출처는 항상 `reported`다.
 활성 보고는 최대 120초 유효하고 종료 신호나 갱신이 없으면 미확인으로 표시한다.
 명시적인 `reason` 이벤트에만 추론 동작을 표시한다. ChatGPT 모델·추론을 자동으로 읽는 기능은 없으며
-Codex·Claude의 후크 수집기는 아직 활성화하지 않았다. 형식과 확장 경계는
+Codex·Claude의 로컬 후크 수집기는 별도 설정으로 연결한다. 형식과 확장 경계는
 [업무 작업실 수집 계약](../work-dashboard/README.md#다른-mcp와-에이전트-수집)을 따른다.
 
 ## 검증
