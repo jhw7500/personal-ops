@@ -441,16 +441,20 @@ async def serve(projects):
                 'parent_source_id': identifier, 'parent_actor_id': identifier, 'parent_task_id': identifier,
                 'exit_code': {'type': 'integer'},
                 'model': {'type': 'string', 'pattern': '^[A-Za-z0-9_.:+/-]+$', 'minLength': 1, 'maxLength': 120},
+                'model_source': {'type': 'string', 'enum': ['configuration', 'event']},
                 'reasoning_effort': {'type': 'string', 'pattern': '^[A-Za-z0-9_.:+/-]+$', 'minLength': 1, 'maxLength': 32},
+                'reasoning_effort_source': {'type': 'string', 'enum': ['configuration', 'event']},
                 'usage': {'type': 'object', 'minProperties': 1, 'properties': {
                     key: {'type': 'integer', 'minimum': 0, 'maximum': 9007199254740991}
                     for key in ['input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens']
                 }, 'additionalProperties': False},
                 'usage_scope': {'type': 'string', 'enum': ['request', 'turn', 'session', 'task']},
+                'usage_estimated': {'type': 'boolean'},
             }, 'required': ['schema_version', 'source_id', 'source_kind', 'actor_id', 'actor_kind',
                             'actor_label', 'task_id', 'task_kind', 'task_label', 'action', 'state'],
             'additionalProperties': False,
-            'dependentRequired': {'usage': ['usage_scope']},
+            'dependentRequired': {'usage': ['usage_scope'], 'model_source': ['model'],
+                                  'reasoning_effort_source': ['reasoning_effort'], 'usage_estimated': ['usage']},
         }
         observer_tool = types.Tool(
             name='report_work_events', title='다른 MCP·에이전트 작업 보고',

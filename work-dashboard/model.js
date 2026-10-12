@@ -200,12 +200,16 @@
       receivedMilliseconds: received?.milliseconds ?? parsed.milliseconds, order,
       provenance: row.provenance === 'observed' ? 'observed' : 'reported'};
     if (typeof row.model === 'string' && row.model.length <= 120 && METADATA_ID.test(row.model)) result.model = row.model;
+    if (result.model && ['configuration', 'event'].includes(row.model_source)) result.modelSource = row.model_source;
     if (typeof row.reasoning_effort === 'string' && row.reasoning_effort.length <= 32
         && METADATA_ID.test(row.reasoning_effort)) result.reasoningEffort = row.reasoning_effort;
+    const effortSource = row.reasoning_effort_source ?? result.modelSource;
+    if (result.reasoningEffort && ['configuration', 'event'].includes(effortSource)) result.reasoningEffortSource = effortSource;
     if (row.usage && typeof row.usage === 'object' && !Array.isArray(row.usage) && USAGE_SCOPES.has(row.usage_scope)) {
       const values = Object.fromEntries(USAGE_KEYS.filter(key => Object.hasOwn(row.usage, key)).map(key => [key, row.usage[key]]));
       if (Object.keys(values).length && Object.values(values).every(value => Number.isSafeInteger(value) && value >= 0)) {
         result.usage = values; result.usageScope = row.usage_scope;
+        if (typeof row.usage_estimated === 'boolean') result.usageEstimated = row.usage_estimated;
       }
     }
     return result;
@@ -219,8 +223,11 @@
       // Metadata from one model must never be attributed to a later, different model.
       if (row.model && row.model !== result.model?.value) result = {};
       for (const key of ['model', 'reasoningEffort', 'usage']) if (Object.hasOwn(row, key)) {
+        const source = key === 'model' ? row.modelSource : row.reasoningEffortSource;
         result[key] = {value: row[key], time: row.time, provenance: row.provenance,
-          ...(key === 'usage' ? {scope: row.usageScope} : {})};
+          ...(key === 'usage' ? {scope: row.usageScope,
+            ...(row.usageEstimated !== undefined ? {estimated: row.usageEstimated} : {})}
+            : source ? {source} : {})};
       }
     }
     return result;
@@ -307,6 +314,7 @@
     }
 
     tasks.sort((left, right) => actorPriority(left) - actorPriority(right)
+      || Number(left.kind === 'agent') - Number(right.kind === 'agent')
       || right._milliseconds - left._milliseconds || left.id.localeCompare(right.id));
     const groups = new Map();
     for (const task of tasks) {
@@ -358,5 +366,20 @@
     };
   }
 
-  return {snapshot};
+  function changes(previous, current, {now = Date.now()} = {}) {
+    if (!previous || !current || previous.project !== current.project
+        || !Array.isArray(previous.tasks) || !Array.isArray(current.tasks)) return [];
+    const known = new Map(previous.tasks.map(task => [task.id, task]));
+    const result = [];
+    for (const task of current.tasks) {
+      const before = known.get(task.id), time = Date.parse(task.time);
+      if (!Number.isFinite(time) || !Number.isFinite(now) || (!before && time < now - 15000) || time > now + 5000
+          || (before && before.state === task.state && before.action === task.action)) continue;
+      result.push({...Object.fromEntries(['id', 'actorId', 'kind', 'label', 'tool', 'action', 'state', 'time',
+        'provenance', 'room', 'sourceRoom'].map(key => [key, task[key]])), noticedAt: new Date(now).toISOString()});
+    }
+    return result.sort((a, b) => Date.parse(a.time) - Date.parse(b.time) || a.id.localeCompare(b.id));
+  }
+
+  return {snapshot, changes};
 }));

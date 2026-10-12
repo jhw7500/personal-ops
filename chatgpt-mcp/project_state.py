@@ -202,6 +202,16 @@ def _sanitize_work_event(project, event, provenance, now, *, preserved_receipt=N
                 _invalid_work_event()
             record[field] = value
 
+    if "model_source" in event:
+        if "model" not in record or event["model_source"] not in ("configuration", "event"):
+            _invalid_work_event()
+        record["model_source"] = event["model_source"]
+    if "reasoning_effort_source" in event:
+        if ("reasoning_effort" not in record
+                or event["reasoning_effort_source"] not in ("configuration", "event")):
+            _invalid_work_event()
+        record["reasoning_effort_source"] = event["reasoning_effort_source"]
+
     if "usage" in event:
         usage = event["usage"]
         if (not isinstance(usage, dict)
@@ -222,6 +232,11 @@ def _sanitize_work_event(project, event, provenance, now, *, preserved_receipt=N
         record["usage_scope"] = event["usage_scope"]
     elif "usage_scope" in event:
         _invalid_work_event()
+
+    if "usage_estimated" in event:
+        if "usage" not in record or not isinstance(event["usage_estimated"], bool):
+            _invalid_work_event()
+        record["usage_estimated"] = event["usage_estimated"]
 
     expiry_limit = min(event_time, receipt) + timedelta(seconds=120)
     if "expires_at" in event:

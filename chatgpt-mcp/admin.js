@@ -5,8 +5,9 @@
   if (location.hash) history.replaceState(null, '', location.pathname);
   const $ = id => document.getElementById(id);
   const s = {token: '', connected: false, project: '', job: '', offset: 0, revision: 0, dirty: false,
-    epoch: 0, jobEpoch: 0, following: true, timer: null, busy: false, saving: false,
-    memoryReady: false, memoryLoading: false, pendingRefresh: false, pendingGit: false, projects: [],
+    epoch: 0, jobEpoch: 0, following: true, fastTimer: null, detailTimer: null,
+    fastBusy: false, detailBusy: false, saving: false, memoryReady: false, memoryLoading: false,
+    pendingFast: false, pendingDetail: false, pendingProgress: false, pendingGit: false, projects: [],
     progressRevision: 0, progressDirty: false, progressReady: false, progressLoading: false,
     progressSaving: false, displayedRevision: -1, gitTime: 0, file: '', diffEpoch: 0, handoffBusy: false,
     mapJobs: [], mapEvents: [], mapRecords: []};
@@ -93,7 +94,7 @@
     s.job = id; s.jobEpoch++; s.offset = 0;
     $('log').textContent = ''; $('log-status').textContent = '출력 불러오는 중…';
     document.querySelectorAll('.job').forEach(el => el.classList.toggle('selected', el.dataset.id === id));
-    if (refreshNow) refresh();
+    if (refreshNow) refreshDetails(false, false);
   }
   function jobButton(job) {
     const button = document.createElement('button'); button.type = 'button';
@@ -106,7 +107,8 @@
     return button;
   }
   function renderJobs(data) {
-    if (!s.job && data.jobs.length) selectJob(data.jobs[0].job_id, false);
+    const selectedDefault = !s.job && data.jobs.length;
+    if (selectedDefault) selectJob(data.jobs[0].job_id, false);
     $('jobs').replaceChildren(); $('job-count').textContent = `(${data.jobs.length})`;
     if (!data.jobs.length) $('jobs').textContent = '저장된 실행 작업이 없습니다.';
     for (const job of data.jobs) $('jobs').append(jobButton(job));
@@ -120,6 +122,7 @@
     const checks = data.jobs.filter(job => /(^|[\s:/._-])(test|tests|typecheck|type-check|lint|build|e2e|check|검사|테스트|빌드)([\s:/._-]|$)/i.test(`${job.preset || ''} ${job.label || ''}`)).slice(0, 20);
     if (!checks.length) $('checks').textContent = '저장된 빌드·테스트·검사 실행이 없습니다. 다른 명령은 전체 실행 작업에서 확인하세요.';
     for (const job of checks) $('checks').append(jobButton(job));
+    if (selectedDefault) refreshDetails(false, false);
   }
   function renderActivity(data) {
     $('activity').replaceChildren();
@@ -172,21 +175,29 @@
     }
     if (s.file) loadDiff();
   }
-  function schedule() {
-    clearTimeout(s.timer);
-    if (s.following && s.connected && s.project) s.timer = setTimeout(() => refresh(), 2000);
+  function pollingEnabled() {
+    return s.following && s.connected && s.project && !document.hidden;
   }
-  async function refresh(forceGit = false) {
+  function clearPollingTimers() {
+    clearTimeout(s.fastTimer); clearTimeout(s.detailTimer);
+  }
+  function scheduleFast() {
+    clearTimeout(s.fastTimer);
+    if (pollingEnabled()) s.fastTimer = setTimeout(refreshFast, 1000);
+  }
+  function scheduleDetails() {
+    clearTimeout(s.detailTimer);
+    if (pollingEnabled()) s.detailTimer = setTimeout(refreshDetails, 5000);
+  }
+  async function refreshFast() {
     if (!s.connected || !s.project) return;
-    if (s.busy) { s.pendingRefresh = true; s.pendingGit ||= forceGit; return; }
-    clearTimeout(s.timer); s.busy = true;
-    const epoch = s.epoch, project = s.project, readGit = forceGit || Date.now() - s.gitTime >= 10000;
+    if (s.fastBusy) { s.pendingFast = true; return; }
+    clearTimeout(s.fastTimer); s.fastBusy = true;
+    const epoch = s.epoch, project = s.project;
     const parts = [
       {path: '/api/jobs', render: renderJobs, error: 'checks', extraError: 'observed-status'},
-      {path: '/api/activity', render: renderActivity, error: 'activity'},
-      {path: '/api/progress', render: progressDisplay, error: 'work-updated'}
+      {path: '/api/activity', render: renderActivity, error: 'activity'}
     ];
-    if (readGit) { s.gitTime = Date.now(); parts.push({path: '/api/changes', render: renderChanges, error: 'git-status'}); }
     try {
       const results = await Promise.allSettled(parts.map(part => api(`${part.path}?${query(project)}`)));
       if (epoch !== s.epoch) return;
@@ -204,26 +215,57 @@
       }
       workMap.update({project, jobs: s.mapJobs, events: s.mapEvents, records: s.mapRecords, following: s.following,
         error: jobs.status === 'rejected' || activity.status === 'rejected' ? '일부 실행·호출 기록을 확인하지 못했습니다.' : ''});
-      if (s.job) {
-        const jobEpoch = s.jobEpoch, id = s.job;
-        try {
-          const result = await api(`/api/log?${query(project)}&job_id=${encodeURIComponent(id)}&offset=${s.offset}`);
-          if (epoch !== s.epoch || jobEpoch !== s.jobEpoch) return;
+      if (epoch === s.epoch) $('updated').textContent = `갱신 ${new Date().toLocaleTimeString()}`;
+    } finally {
+      s.fastBusy = false;
+      if (s.pendingFast) { s.pendingFast = false; queueMicrotask(refreshFast); }
+      else scheduleFast();
+    }
+  }
+  async function refreshDetails(forceGit = false, includeProgress = true) {
+    if (!s.connected || !s.project) return;
+    if (s.detailBusy) {
+      s.pendingDetail = true; s.pendingGit ||= forceGit; s.pendingProgress ||= includeProgress; return;
+    }
+    clearTimeout(s.detailTimer); s.detailBusy = true;
+    const epoch = s.epoch, project = s.project, jobEpoch = s.jobEpoch, id = s.job;
+    const readGit = forceGit || Date.now() - s.gitTime >= 10000;
+    const parts = [];
+    if (includeProgress && !s.progressLoading) {
+      parts.push({path: '/api/progress', render: progressDisplay, error: 'work-updated'});
+    }
+    if (readGit) {
+      s.gitTime = Date.now(); parts.push({path: '/api/changes', render: renderChanges, error: 'git-status'});
+    }
+    if (id) {
+      parts.push({path: `/api/log?${query(project)}&job_id=${encodeURIComponent(id)}&offset=${s.offset}`,
+        render: result => {
+          if (jobEpoch !== s.jobEpoch) return;
           s.offset = result.next_offset;
           $('log').textContent = ($('log').textContent + result.text).slice(-1024 * 1024);
           if (s.following) $('log').scrollTop = $('log').scrollHeight;
           $('log-status').textContent = `${states[result.state] || result.state} · ${s.offset} bytes${result.has_more ? ' · 남은 출력 불러오는 중' : ''}${result.log_truncated ? ' · 저장 한도로 출력이 잘렸습니다' : ''}`;
-        } catch (error) { if (epoch === s.epoch && jobEpoch === s.jobEpoch) $('log-status').textContent = error.message; }
-      }
-      if (epoch === s.epoch) $('updated').textContent = `갱신 ${new Date().toLocaleTimeString()}`;
+        }, error: 'log-status', valid: () => jobEpoch === s.jobEpoch});
+    }
+    try {
+      const results = await Promise.allSettled(parts.map(part => api(part.path.includes('?') ? part.path : `${part.path}?${query(project)}`)));
+      if (epoch !== s.epoch) return;
+      results.forEach((result, index) => {
+        const part = parts[index];
+        if (part.valid && !part.valid()) return;
+        if (result.status === 'fulfilled') part.render(result.value);
+        else $(part.error).textContent = result.reason.message;
+      });
     } finally {
-      s.busy = false;
-      if (s.pendingRefresh) {
-        const git = s.pendingGit; s.pendingRefresh = false; s.pendingGit = false;
-        queueMicrotask(() => refresh(git));
-      } else schedule();
+      s.detailBusy = false;
+      if (s.pendingDetail) {
+        const git = s.pendingGit, progress = s.pendingProgress;
+        s.pendingDetail = false; s.pendingGit = false; s.pendingProgress = false;
+        queueMicrotask(() => refreshDetails(git, progress));
+      } else scheduleDetails();
     }
   }
+  function refresh(forceGit = false) { refreshFast(); refreshDetails(forceGit); }
   async function switchProject(project) {
     s.project = project; s.epoch++; s.jobEpoch++; s.job = ''; s.offset = 0; s.gitTime = 0;
     s.dirty = false; s.memoryReady = false; s.memoryLoading = true; s.revision = 0;
@@ -250,7 +292,7 @@
       (async () => { try { await loadProgress(epoch); } catch (error) { if (epoch === s.epoch) $('work-updated').textContent = error.message; }
         finally { if (epoch === s.epoch) { s.progressLoading = false; controls(); } } })()
     ];
-    refresh(true); await Promise.all(loads);
+    refreshFast(); refreshDetails(true, false); await Promise.all(loads);
   }
   async function login(token) {
     s.token = token; s.epoch++; const epoch = s.epoch;
@@ -366,12 +408,12 @@
   $('follow').addEventListener('click', () => {
     s.following = !s.following; $('follow').textContent = s.following ? '자동 갱신 일시정지' : '자동 갱신 재개';
     workMap.setLive(s.following);
-    if (s.following) refresh(); else clearTimeout(s.timer);
+    if (s.following && !document.hidden) refresh(); else clearPollingTimers();
   });
   $('refresh').addEventListener('click', () => refresh(true));
   $('logout').addEventListener('click', async () => {
     if (s.saving || s.progressSaving || ((s.dirty || s.progressDirty) && !confirm('저장하지 않은 내용을 버리고 연결을 해제할까요?'))) return;
-    s.epoch++; s.jobEpoch++; s.diffEpoch++; s.connected = false; clearTimeout(s.timer);
+    s.epoch++; s.jobEpoch++; s.diffEpoch++; s.connected = false; clearPollingTimers();
     s.mapJobs = []; s.mapEvents = []; s.mapRecords = [];
     workMap.clear();
     $('dashboard').inert = true; controls();
@@ -380,13 +422,17 @@
       s.connected = true; s.memoryLoading = false; s.progressLoading = false; s.handoffBusy = false;
       if (!s.memoryReady) $('memory-status').textContent = '저장본 다시 읽기를 눌러 메모를 불러오세요.';
       if (!s.progressReady) $('progress-status').textContent = '저장본 다시 읽기를 눌러 작업 보고를 불러오세요.';
-      notice(error.message); schedule(); return;
+      notice(error.message); scheduleFast(); scheduleDetails(); return;
     }
     finally { $('dashboard').inert = false; controls(); }
     s.token = ''; s.project = ''; s.dirty = false; s.progressDirty = false;
     $('dashboard').hidden = true; $('login').hidden = false;
     $('memory').value = ''; $('handoff').value = ''; $('log').textContent = '';
     $('connection').textContent = '연결 해제됨'; notice();
+  });
+  document.addEventListener('visibilitychange', () => {
+    clearPollingTimers();
+    if (!document.hidden && s.following) refresh();
   });
   window.addEventListener('beforeunload', event => { if (s.dirty || s.progressDirty) { event.preventDefault(); event.returnValue = ''; } });
   login(initialToken); initialToken = '';

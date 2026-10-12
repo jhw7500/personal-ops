@@ -102,6 +102,34 @@ class WorkEventTest(unittest.TestCase):
         self.assertTrue({"prompt", "args", "results", "reasoning", "env", "tokens"}.isdisjoint(saved))
         self.assertNotIn("secret", json.dumps(saved))
 
+    def test_configuration_and_estimated_usage_survive_persistence(self):
+        saved = self.store.record_work_event("alpha", {
+            **BASE_EVENT, "model": "codex-model", "model_source": "configuration",
+            "reasoning_effort": "high", "usage": {"total_tokens": 42},
+            "usage_scope": "session", "usage_estimated": True,
+        }, provenance="observed")
+        self.assertEqual(saved["model_source"], "configuration")
+        self.assertIs(saved["usage_estimated"], True)
+        self.assertEqual(self.store.list_work_events("alpha")["records"][0], saved)
+
+    def test_metadata_annotations_require_valid_values_and_attached_metadata(self):
+        for fields in ({"model_source": "configuration"},
+                       {"model": "codex-model", "model_source": "inferred"},
+                       {"reasoning_effort_source": "configuration"},
+                       {"reasoning_effort": "high", "reasoning_effort_source": "inferred"},
+                       {"usage_estimated": True},
+                       {"usage": {"total_tokens": 2}, "usage_scope": "session", "usage_estimated": 1}):
+            with self.subTest(fields=fields):
+                with self.assertRaisesRegex(ValueError, "^Invalid work event$"):
+                    sanitize_work_event("alpha", {**BASE_EVENT, **fields})
+
+    def test_effort_configuration_source_does_not_require_a_model(self):
+        saved = self.store.record_work_event("alpha", {
+            **BASE_EVENT, "reasoning_effort": "high", "reasoning_effort_source": "configuration",
+        }, provenance="observed")
+        self.assertNotIn("model", saved)
+        self.assertEqual(saved["reasoning_effort_source"], "configuration")
+
     def test_labels_require_utf8_and_batch_rejects_before_persistence(self):
         unicode_event = {
             **BASE_EVENT,

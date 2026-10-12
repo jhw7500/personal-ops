@@ -62,8 +62,9 @@ MCP 요청 반환과 명령 성공을 구별하며 명령 성공은 `succeeded` 
 직접 관측하는 호스트 수집기는 로컬 `ProjectState.record_work_events(..., provenance='observed')`를 사용한다.
 조회는 기존 `/api/activity`의 `records`에 최근 200개를 추가하므로 기존 `events` 호출자는 호환된다.
 
-Codex CLI·Claude CLI의 후크 수집기는 아직 활성화하지 않았다. 다음 수집기는 도구 목록이나 모델 이름으로
-인물을 추측하지 않고, 실제 세션·에이전트 식별자를 아래 `records` 형식으로 전달하면 된다.
+Codex CLI는 [읽기 전용 세션 관측기와 후크 수집기](../docs/codex-cli-observer.md)를 제공한다.
+후크는 Codex의 신뢰 절차가 필요하며 Claude CLI 수집기는 아직 추가하지 않았다.
+수집기는 도구 목록이나 모델 이름으로 인물을 추측하지 않고 실제 세션·에이전트 식별자를 전달한다.
 같은 로컬 에이전트 ID를 여러 세션에서 재사용한다면 `actor_id`에 세션 ID도 포함한다.
 
 ```js
@@ -105,6 +106,9 @@ canceled, interrupted, unknown. 호출 반환은 `returned`; 명령 성공은 `s
 클럭 오차는 최대 5분 미래까지 허용하되 미래 시각으로 유효 기간을 연장할 수 없다.
 
 선택적인 모델 메타데이터는 `model`, `reasoning_effort`, `usage`, `usage_scope`다.
+`model_source`와 `reasoning_effort_source`는 각각 해당 값이 있을 때 `configuration` 또는
+`event`를 지정한다. 설정값은 화면에서도 명시한다. 제공된 사용량에 `usage_estimated: true`를
+붙이면 추정값으로 표시한다. 원본 카운터 없이 이 플래그만 보낼 수는 없다.
 `usage`에는 제공된 `input_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens`만 포함한다.
 집계 범위는 `request`, `turn`, `session`, `task` 중 하나를 반드시 지정한다. 누락과 0은 구분하며
 별도 요청의 토큰을 합산하거나 추론 토큰을 출력 토큰에 더하지 않는다. 객체를 선택하면 각 값의
@@ -126,7 +130,8 @@ Codex 후크를 추가할 때는 사용자가 [`/hooks`에서 정의를 검토�
 ```text
 Tunnel jobs/events -> adapter ---------------+
 Other MCP reports -> tool / authenticated API +-> private records -> snapshot -> RPG UI
-Codex / Claude    -> adapter (future) --------+
+Codex CLI         -> read-only / hooks ------+
+Claude CLI        -> adapter (future) -------+
 ```
 
 ```bash
@@ -138,3 +143,18 @@ JavaScript 검증에는 Node.js 24.12 이상을 사용한다.
 
 배포는 `chatgpt-mcp/install-runtime.py`가 정해진 JS/CSS 다섯 파일을 비공개 스냅샷에 복사한다.
 작업 가능한 저장소 경로에서 라이브 UI를 직접 실행하지 않는다.
+
+## 빠른 갱신과 상태 변화 표시
+
+작업실의 jobs/activity 조회는 화면이 열려 있을 때 약 1초 간격으로 진행한다.
+작업 보고·로그는 별도 5초 주기, Git 조회는 최소 10초 주기로 유지해 느린 상세 조회가
+지도 갱신을 막지 않는다. 같은 루프의 요청은 겹치지 않고, 관측 정지와 숨겨진 탭에서는
+자동 조회를 멈춘다. 복귀 시 최신 상태를 읽으며 다른 프로젝트의 늦은 응답은 버린다.
+
+새 작업·상태·작업 동작의 변화는 최대 세 개의 최근 변화 버튼과 해당 방의 짧은 강조로
+표시한다. 첫 화면의 과거 기록, 같은 상태의 하트비트, 삭제된 기록은 새 작업/완료 알림이 아니다.
+화면 조회 시각과 원본 작업 시각을 구분한다. 동일 조회는 선택한 상세 DOM과 키보드 초점을 유지한다.
+
+실제 작업 중인 인물에는 후광과 작은 작업 효과, 활성 방에는 표시등을 붙인다.
+관측 지연·관측 정지·움직임 정지·화면 비활성·동작 감소 설정에서는 장식 애니메이션을 멈춘다.
+표시 효과가 작업 상태를 바꾸지는 않으며, 재생은 계속 과거 기록으로 표시한다.

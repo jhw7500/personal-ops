@@ -339,6 +339,89 @@ class AdminBrowserTest(unittest.TestCase):
         expect(self.page.locator('#wd-detail')).to_contain_text('task:chat-session:agent-1:turn-1')
         self.assertEqual(self.page.evaluate('window.pwned'), None)
 
+    def test_native_mcp_return_reaches_recent_changes_with_readable_tool_title(self):
+        self.store.record_activity('alpha', 'git_status', 'started', 'live-git')
+        self.store.record_activity('alpha', 'git_status', 'completed', 'live-git')
+        change = self.page.locator('#wd-live-changes .wd-change').filter(has_text='Git 상태')
+        expect(change.first).to_contain_text('요청 반환')
+        expect(change.first).to_contain_text('직접 관측')
+        expect(self.page.locator('.wd-room-review')).to_have_attribute('data-signal', 'returned')
+
+    def test_live_changes_highlight_real_transitions_without_repeating_heartbeats(self):
+        self.page.evaluate("""() => {
+            const root = document.createElement('section'); root.id = 'live-fixture'; document.body.append(root);
+            window.liveFixture = window.WorkDashboard.create(root);
+            window.liveFixture.update({project:'alpha', records:[]});
+            window.liveRecord = {schema_version:1, project:'alpha', source_id:'codex-local', source_kind:'codex-cli',
+              actor_id:'hero', actor_kind:'agent', actor_label:'Codex', task_id:'call-1', task_kind:'call',
+              task_label:'코드 작성', action:'code', state:'started', time:new Date().toISOString(), provenance:'observed'};
+            window.liveFixture.update({project:'alpha', records:[window.liveRecord]});
+        }""")
+        changes = self.page.locator('#live-fixture .wd-change')
+        expect(changes).to_have_count(1)
+        expect(changes.first).to_contain_text('코드 작성')
+        expect(changes.first).to_contain_text('시작 기록')
+        expect(self.page.locator('#live-fixture .wd-room-coding')).to_have_attribute('data-active-count', '1')
+        expect(self.page.locator('#live-fixture #wd-live-status')).to_have_attribute('data-state', 'live')
+        self.page.evaluate("""() => {
+            window.liveFixture.update({project:'alpha', records:[{...window.liveRecord, time:new Date().toISOString(), model:'config-change'}]});
+        }""")
+        expect(changes).to_have_count(1)
+        self.page.evaluate("""() => {
+            window.liveFixture.update({project:'alpha', records:[{...window.liveRecord, state:'returned',
+              task_label:'<img src=x onerror="window.pwned=1">', time:new Date().toISOString()}]});
+        }""")
+        expect(changes).to_have_count(2)
+        expect(changes.first).to_contain_text('요청 반환')
+        self.assertEqual(changes.locator('img').count(), 0)
+        self.assertIsNone(self.page.evaluate('window.pwned'))
+        expect(self.page.locator('#live-fixture .wd-room-done')).to_have_attribute('data-signal', 'returned')
+        expect(self.page.locator('#live-fixture .wd-actor')).to_have_count(1)
+        self.page.evaluate('window.liveFixture.destroy()')
+
+    def test_identical_updates_keep_inspector_focus_and_reduced_motion_has_no_decorative_animation(self):
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.evaluate("""() => {
+            const root = document.createElement('section'); root.id = 'focus-fixture'; document.body.append(root);
+            window.focusFixture = window.WorkDashboard.create(root);
+            const common = {schema_version:1, project:'alpha', source_id:'codex-local', source_kind:'codex-cli',
+              actor_id:'hero', actor_kind:'agent', actor_label:'Codex', task_kind:'call', action:'code',
+              provenance:'observed', time:new Date().toISOString()};
+            window.focusData = {project:'alpha', records:[{...common, task_id:'call-1', task_label:'코드 작성', state:'started'},
+              {...common, task_id:'call-2', task_label:'파일 조회', action:'read', state:'returned'}]};
+            window.focusFixture.update(window.focusData);
+        }""")
+        actor = self.page.locator('#focus-fixture .wd-actor')
+        actor.click()
+        button = self.page.locator('#focus-fixture .wd-detail-item[data-task-id]').first
+        button.evaluate('(element) => {element.focus(); window.focusedDetail = element;}')
+        self.page.evaluate('window.focusFixture.update(window.focusData)')
+        self.assertTrue(self.page.evaluate('window.focusedDetail.isConnected && document.activeElement === window.focusedDetail'))
+        expect(actor).to_have_attribute('data-working', 'true')
+        self.assertEqual(self.page.evaluate("document.querySelector('#focus-fixture').getAnimations({subtree:true}).filter(a=>a.playState==='running').length"), 0)
+        self.page.evaluate('window.focusFixture.setLive(false)')
+        expect(self.page.locator('#focus-fixture #wd-live-status')).to_have_attribute('data-state', 'paused')
+        self.page.evaluate('window.focusFixture.destroy()')
+
+    def test_configured_model_and_estimated_usage_have_visible_qualifiers(self):
+        self.page.evaluate("""() => {
+            const root = document.createElement('section'); root.id = 'config-fixture'; document.body.append(root);
+            window.configFixture = window.WorkDashboard.create(root);
+            window.configFixture.update({project:'alpha', records:[{schema_version:1, project:'alpha',
+              source_id:'codex-local', source_kind:'codex-cli', actor_id:'session-1', actor_kind:'agent',
+              actor_label:'Codex', task_id:'session-activity', task_kind:'agent', task_label:'세션 실행 중',
+              action:'execute', state:'running', time:new Date().toISOString(), provenance:'observed',
+              model:'codex-model', model_source:'configuration', reasoning_effort:'high',
+              usage:{total_tokens:42}, usage_scope:'session', usage_estimated:true}]});
+        }""")
+        self.page.locator('#config-fixture .wd-actor').click()
+        fields = self.page.locator('#config-fixture .wd-fields')
+        expect(fields).to_contain_text('codex-model · 설정값')
+        expect(fields).to_contain_text('high · 설정값')
+        expect(fields).to_contain_text('세션 단위 · 추정')
+        expect(fields).to_contain_text('합계 42')
+        self.page.evaluate('window.configFixture.destroy()')
+
     def test_absent_metadata_and_expired_reports_do_not_claim_reasoning_or_live_work(self):
         self.page.evaluate("""() => {
             const root = document.createElement('section'); root.id = 'expiry-fixture'; document.body.append(root);

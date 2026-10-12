@@ -30,6 +30,9 @@ Browser <-> SSH local forwarding <-> admin HTTP (127.0.0.1:8765)
 
 ## 로컬 MCP
 
+Codex CLI의 세션 상태·모델 설정·신뢰된 도구 후크를 작업실에 연결하는 별도 로컬
+수집기도 제공한다. 설치·수집 범위·신뢰 절차는 [Codex 수집기](../docs/codex-cli-observer.md)를 참고한다.
+
 ```bash
 python3 chatgpt-mcp/server.py
 python3 chatgpt-mcp/server.py --config /absolute/path/projects.json

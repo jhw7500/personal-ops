@@ -17,8 +17,10 @@
     list_execution_profiles: '명령 조회', prepare_git_operation: 'Git 계획',
     execute_git_operation: 'Git 실행', get_git_operation: 'Git 결과'};
   const active = new Set(['started', 'running', 'canceling']);
+  const sessionTitles = {'Codex session active': '세션 활동 중', 'Codex session waiting': '세션 대기',
+    'Codex session inactive': '활동 확인 대기'};
   const titleFor = actor => toolTitles[actor.tool] || (actor.kind === 'job' && actor.label === '직접 명령 실행'
-    ? actionTitles[actor.action] || actor.label : actor.label);
+    ? actionTitles[actor.action] || actor.label : sessionTitles[actor.label] || actor.label);
   const kindFor = item => ({call: item.sourceKind === 'mcp' ? 'MCP 호출' : '도구 호출', job: '명령 실행', agent: '에이전트 작업',
     mcp: 'MCP 서버', executor: '명령 실행기'}[item.kind] || '객체');
   const stateFor = item => item.kind === 'agent' && item.state === 'succeeded' ? '작업 완료' : states[item.state];
@@ -31,14 +33,14 @@
   const evidenceTitle = value => value === 'observed' ? '직접 관측' : '보고됨';
   const usageScopes = {request: '요청 단위', turn: '턴 단위', session: '세션 단위', task: '작업 단위'};
   function metadataValue(field) {
-    return field ? `${field.value} · ${evidenceTitle(field.provenance)} · ${localTime(field.time)}` : '미수신';
+    return field ? `${field.value}${field.source === 'configuration' ? ' · 설정값' : ''} · ${evidenceTitle(field.provenance)} · ${localTime(field.time)}` : '미수신';
   }
   function usageValue(field) {
     if (!field) return '미수신';
     const labels = {input_tokens: '입력', output_tokens: '출력', reasoning_tokens: '추론', total_tokens: '합계'};
     const values = Object.entries(labels).filter(([key]) => Object.hasOwn(field.value, key))
       .map(([key, title]) => `${title} ${field.value[key].toLocaleString()}`);
-    return `${usageScopes[field.scope]} · ${values.join(' · ')} · ${evidenceTitle(field.provenance)} · ${localTime(field.time)}`;
+    return `${usageScopes[field.scope]}${field.estimated ? ' · 추정' : ''} · ${values.join(' · ')} · ${evidenceTitle(field.provenance)} · ${localTime(field.time)}`;
   }
 
   function element(tag, className, text) {
@@ -57,6 +59,9 @@
     let motion = true, following = true, stale = false, observed = false, destroyed = false;
     let frame = 0, idleTimer = 0, lastFrame = 0, clock = 0, zoom = 1, zoomMode = 'auto', seenTime = -Infinity;
     let activeCount = 0, movingScene = false;
+    let previousSnapshot = null, lastQueryAt = 0, detailSignature = '', changeSignature = '';
+    let recentChanges = [];
+    const effects = new Set();
     let cameraTarget = '';
     let displayRoomValue = null, selectedMotionNote = null;
     const seen = new Set(), replayable = new Set(), tokens = new Map(), taskTokens = new Map(), roomNodes = new Map(), registry = new Map();
@@ -66,16 +71,22 @@
     const title = element('div');
     title.append(element('p', 'eyebrow', 'WORK GUILD'), element('h2', '', '업무 작업실'));
     const project = element('span', 'badge'); project.id = 'wd-project';
+    const liveStatus = element('span', 'wd-live-status'); liveStatus.id = 'wd-live-status';
+    liveStatus.title = '화면의 상태 조회 시각입니다. 각 작업의 관측 시각은 기록에서 확인할 수 있습니다.';
     const motionButton = element('button', '', '움직임 일시정지'); motionButton.id = 'wd-motion';
-    heading.append(title, project, motionButton);
+    heading.append(title, project, liveStatus, motionButton);
     const status = element('p', 'muted'); status.id = 'wd-status'; status.setAttribute('role', 'status');
     const pipeline = element('div', 'wd-pipeline'); pipeline.id = 'wd-pipeline';
     const pipelineValues = [];
-    for (const [name, initial] of [['ChatGPT', '모델·추론 상태 미수신'], ['Tunnel', '연결 상태 미수신'],
+    for (const [name, initial] of [['Agent / model', '모델·추론 상태 미수신'], ['Tunnel', '연결 상태 미수신'],
       ['MCP / CLI', '수집 객체 없음'], ['Work items', '일감 기록 없음']]) {
       const node = element('div', 'wd-node'), value = element('small', '', initial);
       node.append(element('strong', '', name), value); pipeline.append(node); pipelineValues.push(value);
     }
+    const changesPanel = element('div', 'wd-changes');
+    const changesTitle = element('strong', 'wd-changes-title', '최근 변화');
+    const changesList = element('div', 'wd-changes-list'); changesList.id = 'wd-live-changes';
+    changesPanel.append(changesTitle, changesList);
     const toolbar = element('div', 'wd-toolbar');
     const observation = element('span', 'wd-observation'); observation.id = 'wd-observation';
     const replayButton = element('button', '', '최근 활동 재생'); replayButton.id = 'wd-replay';
@@ -101,13 +112,14 @@
       const node = element('section', 'wd-room wd-room-' + room.id); node.dataset.room = room.id;
       Object.assign(node.style, {left: room.x + 'px', top: room.y + 'px', width: room.width + 'px', height: room.height + 'px'});
       const top = element('div', 'wd-room-heading');
+      const lamp = element('span', 'wd-room-lamp'); lamp.setAttribute('aria-hidden', 'true');
       const count = element('button', 'wd-room-count', '0'); count.setAttribute('aria-label', name + '의 표시 기록 보기');
       count.addEventListener('click', () => { roomFilter = room.id; selected = ''; selectedTask = ''; showDetail(); });
-      top.append(element('h3', '', name), count);
+      top.append(element('h3', '', name), lamp, count);
       const more = element('button', 'wd-more'); more.hidden = true;
       more.addEventListener('click', () => { roomFilter = room.id; selected = ''; selectedTask = ''; showDetail(); });
       node.append(top, element('p', 'wd-room-description', description), more);
-      floor.append(node); roomNodes.set(room.id, {count, more});
+      floor.append(node); roomNodes.set(room.id, {node, count, more});
     }
     stage.append(mapCanvas, floor); sizer.append(stage); camera.append(sizer);
     const inspector = element('aside', 'wd-inspector'); inspector.id = 'wd-detail';
@@ -115,7 +127,7 @@
     const hint = element('p', 'muted wd-hint', '지도를 끌거나 스크롤해 둘러보세요. 인물과 방의 개수를 누르면 기록을 확인할 수 있습니다.');
     const legend = element('p', 'muted wd-legend', '청록 가방 · MCP 서버   황금 가방 · 명령 실행기   보라 가방 · 에이전트   문서 · 완료 일감');
     const note = element('p', 'muted wd-note', '인물은 고정된 작업 객체이며 완료 일감은 보관실에 남습니다. 직접 관측과 채팅 보고를 구분하며, 재생은 과거 기록입니다. 모델·추론 수준·토큰은 제공된 값만 표시합니다. 추론 동작에는 명시적인 시작·종료 신호가 필요하며 ChatGPT 내부 추론은 자동 수집되지 않습니다.');
-    root.replaceChildren(heading, status, pipeline, toolbar, layout, hint, legend, note);
+    root.replaceChildren(heading, status, pipeline, changesPanel, toolbar, layout, hint, legend, note);
 
     const canMove = () => motion && following && !stale && !reducedMotion.matches && !document.hidden;
     function setZoom(value, mode = 'manual') {
@@ -168,6 +180,9 @@
     camera.addEventListener('pointerup', stopDrag); camera.addEventListener('pointercancel', stopDrag);
 
     function showDetail() {
+      const signature = JSON.stringify([selected, selectedTask, roomFilter, actors, tasks]);
+      if (signature === detailSignature) return;
+      detailSignature = signature;
       inspector.replaceChildren(); displayRoomValue = null; selectedMotionNote = null;
       const actor = actors.find(row => row.id === selected);
       const work = tasks.find(row => row.id === (selectedTask || actor?.taskId || actor?.lastTaskId));
@@ -198,7 +213,7 @@
       if (work?.parentTaskId) entries.push(['상위 일감', work.parentTaskId]);
       const telemetry = (selectedTask ? work?.telemetry : actor?.telemetry) || work?.telemetry || {};
       if (actor?.kind === 'agent' || work?.kind === 'agent' || Object.keys(telemetry).length) {
-        entries.splice(actor ? 1 : 0, 0, ['모델', metadataValue(telemetry.model)], ['적용 추론 수준', metadataValue(telemetry.reasoningEffort)],
+        entries.splice(actor ? 1 : 0, 0, ['모델', metadataValue(telemetry.model)], ['추론 수준', metadataValue(telemetry.reasoningEffort)],
           ['토큰', usageValue(telemetry.usage)]);
       }
       for (const [key, value] of entries) {
@@ -226,6 +241,7 @@
       selected = id; selectedTask = ''; roomFilter = '';
       for (const [key, token] of tokens) token.button.classList.toggle('selected', key === id);
       showDetail();
+      showModel();
       centerOnRecord(true);
     }
 
@@ -234,10 +250,65 @@
       if (!work) return;
       selected = work.actorId; selectedTask = id; roomFilter = '';
       for (const [key, token] of tokens) token.button.classList.toggle('selected', key === selected);
-      showDetail(); centerOnRecord(true);
+      showDetail(); showModel(); centerOnRecord(true);
+    }
+
+    function showModel() {
+      const sourceTitles = {'chatgpt': 'ChatGPT', 'codex-cli': 'Codex CLI', 'claude-cli': 'Claude CLI'};
+      const chosen = actors.find(actor => actor.id === selected && actor.kind === 'agent')
+        || actors.filter(actor => actor.kind === 'agent' && Object.keys(actor.telemetry || {}).length)
+          .sort((a, b) => Number(!active.has(a.state)) - Number(!active.has(b.state))
+            || Date.parse(b.time) - Date.parse(a.time))[0];
+      if (!chosen) { pipelineValues[0].textContent = '모델·추론 상태 미수신'; return; }
+      const telemetry = chosen.telemetry || {};
+      if (!telemetry.model && !telemetry.reasoningEffort) {
+        pipelineValues[0].textContent = `${sourceTitles[chosen.sourceKind] || chosen.sourceKind} · 모델·추론 상태 미수신`;
+        return;
+      }
+      const parts = [sourceTitles[chosen.sourceKind] || chosen.sourceKind,
+        telemetry.model ? `${telemetry.model.value}${telemetry.model.source === 'configuration' ? ' · 설정값' : ''} · ${evidenceTitle(telemetry.model.provenance)}` : '모델 미수신',
+        telemetry.reasoningEffort ? `${telemetry.reasoningEffort.value}${telemetry.reasoningEffort.source === 'configuration' ? ' · 설정값' : ''} · ${evidenceTitle(telemetry.reasoningEffort.provenance)}` : '추론 수준 미수신'];
+      pipelineValues[0].textContent = parts.join(' · ');
+    }
+
+    function showChanges() {
+      const available = new Set(tasks.map(task => task.id));
+      const signature = JSON.stringify(recentChanges.map(item => [item, available.has(item.id)]));
+      if (signature === changeSignature) return;
+      changeSignature = signature; changesList.replaceChildren();
+      if (!recentChanges.length) {
+        changesList.append(element('span', 'wd-changes-empty', '새 작업의 시작·반환·상태 변화를 기다리는 중'));
+        return;
+      }
+      for (const item of recentChanges) {
+        const button = element('button', 'wd-change');
+        button.dataset.state = item.state; button.dataset.taskId = item.id;
+        button.disabled = !available.has(item.id);
+        button.title = `기록 시각 ${localTime(item.time)} · 화면 변화 확인 ${localTime(item.noticedAt)}`;
+        button.append(element('span', 'wd-change-action', taskGlyphs[item.action] || '[]'),
+          element('span', 'wd-change-label', `${titleFor(item)} · ${stateFor(item)}`),
+          element('small', '', `${evidenceTitle(item.provenance)} · 확인 ${new Date(item.noticedAt).toLocaleTimeString()}`));
+        button.addEventListener('click', () => selectWork(item.id)); changesList.append(button);
+      }
+    }
+
+    function signalRoom(roomId, item) {
+      const room = roomNodes.get(roomId); if (!room) return;
+      room.node.dataset.signal = item.state;
+      if (!canMove() || typeof room.node.animate !== 'function') return;
+      const color = ['failed', 'timed_out', 'canceled', 'interrupted', 'unknown'].includes(item.state)
+        ? '#e99a78' : item.state === 'returned' || item.state === 'succeeded' ? '#b9d794' : '#f1ce80';
+      const effect = room.node.animate([{boxShadow: `inset 0 0 0 3px ${color}, inset 0 0 26px ${color}88`},
+        {boxShadow: 'inset 0 0 0 0 transparent, inset 0 0 0 transparent'}], {duration: 1400, easing: 'ease-out'});
+      effects.add(effect); effect.finished.then(() => effects.delete(effect), () => effects.delete(effect));
     }
 
     function paint() {
+      const age = lastQueryAt ? Math.max(0, Math.floor((Date.now() - lastQueryAt) / 1000)) : 0;
+      const phase = stale ? 'stale' : !following ? 'paused' : document.hidden ? 'hidden' : !lastQueryAt ? 'loading' : age > 10 ? 'delayed' : 'live';
+      liveStatus.dataset.state = phase;
+      liveStatus.textContent = phase === 'live' ? `화면 갱신 · ${age < 2 ? '방금' : age + '초 전'}`
+        : {stale: '관측 지연', paused: '관측 일시정지', hidden: '화면 비활성', loading: '기록 확인 중', delayed: `마지막 갱신 ${age}초 전`}[phase];
       const positions = movement.snapshot();
       let replays = 0, moving = 0;
       for (const item of positions) {
@@ -298,7 +369,10 @@
       motionButton.textContent = motion ? '움직임 일시정지' : '움직임 재개';
       motionButton.setAttribute('aria-pressed', String(!motion));
       if (canMove() && tokens.size && !frame && !idleTimer) frame = requestAnimationFrame(animate);
-      else if (!canMove()) { cancelAnimationFrame(frame); clearTimeout(idleTimer); frame = 0; idleTimer = 0; lastFrame = 0; }
+      else if (!canMove()) {
+        cancelAnimationFrame(frame); clearTimeout(idleTimer); frame = 0; idleTimer = 0; lastFrame = 0;
+        for (const effect of effects) effect.cancel(); effects.clear();
+      }
       paint();
     }
     motionButton.addEventListener('click', () => { motion = !motion; motionState(); });
@@ -308,7 +382,8 @@
     });
     const mediaChanged = () => { if (reducedMotion.matches) movement.settle(); motionState(); };
     reducedMotion.addEventListener('change', mediaChanged);
-    document.addEventListener('visibilitychange', motionState);
+    const visibilityChanged = () => { if (!document.hidden) previousSnapshot = null; motionState(); };
+    document.addEventListener('visibilitychange', visibilityChanged);
 
     function update(input) {
       if (currentProject !== input.project) clear(input.project);
@@ -317,19 +392,26 @@
       for (const actor of actors) registry.set(actor.id, actor);
       activeCount = data.counts.active;
       following = input.following !== false; stale = Boolean(input.error); root.dataset.stale = String(stale);
+      if (!stale) {
+        lastQueryAt = Date.now();
+        if (following) for (const item of window.WorkDashboardModel.changes(previousSnapshot, data)) {
+          recentChanges.unshift(item); recentChanges = recentChanges.slice(0, 3);
+          signalRoom(item.sourceRoom, item);
+          if (item.room !== item.sourceRoom) signalRoom(item.room, item);
+        }
+        previousSnapshot = data;
+      }
       status.textContent = input.error ? `조회 실패 · 마지막 확인 기록 유지 · ${input.error}` :
         `${following ? '자동 관찰' : '자동 관찰 일시정지'} · 객체 ${data.entityCount} · 진행 ${data.counts.active} · 반환/성공 ${data.counts.done} · 확인 필요 ${data.counts.attention} · 미확인 ${data.counts.unknown} · ${data.counts.total}개 일감`;
       pipelineValues[2].textContent = actors.length ? [...new Set(actors.map(actor => actor.sourceKind))].join(' · ') + ' · 최근 ' + localTime(data.latestEventAt) : '수집 객체 없음';
-      const chat = actors.filter(actor => actor.sourceKind === 'chatgpt' && actor.telemetry?.model)
-        .sort((a, b) => Date.parse(b.telemetry.model.time) - Date.parse(a.telemetry.model.time))[0];
-      pipelineValues[0].textContent = chat ? `${chat.telemetry.model.value} · ${evidenceTitle(chat.telemetry.model.provenance)}${chat.telemetry.reasoningEffort ? ' · ' + chat.telemetry.reasoningEffort.value : ' · 추론 수준 미수신'}`
-        : '모델·추론 상태 미수신';
+      showModel(); showChanges();
       pipelineValues[3].textContent = `진행 ${data.counts.active} · 기록 ${data.counts.total}`;
       const visibleActors = [], visible = new Set(), visibleTasks = new Set(), autoReplay = [];
       replayable.clear();
-      for (const [id, {count, more}] of roomNodes) {
+      for (const [id, {node, count, more}] of roomNodes) {
         const members = actors.filter(actor => actor.room === id);
         const work = tasks.filter(task => task.room === id);
+        node.dataset.activeCount = String(members.filter(actor => active.has(actor.state)).length);
         count.textContent = String(work.length); count.title = `객체 ${members.length} · 일감 ${work.length}`;
         more.hidden = work.length <= 6 && members.length <= 6;
         more.textContent = [work.length > 6 ? `+${work.length - 6}개 일감` : '',
@@ -365,7 +447,9 @@
             const button = element('button', 'wd-actor'), avatar = element('canvas', 'wd-avatar');
             avatar.setAttribute('aria-hidden', 'true'); button.dataset.actorId = actor.id;
             const caption = element('span', 'wd-actor-task');
-            button.append(avatar, element('span', 'wd-actor-label'), caption);
+            const sparks = element('span', 'wd-work-effects'); sparks.setAttribute('aria-hidden', 'true');
+            for (let index = 0; index < 3; index++) sparks.append(element('i', ''));
+            button.append(avatar, sparks, element('span', 'wd-actor-label'), caption);
             button.addEventListener('click', () => select(actor.id));
             stage.append(button); token = {button, avatar, caption, poseKey: ''}; tokens.set(actor.id, token);
           }
@@ -397,20 +481,25 @@
       activeCount = 0; movingScene = false;
       cameraTarget = '';
       observed = false; seenTime = -Infinity; seen.clear(); replayable.clear(); movement.clear();
+      previousSnapshot = null; recentChanges = []; lastQueryAt = 0; detailSignature = ''; changeSignature = '';
+      for (const effect of effects) effect.cancel(); effects.clear();
       registry.clear();
       cancelAnimationFrame(frame); clearTimeout(idleTimer); frame = 0; idleTimer = 0; lastFrame = 0; clock = 0;
       for (const token of tokens.values()) token.button.remove(); tokens.clear();
       for (const button of taskTokens.values()) button.remove(); taskTokens.clear();
-      for (const {count, more} of roomNodes.values()) { count.textContent = '0'; more.hidden = true; }
+      for (const {node, count, more} of roomNodes.values()) {
+        count.textContent = '0'; more.hidden = true; node.dataset.activeCount = '0'; delete node.dataset.signal;
+      }
       project.textContent = nextProject; status.textContent = nextProject ? '기록 불러오는 중…' : '연결 전';
       pipelineValues[0].textContent = '모델·추론 상태 미수신';
       pipelineValues[2].textContent = '호출 기록 없음'; pipelineValues[3].textContent = '실행 기록 없음';
-      root.dataset.stale = 'false'; motionState(); showDetail();
+      root.dataset.stale = 'false'; showChanges(); motionState(); showDetail();
     }
-    function setLive(value) { following = value; motionState(); }
+    function setLive(value) { if (value && !following) previousSnapshot = null; following = value; motionState(); }
     function destroy() {
       destroyed = true; observer.disconnect(); cancelAnimationFrame(frame); clearTimeout(idleTimer); movement.clear(); tokens.clear(); taskTokens.clear(); registry.clear();
-      reducedMotion.removeEventListener('change', mediaChanged); document.removeEventListener('visibilitychange', motionState);
+      for (const effect of effects) effect.cancel(); effects.clear();
+      reducedMotion.removeEventListener('change', mediaChanged); document.removeEventListener('visibilitychange', visibilityChanged);
       root.replaceChildren();
     }
     clear();

@@ -10,6 +10,45 @@ const event = (overrides = {}) => ({schema_version: 1, project, source_id: 'chat
   task_id: 'turn-1', task_kind: 'agent', task_label: '요구사항 검토', action: 'reason',
   state: 'running', time: '2026-10-12T01:00:10Z', provenance: 'reported', ...overrides});
 
+test('configured model and effort stay distinct from estimated session usage', () => {
+  const telemetry = snapshot({project, now, records: [event({model: 'codex-model',
+    model_source: 'configuration', reasoning_effort: 'high',
+    usage: {total_tokens: 42}, usage_scope: 'session', usage_estimated: true})]}).actors[0].telemetry;
+  assert.equal(telemetry.model.source, 'configuration');
+  assert.equal(telemetry.reasoningEffort.source, 'configuration');
+  assert.equal(telemetry.usage.estimated, true);
+  assert.equal(telemetry.usage.scope, 'session');
+});
+
+test('effort is labeled configuration even when no model is supplied', () => {
+  const telemetry = snapshot({project, now, records: [event({reasoning_effort: 'high',
+    reasoning_effort_source: 'configuration'})]}).actors[0].telemetry;
+  assert.equal(Object.hasOwn(telemetry, 'model'), false);
+  assert.equal(telemetry.reasoningEffort.source, 'configuration');
+});
+
+test('replacement metadata does not inherit older source or estimate annotations', () => {
+  const records = [event({model: 'codex-model', model_source: 'configuration',
+    usage: {total_tokens: 42}, usage_scope: 'session', usage_estimated: true}),
+  event({model: 'codex-model', usage: {total_tokens: 7}, usage_scope: 'turn',
+    time: '2026-10-12T01:00:20Z'})];
+  const telemetry = snapshot({project, now, records}).actors[0].telemetry;
+  assert.equal(Object.hasOwn(telemetry.model, 'source'), false);
+  assert.equal(Object.hasOwn(telemetry.usage, 'estimated'), false);
+  assert.equal(telemetry.usage.value.total_tokens, 7);
+});
+
+test('a passive session heartbeat does not mask a running tool on the same agent', () => {
+  const records = [event({source_id: 'codex-local', source_kind: 'codex-cli',
+    task_id: 'tool:1', task_kind: 'call', task_label: 'apply_patch', action: 'code', state: 'started'}),
+  event({source_id: 'codex-local', source_kind: 'codex-cli', task_id: 'session-activity',
+    action: 'execute', time: '2026-10-12T01:00:20Z'})];
+  const actor = snapshot({project, now, records}).actors[0];
+  assert.equal(actor.action, 'code');
+  assert.equal(actor.room, 'coding');
+  assert.equal(actor.taskId, 'task:codex-local:agent-1:tool%3A1');
+});
+
 test('explicit reasoning events show one agent and supplied model metadata', () => {
   const result = snapshot({project, now, records: [event({model: 'fixture-model', reasoning_effort: 'high',
     usage: {input_tokens: 25, output_tokens: 0, reasoning_tokens: 0}, usage_scope: 'request'})]});

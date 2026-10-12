@@ -1,5 +1,22 @@
 .wd-map{border-top:3px solid #d3ac69;overflow:hidden;background:linear-gradient(135deg,#1d2730,#192230);--wd-gold:#e6bc72}
 .wd-map h2{font-size:24px}.wd-map .eyebrow{color:var(--wd-gold)}
+.wd-live-status{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#b5cbb7;white-space:nowrap}
+.wd-live-status::before{content:"";width:7px;height:7px;background:#70828d;border-radius:50%;box-shadow:0 0 0 3px #70828d22}
+.wd-live-status[data-state=live]::before{background:#9bd29c;box-shadow:0 0 0 3px #9bd29c22}
+.wd-live-status[data-state=stale],.wd-live-status[data-state=delayed]{color:#efb17e}.wd-live-status[data-state=stale]::before,.wd-live-status[data-state=delayed]::before{background:#efb17e}
+.wd-changes{display:flex;gap:10px;align-items:center;min-height:48px;padding:8px 10px;margin:-5px 0 10px;background:#14212a;border:1px solid #3c4d4e}
+.wd-changes-title{font-size:11px;color:#dec58e;white-space:nowrap}.wd-changes-list{display:flex;gap:7px;flex:1;min-width:0;flex-wrap:wrap}
+.wd-changes-empty{font-size:11px;color:#8fa4b1;padding:8px 0}.wd-change{display:grid;grid-template-columns:19px minmax(0,1fr);gap:2px 6px;flex:1;min-width:160px;max-width:330px;text-align:left;padding:6px 8px;margin:0;font-size:11px;border-radius:2px;border-color:#52675e;background:#1d302c}
+.wd-change-action{grid-row:span 2;color:#e8c986;align-self:center;font-family:ui-monospace,monospace}.wd-change-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wd-change small{font-size:9px;color:#a1b6b5}
+.wd-change[data-state=returned],.wd-change[data-state=succeeded]{border-color:#6b8257}.wd-change[data-state=failed],.wd-change[data-state=interrupted],.wd-change[data-state=unknown]{border-color:#986e53}
+.wd-room-lamp{width:8px;height:8px;border:2px solid #415344;background:#435548;box-shadow:1px 1px 0 #16261e;margin-left:auto}
+.wd-room:not([data-active-count="0"]) .wd-room-lamp{background:#d1e08a;border-color:#9da767;box-shadow:0 0 7px #d1e08a77;animation:wd-lamp 1.4s steps(2,end) infinite}
+.wd-actor[data-working=true]::before{content:"";position:absolute;top:34px;left:18px;width:28px;height:9px;border:1px solid #e8c77c77;border-radius:50%;background:#e8c77c22;animation:wd-work-halo 1.2s ease-in-out infinite;pointer-events:none}
+.wd-work-effects{display:none;position:absolute;inset:0 0 16px;pointer-events:none}.wd-actor[data-working=true] .wd-work-effects{display:block}
+.wd-work-effects i{position:absolute;width:3px;height:3px;background:#e8cb88;left:14px;top:20px;animation:wd-work-spark 1.1s steps(3,end) infinite}.wd-work-effects i:nth-child(2){left:48px;top:17px;animation-delay:-.35s}.wd-work-effects i:nth-child(3){left:34px;top:9px;animation-delay:-.7s}
+.wd-actor[data-action=read] .wd-work-effects i,.wd-actor[data-action=search] .wd-work-effects i{background:#b2d5aa}.wd-actor[data-action=code] .wd-work-effects i{background:#a8d3e4}.wd-actor[data-action=test] .wd-work-effects i{background:#b8d892}
+.wd-motion-paused .wd-room-lamp,.wd-motion-paused .wd-work-effects i,.wd-motion-paused .wd-actor::before{animation:none!important}
+@keyframes wd-lamp{50%{opacity:.65}}@keyframes wd-work-halo{50%{transform:scale(1.15);opacity:.55}}@keyframes wd-work-spark{0%{transform:translateY(3px);opacity:0}30%{opacity:.9}100%{transform:translateY(-7px);opacity:0}}
 .wd-map .section-heading{flex-wrap:wrap}.wd-map .section-heading>div{flex:1;min-width:160px}
 .wd-pipeline{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin:14px 0 18px;border:1px solid #45515b;background:#121b25}
 .wd-node{padding:9px 12px;min-width:0;overflow-wrap:anywhere;border-right:1px solid #45515b}.wd-node:last-child{border-right:0}
@@ -24,6 +41,8 @@
 .wd-actor-label{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;height:15px;padding:1px 3px;color:#f1efcf;background:#151d21bc;font-size:9px;line-height:13px;border:1px solid #3f4b46}
 .wd-actor-task{position:absolute;left:50%;bottom:63px;transform:translateX(-50%);max-width:138px;min-width:48px;padding:3px 5px;border:1px solid #8b7952;background:#182521e8;color:#fff1be;font-size:10px;line-height:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
 .wd-actor[data-state=idle][data-presentation=observed] .wd-actor-task{color:#bac8ba;border-color:#526251;background:#1a2923cc}
+.wd-actor[data-state=idle][data-presentation=observed] .wd-actor-task,.wd-actor[data-state=unknown] .wd-actor-task,.wd-actor[data-state=unobserved] .wd-actor-task{visibility:hidden}
+.wd-actor:is(:hover,:focus-visible,.selected) .wd-actor-task{visibility:visible}
 .wd-task{position:absolute;width:64px;height:38px;padding:0;margin:0;border:0;border-radius:0;background:transparent;text-align:center}
 .wd-task:hover{background:#3b352a66;border:0}.wd-task-icon{display:block;width:25px;height:21px;margin:0 auto 2px;border:2px solid #876948;box-shadow:2px 2px 0 #252723;background:#e5cc89;color:#59462f;font:10px/17px ui-monospace,monospace;image-rendering:pixelated}
 .wd-task-label{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 2px;color:#efe0b9;background:#29251dbf;font-size:9px;line-height:12px}
@@ -37,3 +56,5 @@
 .wd-hint,.wd-legend,.wd-note{font-size:11px;margin:9px 0 0}.wd-map[data-stale=true] .wd-camera{border-color:#dc9b7b}
 @media(max-width:1120px){.wd-layout{grid-template-columns:minmax(0,1fr)}.wd-inspector{max-height:260px}.wd-fields{display:grid;grid-template-columns:100px minmax(0,1fr);gap:7px}.wd-fields dt,.wd-fields dd{margin:0}}
 @media(max-width:760px){.wd-pipeline{grid-template-columns:repeat(2,minmax(0,1fr))}.wd-node{border-bottom:1px solid #45515b}.wd-camera{height:440px;max-height:65vh;min-height:320px}.wd-layout{gap:12px}.wd-map h2{font-size:21px}.wd-toolbar{gap:5px}.wd-observation{flex-basis:100%}.wd-toolbar button{padding:7px 8px}}
+@media(max-width:760px){.wd-changes{align-items:flex-start}.wd-change{min-width:130px;max-width:none}.wd-changes-list{display:grid;grid-template-columns:minmax(0,1fr);gap:5px}.wd-change:nth-child(n+3){display:none}.wd-live-status{font-size:10px}}
+@media(prefers-reduced-motion:reduce){.wd-room-lamp,.wd-work-effects i,.wd-actor::before{animation:none!important}}

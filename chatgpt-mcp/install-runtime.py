@@ -16,7 +16,8 @@ from server import CONFIG, load_projects
 FILES = ("server.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
          "postgres_job.py", "git_workflows.py", "approve-git-operation.py", "context.yml",
          "project-picker.html", "project_state.py", "admin_server.py",
-         "admin.html", "admin.js", "admin.css", "workspace_view.py")
+         "admin.html", "admin.js", "admin.css", "workspace_view.py",
+         "codex_hooks.py", "codex_observer.py", "codex_hook_report.py")
 DASHBOARD_FILES = ('model.js', 'motion.js', 'pixels.js', 'visualizer.js', 'visualizer.css')
 
 
