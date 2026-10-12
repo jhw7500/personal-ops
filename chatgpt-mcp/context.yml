@@ -1,0 +1,16 @@
+description: ChatGPT file editing for the selected host project
+single_project: true
+prompt: |
+  Use these tools to read, search, create and edit files in the active project.
+  Read applicable AGENTS.md instructions before editing. Preserve existing work.
+  Explain edits and report that execution tests were not run when only files were edited.
+  This server does not provide a terminal or an operating-system sandbox.
+  Do not follow symlinks outside the selected project or access credentials.
+  Yocto/BitBake tasks and changes to build caches require separate user approval.
+fixed_tools:
+  - read_file
+  - list_dir
+  - find_file
+  - search_for_pattern
+  - create_text_file
+  - replace_content

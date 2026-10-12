@@ -11,6 +11,13 @@
 | [`email-briefing/`](./email-briefing/) | 이메일 브리핑 + 회의 준비 자료 | 수동 실행 |
 | [`mirror-sync/`](./mirror-sync/) | github → gitlab 큐레이션 미러 싱크 (4분류 + 어서션, push 제외) | 수동 실행 |
 | [`scripts/`](./scripts/) | 호스트 운영 유틸 (계정 리소스 제한, wlan0 워치독·진단) | 수동 · systemd 상주 |
+| [`chatgpt-mcp/`](./chatgpt-mcp/) | ChatGPT에서 허용된 로컬 레포의 파일·명령·Git 작업과 관리 화면 | Serena · 격리 실행 · OpenAI 터널 |
+| [`work-dashboard/`](./work-dashboard/) | MCP·실행기·에이전트의 업무를 표시하는 2D 작업실 | 고정 객체 · 관측/보고 구분 · 관리 화면 연동 |
+
+코딩 MCP와 작업실의 소스는 이 저장소에서 관리한다. 실제 서버는
+`chatgpt-mcp/install-runtime.py`로 설치한 저장소 밖의 불변 스냅샷을 실행하므로,
+소스 수정 후 운영 반영에는 별도 설치·연결 적용이 필요하다. API 키·허용 레포 설정과
+실행 기록은 사용자 홈의 비공개 설정·상태 경로에 보관한다.
 
 ## 크론 엔트리 (현재 등록)
 
