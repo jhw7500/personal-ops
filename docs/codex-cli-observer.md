@@ -160,6 +160,30 @@ Python 전체 148개, JavaScript 72개, 관리 화면 32개, 갱신 4개 검사(
 기존 Codex 공유 서버 PID는 유지했다. 비공개 설정 백업과 검증 기록은
 `~/.local/state/personal-ops-commit-review/20261012/`에 보관했다.
 
+## 2026-10-12 후크 활성화 확인
+
+사용자의 진행 요청에 따라 등록된 수집 후크 7개의 명령·출처·비동기 설정·3초 제한과
+불변 런타임을 검토했다. 실행 중인 Codex 0.162.1의 `hooks/list`가 반환한 정의는 모두
+검토한 소스와 일치했고 설정 오류는 없었다.
+
+해당 버전의 `/hooks` 화면과 같은 `config/batchWrite` 경로로 검토한 7개 항목의
+`key`와 `currentHash`를 그대로 사용했다. `hooks.state`를 `upsert`하고
+`reloadUserConfig:true`로 로드된 세션에 적용했다. 사용자 설정의 현재 version으로
+동시 변경을 검사했으며, 별도 해시 계산·신뢰 우회 플래그·직접 설정 파일 편집은 하지 않았다.
+재조회에서 7개 모두 `trusted / enabled`로 확인했다. 다른 후크·설정 값·후크 정의와
+기존 Codex 공유 서버 PID는 유지됐다.
+
+실제 이 세션의 쉘 도구 `Bash` 호출에서 동일한 도구 ID의 `started / returned` 기록을
+직접 관측했다. 운영 Chromium에서는 root Codex 인물이 한 명으로 표시되고 실행실의
+작업 효과와 Bash 상세가 나타났으며 페이지 오류는 0개였다. 네이티브 후크 활성화와
+쉘 호출 경로는 확인했고, 턴·중단·자식 에이전트 후크의 실제 사건별 검증은 이후 해당
+사건이 발생할 때 확인해야 한다. 토큰 제공 여부와 실제 재부팅 검증도 남아 있다.
+
+비공개 설정 백업·네이티브 정의·활성화 결과·화면 검증은
+`~/.local/state/personal-ops-hook-activation/20261012/`에 보관했다.
+소스 근거는 고정 버전의
+[TUI 후크 신뢰 저장 경로](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/tui/src/hooks_rpc.rs#L58-L91)다.
+
 ## 근거
 
 동작은 설치된 Codex 0.162.1과 다음 공식 자료를 기준으로 확인했다.
