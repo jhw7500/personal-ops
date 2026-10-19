@@ -616,6 +616,77 @@ class AdminBrowserTest(unittest.TestCase):
         expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('응답 대기')
         expect(self.room.locator('#wd-detail .wd-work-summary')).not_to_contain_text('실행 중으로 관측')
 
+    def test_claude_children_distinguish_expired_lifecycle_from_recent_tool_results(self):
+        now = datetime.now(timezone.utc)
+        base = {'schema_version': 1, 'source_id': 'claude-local', 'source_kind': 'claude-cli',
+                'actor_kind': 'agent', 'actor_label': 'general-purpose', 'task_kind': 'call',
+                'task_label': 'Claude subagent', 'action': 'execute', 'state': 'started'}
+        rows = []
+        for child in ('child-a', 'child-b'):
+            actor = 'sub:session:' + child
+            rows.extend([
+                {**base, 'actor_id': actor, 'task_id': 'agent:session:' + child,
+                 'time': (now - timedelta(minutes=5)).isoformat()},
+                {**base, 'actor_id': actor, 'task_id': 'tool:' + child,
+                 'task_label': 'Bash', 'tool_name': 'Bash', 'state': 'started',
+                 'time': (now - timedelta(seconds=4)).isoformat()},
+                {**base, 'actor_id': actor, 'task_id': 'tool:' + child,
+                 'task_label': 'Bash', 'tool_name': 'Bash', 'state': 'returned',
+                 'time': (now - timedelta(seconds=3)).isoformat()},
+            ])
+        self.store.record_work_events('alpha', rows, provenance='observed')
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.locator('#refresh').click()
+        badges = self.room.locator('.wd-actor-observation')
+        expect(badges).to_have_count(2)
+        child = self.room.locator('.wd-actor[data-actor-id="entity:claude-local:sub%3Asession%3Achild-a"]')
+        expect(child).to_have_attribute('data-state', 'idle')
+        expect(child).to_have_attribute('data-working', 'false')
+        expect(child).to_have_attribute('data-observation-status', 'subagent')
+        expect(child).to_have_attribute('aria-label', re.compile('서브에이전트 종료 미확인'))
+        child.click()
+        note = self.room.locator('#wd-detail .wd-detail-observation')
+        expect(note).to_contain_text('서브에이전트 종료 미확인')
+        expect(note).to_contain_text('실행 중인 에이전트 수')
+        recent = self.room.locator('#wd-detail .wd-native-activity')
+        expect(recent).to_contain_text('최근 Claude 호출')
+        expect(recent.locator('.wd-native-entry')).to_have_count(1)
+        expect(recent).to_contain_text('요청 반환')
+        expect(recent).not_to_contain_text('tool:child-b')
+        expect(self.room.locator('#wd-map-note')).to_contain_text('완료 후 대기하는 객체')
+        stop = {**base, 'actor_id': 'sub:session:child-a', 'task_id': 'agent:session:child-a',
+                'state': 'returned', 'time': now.isoformat()}
+        self.store.record_work_events('alpha', [stop], provenance='observed')
+        self.page.locator('#refresh').click()
+        expect(child).to_have_attribute('data-observation-status', '')
+        expect(child.locator('.wd-actor-observation')).to_have_count(0)
+        expect(self.room.locator('.wd-actor-observation')).to_have_count(1)
+        self.assertEqual(self.errors, [])
+
+    def test_claude_expired_badge_preserves_recorded_replay_and_clears_when_evidence_is_pruned(self):
+        fixture = self.create_called_character_fixture()
+        self.room_page.evaluate("""() => {
+            const base = {source_id: 'claude-local', source_kind: 'claude-cli',
+                actor_id: 'sub:session:child', actor_label: 'Claude child', task_kind: 'call',
+                action: 'execute'};
+            calledRecords = [callRecord('unused', 300, {...base, task_id: 'agent:session:child'}),
+                callRecord('unused', 3, {...base, task_id: 'tool:done', tool_name: 'Bash'}),
+                callRecord('unused', 2, {...base, task_id: 'tool:done', tool_name: 'Bash', state: 'returned'})];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        child = fixture.locator('.wd-actor[data-actor-id="entity:claude-local:sub%3Asession%3Achild"]')
+        expect(child.locator('.wd-actor-observation')).to_have_text('종료 미확인')
+        fixture.locator('#wd-replay').click()
+        expect(child).to_have_attribute('data-presentation', 'replay')
+        expect(child.locator('.wd-actor-task')).to_contain_text('기록 재생')
+        expect(child.locator('.wd-actor-observation')).to_have_text('종료 미확인')
+        expect(child).to_have_attribute('data-state', 'idle')
+        self.room_page.evaluate("""() => calledFixture.update({project: 'alpha', records: []})""")
+        expect(child).to_have_count(1)
+        expect(child).to_have_attribute('data-observation-status', '')
+        expect(child.locator('.wd-actor-observation')).to_have_count(0)
+        self.assertEqual(self.errors, [])
+
     def test_native_terminal_result_remains_readable_after_a_newer_heartbeat(self):
         now = datetime.now(timezone.utc)
         base = {'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',

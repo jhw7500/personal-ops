@@ -328,10 +328,18 @@
     return result;
   }
 
+  function claudeLifecycleFor(row) {
+    if (row.source_kind !== 'claude-cli' || row.actor_kind !== 'agent' || row.provenance !== 'observed'
+        || row.task_kind !== 'call' || row.action !== 'execute') return null;
+    if (row.task_id.startsWith('prompt:') && row.task_id.length > 7) return 'prompt';
+    return row.actor_id.startsWith('sub:') && row.task_id === `agent:${row.actor_id.slice(4)}` ? 'subagent' : null;
+  }
+
   // Adapters provide explicit identities; CLI/model/agent identities are never inferred from tool names.
   function normalizeRecords(project, records, now) {
     const selected = new Map();
     const starts = new Map();
+    const lifecycleStarts = new Map();
     const metadata = new Map();
     for (const [order, row] of (Array.isArray(records) ? records : []).entries()) {
       if (!row || row.schema_version !== 1 || row.project !== project
@@ -355,6 +363,10 @@
       if (row.state === 'started' || row.state === 'running') {
         const previousStart = starts.get(id);
         if (!previousStart || parsed.milliseconds < previousStart) starts.set(id, parsed.milliseconds);
+        if (claudeLifecycleFor(row)) {
+          const previous = lifecycleStarts.get(id);
+          if (previous === undefined || parsed.milliseconds < previous) lifecycleStarts.set(id, parsed.milliseconds);
+        }
       }
       const previous = selected.get(id);
       if (previous && (previous.parsed.milliseconds > parsed.milliseconds
@@ -366,7 +378,8 @@
       let state = row.state;
       if (row.task_kind === 'job' && state === 'succeeded' && row.exit_code !== 0) state = 'unknown';
       const deadline = Math.min(parsed.milliseconds, received?.milliseconds ?? parsed.milliseconds) + 120000;
-      if (ACTIVE_STATES.has(state) && now >= Math.min(expiry?.milliseconds ?? deadline, deadline)) state = 'unknown';
+      const observationExpired = ACTIVE_STATES.has(state) && now >= Math.min(expiry?.milliseconds ?? deadline, deadline);
+      if (observationExpired) state = 'unknown';
       const sourceRoom = ACTION_ROOMS[row.action];
       const room = state === 'returned' || state === 'succeeded' ? 'done'
         : ATTENTION_STATES.has(state) ? 'attention'
@@ -398,6 +411,8 @@
           )}:${encodeURIComponent(row.parent_task_id)}` : null,
         _entity: actor, _milliseconds: parsed.milliseconds,
         _observationMilliseconds: received?.milliseconds ?? parsed.milliseconds,
+        _observationExpired: observationExpired, _claudeLifecycle: claudeLifecycleFor(row),
+        _claudeStartedAt: lifecycleStarts.get(id),
         _telemetryRows: metadata.get(id), _taskLabelKnown: taskLabelKnown,
         ...(sessionActivity ? {sessionActivity: true} : {}),
         ...(skill ? {skill} : {}),
@@ -651,12 +666,21 @@
       const pending = nativeCall || work.find(task => ACTIVE_STATES.has(task.state) || task.state === 'unknown');
       const activeWork = work.filter(task => ACTIVE_STATES.has(task.state));
       const current = pending || latest;
+      // Lifecycle freshness is separate from physical idle/replay posture. A tool return
+      // cannot close a request, nor can an unmatched start prove continued execution.
+      const lifecycle = work.filter(task => task._claudeLifecycle && Number.isFinite(task._claudeStartedAt)).sort((left, right) =>
+        right._claudeStartedAt - left._claudeStartedAt
+        || Number(right._observationExpired) - Number(left._observationExpired)
+        || left.id.localeCompare(right.id))[0];
+      const observationStatus = lifecycle?._observationExpired ? {kind: lifecycle._claudeLifecycle,
+        taskId: lifecycle.id, time: lifecycle.time} : null;
       return {...latest._entity, project, id, state: pending ? pending.state : 'idle',
         room: pending ? pending.room : 'waiting', sourceRoom: current.sourceRoom,
         action: pending ? pending.action : 'idle', taskId: pending ? pending.id : null,
         lastTaskId: latest.id, time: latest.time, jobId: pending ? pending.jobId : null,
         provenance: current.provenance,
         telemetry: telemetryFor(work.flatMap(task => task._telemetryRows || [])),
+        ...(observationStatus ? {observationStatus} : {}),
         activeCount: activeWork.filter(task => !(nativeCall && task.sessionActivity)).length,
         taskCount: work.length};
     });
@@ -668,7 +692,7 @@
     }
     actors.sort((a, b) => actorPriority(a) - actorPriority(b) || a.id.localeCompare(b.id));
     const latest = tasks.reduce((value, task) => Math.max(value, task._milliseconds), -Infinity);
-    const publicTasks = tasks.map(({_milliseconds, _observationMilliseconds, _entity, _telemetryRows,
+    const publicTasks = tasks.map(({_milliseconds, _observationMilliseconds, _observationExpired, _claudeLifecycle, _claudeStartedAt, _entity, _telemetryRows,
       _hostAuthoritative, _hostContextActionKnown, _invokedAt, ...task}) => {
       const row = {...task, sourceId: _entity.sourceId, sourceKind: _entity.sourceKind};
       if (_invokedAt) row.invokedAt = _invokedAt;

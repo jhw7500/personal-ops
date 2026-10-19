@@ -49,6 +49,8 @@
   const kindFor = item => ({call: item.sourceKind === 'mcp' ? 'MCP 호출' : '도구 호출', job: '명령 실행', agent: '에이전트 작업',
     mcp: 'MCP 서버', executor: '명령 실행기'}[item.kind] || '객체');
   const stateFor = item => item.kind === 'agent' && item.state === 'succeeded' ? '작업 완료' : states[item.state];
+  const observationTitle = owner => owner?.observationStatus?.kind === 'subagent' ? '서브에이전트 종료 미확인'
+    : owner?.observationStatus?.kind === 'prompt' ? '요청 종료 미확인' : '';
   const actionTitles = {read: '책 읽기', search: '자료 탐색', reason: '추론 신호', code: '코드 작성', build: '빌드 조립',
     test: '검사', review: '변경 비교', execute: '명령 실행', commit: '커밋 기록', push: '전송', idle: '대기'};
   const taskGlyphs = {read: '[]', search: '?', reason: '*', code: '</>', build: '#', test: 'OK', review: '<>',
@@ -241,7 +243,8 @@
     layout.append(camera, inspector);
     const hint = element('p', 'muted wd-hint', '지도를 끌거나 스크롤해 둘러보세요. 인물과 방의 개수를 누르면 기록을 확인할 수 있습니다.');
     const legend = element('p', 'muted wd-legend', '두뇌 · 같은 담당자의 분석·설계·검토 역할   WEB / FILE · 웹·파일 검색   청록 가방 · MCP   황금 가방 · 실행기   보라 가방 · 에이전트   문서 · 완료 기록');
-    const note = element('p', 'muted wd-note', '호출된 인물만 차례로 입장해 일하고 대기실로 돌아갑니다. 방은 여섯 자리이며, 정원이 차면 호출이 가장 오래된 인물이 퇴장합니다. 화면 밖에서도 실제 작업은 계속되고 기록을 확인할 수 있습니다. 직접 관측·채팅 보고·과거 재생을 구분하며 ChatGPT 내부 추론과 외부 검색은 자동 수집되지 않습니다.');
+    const note = element('p', 'muted wd-note', '호출된 인물만 차례로 입장해 일하고 대기실로 돌아갑니다. 완료 후 대기하는 객체도 포함되므로 화면의 인원은 현재 실행 중인 에이전트 수가 아닙니다. 종료 미확인 표시는 시작 후 새 상태를 확인하지 못한 경우이며 실행 중이라는 뜻이 아닙니다. 방은 여섯 자리이며, 정원이 차면 호출이 가장 오래된 인물이 퇴장합니다. 화면 밖에서도 실제 작업은 계속됩니다. 직접 관측·채팅 보고·과거 재생을 구분하며 ChatGPT 내부 추론과 외부 검색은 자동 수집되지 않습니다.');
+    note.id = 'wd-map-note';
     const contextDetails = element('details', 'wd-context-details'); contextDetails.id = 'wd-context-details';
     contextDetails.append(element('summary', '', '작업 목록 · 모델 · 연결 상세'), pipeline, workContext);
     const help = element('details', 'wd-help');
@@ -581,16 +584,18 @@
     }
 
     function appendNativeActivity(owner, work) {
-      if (owner?.sourceKind !== 'codex-cli') return;
+      if (!['codex-cli', 'claude-cli'].includes(owner?.sourceKind)) return;
       const rows = window.WorkDashboardModel.recentTasks(tasks.filter(task =>
-        task.actorId === owner.id && task.kind === 'call' && !task.sessionActivity));
+        task.actorId === owner.id && task.kind === 'call' && !task.sessionActivity
+        && (owner.sourceKind !== 'claude-cli' || task.tool)));
       if (!rows.length) return;
       const pending = task => active.has(task.state) || task.state === 'queued';
       const current = rows.filter(pending).slice(0, 3);
       const recent = rows.filter(task => !pending(task)).slice(0, 6 - current.length);
       const panel = element('section', 'wd-detail-summary wd-native-activity');
-      panel.setAttribute('aria-label', '최근 터미널 활동');
-      panel.append(element('small', 'wd-summary-heading', '최근 터미널 활동'));
+      const heading = owner.sourceKind === 'claude-cli' ? '최근 Claude 호출' : '최근 터미널 활동';
+      panel.setAttribute('aria-label', heading);
+      panel.append(element('small', 'wd-summary-heading', heading));
       const currentTitle = stale || resumeSnapshot || !following ? '마지막 확인 호출' : '현재 호출';
       for (const [id, title, entries, empty] of [
         ['current', currentTitle, current, '현재 호출 기록 없음'],
@@ -785,6 +790,15 @@
       if (!work) summary.append(element('strong', '', actorName(owner)),
         element('p', '', `${actorName(owner)} · ${stateFor(owner)} · 현재 업무 ${owner?.taskId ? '관측됨' : '미수신'}`));
       inspector.append(jobBadge(owner), summary);
+      if (observationTitle(owner)) {
+        const observation = element('section', 'wd-detail-summary wd-detail-observation');
+        observation.append(element('strong', '', observationTitle(owner)),
+          element('p', '', `시작 기록 · ${localTime(owner.observationStatus.time)}`),
+          element('p', '', '종료 기록은 최근 수신 범위에서 확인되지 않았습니다. 현재 실행 중인 에이전트 수나 작업 중단을 뜻하지 않습니다.'));
+        const lifecycle = tasks.find(task => task.id === owner.observationStatus.taskId);
+        if (lifecycle) observation.append(taskLink(lifecycle, '시작 기록 확인'));
+        inspector.append(observation);
+      }
       appendNativeActivity(owner, work);
       appendTalk(owner, work); appendLog(work); appendRelated(owner, work);
       if (work) {
@@ -1098,10 +1112,20 @@
           token.work = tasks.find(row => row.id === sprite.taskId) || token.work;
           token.button.dataset.room = sprite.room; token.button.dataset.state = sprite.state; token.button.dataset.kind = sprite.kind;
           token.button.dataset.provenance = sprite.provenance || 'reported';
+          token.button.dataset.observationStatus = sprite.observationStatus?.kind || '';
+          let observationBadge = token.button.querySelector('.wd-actor-observation');
+          if (observationTitle(sprite)) {
+            if (!observationBadge) {
+              observationBadge = element('span', 'wd-actor-observation', '종료 미확인');
+              token.button.append(observationBadge);
+            }
+            observationBadge.title = `${observationTitle(sprite)} · 시작 기록 ${localTime(sprite.observationStatus.time)} · 종료 기록은 최근 수신 범위에서 확인되지 않음`;
+          } else observationBadge?.remove();
           token.button.classList.toggle('selected', sprite.id === selected);
           token.button.querySelector('.wd-actor-label').textContent = sprite.label;
-          token.button.setAttribute('aria-label', `${kindFor(sprite)} · ${titleFor(sprite)} · ${states[sprite.state]} · ${roomTitle(sprite.room)}`);
-          token.button.title = `${titleFor(sprite)} · ${states[sprite.state]} · ${evidenceTitle(sprite.provenance)} · ${localTime(sprite.time)}`;
+          const observationLabel = observationTitle(sprite) ? ` · ${observationTitle(sprite)}` : '';
+          token.button.setAttribute('aria-label', `${kindFor(sprite)} · ${titleFor(sprite)} · ${states[sprite.state]} · ${roomTitle(sprite.room)}${observationLabel}`);
+          token.button.title = `${titleFor(sprite)} · ${states[sprite.state]} · ${evidenceTitle(sprite.provenance)} · ${localTime(sprite.time)}${observationLabel}`;
         }
       }
       const focusedCard = document.activeElement;
@@ -1185,7 +1209,8 @@
           token.caption.title = work ? `${readableAction(work)} · ${readableTaskTitle(work)}` : states[actor.state];
           if (work?.skill && !item.departing) {
             const accessible = `${actorName(actor)} · 스킬 ${skillDescription(work)} · ${
-              evidenceTitle(work.skill.provenance)} · ${stateFor(work)} · ${readableTaskTitle(work)} · ${roomTitle(item.displayRoom)}`;
+              evidenceTitle(work.skill.provenance)} · ${stateFor(work)} · ${readableTaskTitle(work)} · ${roomTitle(item.displayRoom)}${
+              observationTitle(actor) ? ' · ' + observationTitle(actor) : ''}`;
             if (token.button.getAttribute('aria-label') !== accessible) token.button.setAttribute('aria-label', accessible);
           }
           if (item.departing) {
@@ -1331,6 +1356,10 @@
       }
       const invocationOrder = new Map(called.map(task => [task.id, invocationRanks.get(task.id).sequence]));
       const currentSprites = window.WorkDashboardModel.scene(data, {invocationOrder}).sprites;
+      const currentOwners = new Map(actors.map(actor => [actor.id, actor]));
+      // Retained idle figures must not retain lifecycle evidence that left the query window.
+      for (const [id, sprite] of idleSprites) idleSprites.set(id, {...sprite,
+        observationStatus: currentOwners.get(sprite.ownerId)?.observationStatus});
       const currentIds = new Set(currentSprites.map(sprite => sprite.id));
       for (const sprite of currentSprites) {
         if (sprite.state === 'idle') idleSprites.set(sprite.id, sprite);
