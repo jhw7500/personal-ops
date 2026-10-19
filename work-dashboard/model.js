@@ -380,6 +380,8 @@
       const result = numericResult(row.exit_code);
       const taskLabelKnown = typeof row.task_label === 'string' && Boolean(row.task_label);
       const skill = row.task_kind === 'call' ? skillFor(metadata.get(id)) : null;
+      const sessionActivity = row.source_kind === 'codex-cli' && row.task_kind === 'agent'
+        && row.task_id === 'session-activity';
       return {id, kind: row.task_kind, actorId: actor.id, label: typeof row.task_label === 'string'
         && row.task_label ? row.task_label.slice(0, 200) : row.action, action: row.action,
         state, room, sourceRoom, time: parsed.iso, tool, activityRole, searchScope, jobId: null,
@@ -387,6 +389,7 @@
         telemetry: telemetryFor(metadata.get(id)),
         replayable: TERMINAL_STATES.has(state) && starts.has(id) && starts.get(id) <= parsed.milliseconds,
         _invokedAt: starts.has(id) ? new Date(starts.get(id)).toISOString()
+          : row.source_kind === 'codex-cli' && row.task_kind === 'call' && state === 'queued' ? parsed.iso
           : TERMINAL_STATES.has(state) || state === 'unknown' ? parsed.iso : null,
         parentTaskId: typeof row.parent_task_id === 'string' && CALL_ID.test(row.parent_task_id)
           ? `task:${encodeURIComponent(typeof row.parent_source_id === 'string' && CALL_ID.test(row.parent_source_id)
@@ -396,6 +399,7 @@
         _entity: actor, _milliseconds: parsed.milliseconds,
         _observationMilliseconds: received?.milliseconds ?? parsed.milliseconds,
         _telemetryRows: metadata.get(id), _taskLabelKnown: taskLabelKnown,
+        ...(sessionActivity ? {sessionActivity: true} : {}),
         ...(skill ? {skill} : {}),
         ...(result ? {result} : {})};
     });
@@ -642,7 +646,10 @@
       if (!work.length) return {...known.get(id), project, state: 'unobserved', room: 'waiting', sourceRoom: 'waiting',
         action: 'idle', taskId: null, lastTaskId: null, time: null, jobId: null, activeCount: 0, taskCount: 0, telemetry: {}};
       const latest = work.reduce((a, b) => a._milliseconds >= b._milliseconds ? a : b);
-      const pending = work.find(task => ACTIVE_STATES.has(task.state) || task.state === 'unknown');
+      const nativeCall = work.some(task => task.sessionActivity)
+        ? work.find(task => task.kind === 'call' && ACTIVE_STATES.has(task.state)) : null;
+      const pending = nativeCall || work.find(task => ACTIVE_STATES.has(task.state) || task.state === 'unknown');
+      const activeWork = work.filter(task => ACTIVE_STATES.has(task.state));
       const current = pending || latest;
       return {...latest._entity, project, id, state: pending ? pending.state : 'idle',
         room: pending ? pending.room : 'waiting', sourceRoom: current.sourceRoom,
@@ -650,7 +657,7 @@
         lastTaskId: latest.id, time: latest.time, jobId: pending ? pending.jobId : null,
         provenance: current.provenance,
         telemetry: telemetryFor(work.flatMap(task => task._telemetryRows || [])),
-        activeCount: work.filter(task => ACTIVE_STATES.has(task.state)).length,
+        activeCount: activeWork.filter(task => !(nativeCall && task.sessionActivity)).length,
         taskCount: work.length};
     });
     const labels = new Map();
@@ -718,9 +725,19 @@
   function displayTask(tasks, owner, latest) {
     const attention = tasks.find(task => task === latest && visibleAttention(task) && meaningfulUnknown(task, owner));
     if (attention) return attention;
+    if (owner.sourceKind === 'codex-cli' && tasks.some(task => task.sessionActivity)) {
+      const nativeCall = tasks.find(task => task.kind === 'call' && ACTIVE_STATES.has(task.state));
+      if (nativeCall) return nativeCall;
+    }
     const active = tasks.find(task => ['started', 'running', 'canceling'].includes(task.state));
     if (active) return active;
     return tasks.find(task => ['returned', 'succeeded'].includes(task.state)) || null;
+  }
+
+  function latestConcreteTask(tasks, ownerId) {
+    if (typeof ownerId !== 'string') return null;
+    return recentTasks((Array.isArray(tasks) ? tasks : []).filter(task =>
+      task?.actorId === ownerId && task.kind === 'call' && task.sessionActivity !== true))[0] || null;
   }
 
   function sprite(owner, task, displayType, role = null, invocationTask = task) {
@@ -1072,6 +1089,6 @@
     return prefix + `${result.hostExecutionId && result.hostActionKnown !== true ? '세부 행동 미수신' : actions[result.action] || '작업'} · 진행 중으로 기록됐습니다. 완료 결과는 아직 없습니다.`;
   }
 
-  return {snapshot, scene, changes, recentTasks, resumeChanges, speechEvents, characterJob, recordedAnswer,
+  return {snapshot, scene, changes, recentTasks, latestConcreteTask, resumeChanges, speechEvents, characterJob, recordedAnswer,
     hostPhaseLabel, hostExecutionReference, hostCommandLabel, hostResultSummary};
 }));

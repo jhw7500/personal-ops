@@ -25,7 +25,7 @@ FILES = ("server.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools
          "admin.html", "admin.js", "admin.css", "agent-admin.js",
          "runtime-rollout-admin.js", "workspace_view.py",
          "workroom-frame.html", "workroom-frame.js", "workroom-bridge.js",
-         "codex_hooks.py", "codex_observer.py", "codex_hook_report.py",
+         "codex_hooks.py", "codex_observer.py", "codex_activity.py", "codex_hook_report.py",
          "claude_hooks.py", "claude_hook_report.py",
          "host_registry.py", "host_actions.py", "host_process.py", "host_source_review.py",
          "host_registered_operations.py", "host_compose_actions.py", "host_registered_tools.py",

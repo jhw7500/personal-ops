@@ -288,6 +288,48 @@ class CodexObserverTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(store.calls[0][1]), 20)
         self.assertEqual(result["recorded"], 1)
 
+    async def test_native_activity_is_observed_without_resuming_or_replaying_history(self):
+        from codex_activity import CodexActivityReader
+        home = self.root / "codex"
+        folder = home / "sessions" / "2026" / "10" / "12"
+        folder.mkdir(parents=True)
+        native_id = self.thread()["id"]
+        rollout = folder / f"rollout-2026-10-12T10-00-00-{native_id}.jsonl"
+        rollout.write_text(json.dumps({"type": "response_item", "timestamp": NOW,
+                                      "payload": {"type": "function_call", "name": "old_tool",
+                                                  "call_id": "old-call"}}) + "\n")
+        thread = self.thread(path=str(rollout))
+        reader = CodexActivityReader(home)
+        store = RecordingStore()
+        first = await observe_once(FakeRpc([thread]), self.projects, store,
+                                   time=NOW, tracked={}, activity=reader)
+        self.assertEqual(first["recorded"], 1)
+        stamp = "2026-10-12T10:15:01+00:00"
+        with rollout.open("a") as stream:
+            for payload in [{"type": "function_call", "name": "exec_command",
+                             "call_id": "new-call", "arguments": "PRIVATE COMMAND"},
+                            {"type": "function_call_output", "call_id": "new-call",
+                             "output": "PRIVATE OUTPUT"}]:
+                stream.write(json.dumps({"timestamp": stamp, "type": "response_item",
+                                         "payload": payload}) + "\n")
+        rpc = FakeRpc([thread])
+        second = await observe_once(rpc, self.projects, store, time=stamp,
+                                    tracked=first["tracked"], activity=reader)
+        calls = [row for _, batch, provenance in store.calls for row in batch
+                 if row["task_kind"] == "call" and provenance == "observed"]
+        self.assertEqual([row["state"] for row in calls], ["queued", "returned"])
+        self.assertEqual({row["actor_id"] for row in calls}, {native_id})
+        self.assertEqual({row["project"] for row in calls}, {"alpha"})
+        self.assertEqual(second["activity_recorded"], 2)
+        self.assertNotIn("PRIVATE", json.dumps(store.calls))
+        self.assertNotIn("old-call", json.dumps(store.calls))
+        self.assertTrue(all(method in {"initialize", "thread/loaded/list", "thread/read"}
+                            for method, _ in rpc.calls))
+        third = await observe_once(FakeRpc([thread]), self.projects, store,
+                                   time="2026-10-12T10:15:02+00:00",
+                                   tracked=second["tracked"], activity=reader)
+        self.assertEqual(third["recorded"], 0)
+
     async def test_disappeared_allowed_thread_is_cleared_as_unknown(self):
         store = RecordingStore()
         first = await observe_once(

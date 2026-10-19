@@ -577,6 +577,22 @@
       inspector.append(records);
     }
 
+    function appendNativeActivity(owner, work) {
+      if (owner?.sourceKind !== 'codex-cli' || !work?.sessionActivity) return;
+      const latest = window.WorkDashboardModel.latestConcreteTask(tasks, owner.id);
+      if (!latest || latest.id === work.id) return;
+      const panel = element('section', 'wd-detail-summary wd-native-activity');
+      panel.setAttribute('aria-label', '최근 터미널 활동');
+      panel.append(element('small', 'wd-summary-heading', '최근 터미널 활동'),
+        element('strong', 'wd-summary-purpose', readableTaskTitle(latest)),
+        element('p', 'wd-summary-action', `${latest.tool ? `도구 · ${latest.tool} · ` : ''}상태 · ${stateFor(latest)}`));
+      if (Number.isInteger(latest.result?.exit_code)) {
+        panel.append(element('p', 'wd-summary-numeric', `종료 코드 ${latest.result.exit_code}`));
+      }
+      panel.append(taskLink(latest, '작업 상세'));
+      inspector.append(panel);
+    }
+
     function revealDetail() {
       if (window.innerWidth <= 760) {
         inspector.focus({preventScroll: true}); inspector.scrollIntoView({block: 'nearest'});
@@ -736,6 +752,7 @@
       if (!work) summary.append(element('strong', '', actorName(owner)),
         element('p', '', `${actorName(owner)} · ${stateFor(owner)} · 현재 업무 ${owner?.taskId ? '관측됨' : '미수신'}`));
       inspector.append(jobBadge(owner), summary);
+      appendNativeActivity(owner, work);
       appendTalk(owner, work); appendLog(work); appendRelated(owner, work);
       if (work) {
         const links = element('div', 'wd-task-links');

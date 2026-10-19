@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Read-only Codex app-server observer for the personal-ops dashboard.
 
-Only allowlisted thread metadata crosses this boundary. The observer never
-loads or resumes a thread and never reads turns, prompts, messages, or tool
-payloads.
+Only allowlisted metadata crosses this boundary. RPC never loads or resumes a
+thread or requests turns. A bounded local cursor may extract newly appended
+tool identities and outcomes; command text, arguments, output and reasoning
+are never retained or sent to the dashboard.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import stat
 import sys
 import time as monotonic_time
 
+from codex_activity import CodexActivityReader
 from project_state import ProjectState
 
 
@@ -363,7 +365,8 @@ def _copy_prior_usage_if_unread(event, previous):
     event["usage_estimated"] = previous["usage_estimated"]
 
 
-async def observe_once(rpc, projects, store, *, read_usage=False, time=None, tracked=None):
+async def observe_once(rpc, projects, store, *, read_usage=False, time=None, tracked=None,
+                       activity=None):
     """Read loaded Codex threads once and record bounded observed events."""
     if tracked is None:
         tracked = {}
@@ -377,6 +380,8 @@ async def observe_once(rpc, projects, store, *, read_usage=False, time=None, tra
     observed_at = _observation_clock(time)
     normalized = []
     next_tracked = {}
+    activity_recorded = 0
+    authorized_ids = set()
     for thread_id in loaded_ids:
         result = await rpc.call("thread/read", {
             "threadId": thread_id,
@@ -394,6 +399,7 @@ async def observe_once(rpc, projects, store, *, read_usage=False, time=None, tra
             continue
         project, event = item
         actor_id = event["actor_id"]
+        authorized_ids.add(actor_id)
         previous = _coerce_tracking_entry(tracked.get(actor_id), observed_at)
         comparison_event = event
         if previous is not None and not read_usage:
@@ -424,6 +430,14 @@ async def observe_once(rpc, projects, store, *, read_usage=False, time=None, tra
             next_tracked[actor_id] = _tracking_entry(
                 project, comparison_event, last_recorded_event, last_recorded_at,
             )
+
+        if activity is not None:
+            call_events = activity.read(thread, event, now=observed_at.isoformat())
+            normalized.extend((project, call) for call in call_events)
+            activity_recorded += len(call_events)
+
+    if activity is not None:
+        activity.forget_unloaded(authorized_ids)
 
     loaded_set = set(loaded_ids)
     for actor_id, previous in tracked.items():
@@ -457,7 +471,8 @@ async def observe_once(rpc, projects, store, *, read_usage=False, time=None, tra
             batch = events[offset:offset + 20]
             store.record_work_events(project, batch, provenance="observed")
             recorded += len(batch)
-    return {"recorded": recorded, "tracked": next_tracked}
+    return {"recorded": recorded, "tracked": next_tracked,
+            "activity_recorded": activity_recorded}
 
 
 def _read_managed_pid(pid_file):
@@ -626,6 +641,8 @@ def _parser():
     parser.add_argument("--state-dir", type=Path, default=state_root)
     parser.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     parser.add_argument("--read-usage", action="store_true")
+    parser.add_argument("--no-activity", action="store_true",
+                        help="Read session metadata only; do not tail local tool activity")
     return parser
 
 
@@ -639,6 +656,7 @@ async def _run(args):
 
     projects = _load_projects(args.projects)
     store = ProjectState(projects, args.state_dir)
+    activity = None if args.no_activity else CodexActivityReader(args.codex_home)
     tracked = {}
     last_usage_read = None
     while True:
@@ -657,12 +675,14 @@ async def _run(args):
                 read_usage=should_read_usage,
                 time=datetime.now(timezone.utc).isoformat(),
                 tracked=tracked,
+                activity=activity,
             )
             tracked = result["tracked"]
             if should_read_usage:
                 last_usage_read = now
             print(
-                f"codex-observer recorded={result['recorded']} tracked={len(tracked)}",
+                f"codex-observer recorded={result['recorded']} tracked={len(tracked)} "
+                f"activity={result['activity_recorded']}",
                 flush=True,
             )
         if args.once:

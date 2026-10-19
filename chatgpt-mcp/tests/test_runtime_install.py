@@ -37,6 +37,7 @@ import sys
 sys.path.insert(0, sys.argv[1])
 import host_runtime_operations
 import host_registered_operations
+import codex_observer
 manager = host_registered_operations.RegisteredHostOperations({}, None, state_dir=sys.argv[2])
 print(host_runtime_operations._verified_installation(), manager._trusted_runtime)
 '''
@@ -63,7 +64,7 @@ class RuntimeInstallTest(unittest.TestCase):
         result = installer.install(self.source, self.root / "runtime", self.projects)
         release = Path(result["runtime_dir"])
         self.assertEqual((release / 'workspace_view.py').read_text(), 'original\n')
-        for name in ('codex_hooks.py', 'codex_observer.py', 'codex_hook_report.py',
+        for name in ('codex_hooks.py', 'codex_observer.py', 'codex_activity.py', 'codex_hook_report.py',
                      'claude_hooks.py', 'claude_hook_report.py', 'host_runtime.py',
                      'host_runtime_config.py', 'host_runtime_operations.py',
                      'host_runtime_tools.py', 'host_runtime_web.py', 'host_db_migration.py',

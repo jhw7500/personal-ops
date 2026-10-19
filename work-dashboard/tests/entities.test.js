@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const {snapshot} = require('../model.js');
+const {latestConcreteTask, scene, snapshot} = require('../model.js');
 
 const project = 'tossApp';
 const now = Date.parse('2026-10-12T01:00:30Z');
@@ -154,4 +154,69 @@ test('safe action metadata identifies a direct build even when its job label is 
   assert.equal(result.tasks[0].action, 'build');
   assert.equal(result.tasks[0].sourceRoom, 'testing');
   assert.equal(result.actors[0].action, 'build');
+});
+
+test('a queued native call stays visible and outranks a newer Codex session heartbeat', () => {
+  const result = snapshot({project, now, records: [
+    record({task_id: 'shell-1', task_kind: 'call', task_label: '테스트 대기', tool_name: 'exec_command',
+      action: 'execute', state: 'queued', time: '2026-10-12T01:00:20Z'}),
+    record({task_id: 'session-activity', task_label: 'Codex 세션', action: 'execute',
+      state: 'running', time: '2026-10-12T01:00:25Z'}),
+  ]});
+  const call = result.tasks.find(task => task.kind === 'call');
+  const heartbeat = result.tasks.find(task => task.sessionActivity);
+  const view = scene(result);
+
+  assert.equal(call.invokedAt, '2026-10-12T01:00:20.000Z');
+  assert.equal(heartbeat.id, 'task:codex-local:session-1:session-activity');
+  assert.equal(result.actors.length, 1);
+  assert.equal(result.actors[0].taskId, call.id);
+  assert.equal(result.actors[0].state, 'queued');
+  assert.equal(result.actors[0].activeCount, 1);
+  assert.equal(view.sprites.length, 1);
+  assert.equal(view.sprites[0].ownerId, result.actors[0].id);
+  assert.equal(view.sprites[0].taskId, call.id);
+  assert.equal(view.sprites[0].state, 'queued');
+  assert.equal(view.sprites[0].room, 'waiting');
+});
+
+test('a running native call outranks a newer Codex session heartbeat without duplicating its actor', () => {
+  const result = snapshot({project, now, records: [
+    record({task_id: 'shell-1', task_kind: 'call', task_label: '테스트 실행', tool_name: 'exec_command',
+      action: 'execute', state: 'running', time: '2026-10-12T01:00:20Z'}),
+    record({task_id: 'session-activity', task_label: 'Codex 세션', action: 'execute',
+      state: 'running', time: '2026-10-12T01:00:25Z'}),
+  ]});
+
+  assert.equal(result.actors.length, 1);
+  assert.equal(result.actors[0].taskId, 'task:codex-local:session-1:shell-1');
+  assert.equal(result.actors[0].activeCount, 1);
+  assert.equal(scene(result).sprites[0].taskId, result.actors[0].taskId);
+});
+
+test('a completed-only native call remains terminal and supplies concrete inspector detail beside liveness', () => {
+  const result = snapshot({project, now, records: [
+    record({task_id: 'shell-1', task_kind: 'call', task_label: '테스트 결과', tool_name: 'exec_command',
+      action: 'execute', state: 'returned', exit_code: 7, time: '2026-10-12T01:00:20Z'}),
+    record({task_id: 'session-activity', task_label: 'Codex 세션', action: 'execute',
+      state: 'running', time: '2026-10-12T01:00:25Z'}),
+  ]});
+  const concrete = latestConcreteTask(result.tasks, result.actors[0].id);
+
+  assert.equal(result.actors[0].taskId, 'task:codex-local:session-1:session-activity');
+  assert.equal(concrete.id, 'task:codex-local:session-1:shell-1');
+  assert.equal(concrete.state, 'returned');
+  assert.equal(concrete.result.exit_code, 7);
+  assert.equal(concrete.replayable, false);
+  assert.equal(scene(result).sprites[0].state, 'running');
+});
+
+test('session activity fallback is exact to Codex CLI and leaves other sources unchanged', () => {
+  const result = snapshot({project, now, records: [
+    record({source_id: 'claude-local', source_kind: 'claude-cli', task_id: 'session-activity',
+      state: 'running', time: '2026-10-12T01:00:25Z'}),
+  ]});
+
+  assert.equal(Object.hasOwn(result.tasks[0], 'sessionActivity'), false);
+  assert.equal(result.actors[0].taskId, result.tasks[0].id);
 });

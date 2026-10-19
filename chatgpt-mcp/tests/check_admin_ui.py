@@ -531,6 +531,54 @@ class AdminBrowserTest(unittest.TestCase):
         self.room.locator('#wd-back-map').click()
         expect(self.room.locator('#wd-camera')).to_be_focused()
 
+    def test_native_queued_call_is_visible_instead_of_newer_session_heartbeat(self):
+        now = datetime.now(timezone.utc)
+        base = {'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',
+                'actor_id': 'terminal-native', 'actor_kind': 'agent', 'actor_label': 'Codex',
+                'task_id': 'session-activity', 'task_kind': 'agent',
+                'task_label': 'Codex session active', 'action': 'execute',
+                'state': 'running', 'time': now.isoformat()}
+        call = {**base, 'task_id': 'call-native-request', 'task_kind': 'call',
+                'task_label': '터미널 도구 호출 요청', 'tool_name': 'exec_command',
+                'state': 'queued', 'time': (now - timedelta(seconds=1)).isoformat()}
+        self.store.record_work_events('alpha', [call, base], provenance='observed')
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.locator('#refresh').click()
+        actor = self.room.locator('.wd-actor[data-actor-id="entity:codex-local:terminal-native"]')
+        expect(actor).to_have_count(1)
+        expect(actor).to_have_attribute('data-state', 'queued')
+        expect(actor).to_have_attribute('data-room', 'waiting')
+        expect(actor).to_have_attribute('data-working', 'false')
+        actor.click()
+        expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('터미널 도구 호출 요청')
+        expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('exec_command')
+
+    def test_native_terminal_result_remains_readable_after_a_newer_heartbeat(self):
+        now = datetime.now(timezone.utc)
+        base = {'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',
+                'actor_id': 'terminal-native', 'actor_kind': 'agent', 'actor_label': 'Codex',
+                'task_id': 'session-activity', 'task_kind': 'agent',
+                'task_label': 'Codex session active', 'action': 'execute',
+                'state': 'running', 'time': now.isoformat()}
+        done = {**base, 'task_id': 'native-result', 'task_kind': 'call',
+                'task_label': '터미널 명령 결과', 'tool_name': 'CommandExecution',
+                'state': 'failed', 'exit_code': 7,
+                'time': (now - timedelta(seconds=1)).isoformat()}
+        self.store.record_work_events('alpha', [done, base], provenance='observed')
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.locator('#refresh').click()
+        actor = self.room.locator('.wd-actor[data-actor-id="entity:codex-local:terminal-native"]')
+        expect(actor).to_have_count(1)
+        actor.click()
+        panel = self.room.locator('#wd-detail .wd-native-activity')
+        expect(panel).to_contain_text('최근 터미널 활동')
+        expect(panel).to_contain_text('터미널 명령 결과')
+        expect(panel).to_contain_text('CommandExecution')
+        expect(panel).to_contain_text('종료 코드 7')
+        expect(panel).to_contain_text('실패')
+        panel.get_by_role('button', name=re.compile('^작업 상세')).click()
+        expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('터미널 명령 결과')
+
     def test_workroom_precedes_approvals_and_navigation_is_keyboard_operable(self):
         original_map = self.page.locator('#work-map').element_handle()
         expect(self.page.locator('#nav-workroom')).to_have_attribute('aria-selected', 'true')
