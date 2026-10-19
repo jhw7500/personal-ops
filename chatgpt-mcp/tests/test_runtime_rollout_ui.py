@@ -60,7 +60,11 @@ if __name__ == "__main__":
             self.manager = RuntimeRolloutWeb(
                 {PROJECT: self.repo}, state_dir=self.base / "rollout-state",
                 launcher=lambda command: self.launched.append(command) or True,
-                observer=observe, test_only=True,
+                observer=observe,
+                runtime_reader=lambda: "a" * 64,
+                boot_reader=lambda: "11111111-2222-3333-4444-555555555555",
+                uid_reader=lambda: 1000,
+                test_only=True,
             )
             token_path = self.base / "private" / "admin-token"
             token_path.parent.mkdir(mode=0o700)

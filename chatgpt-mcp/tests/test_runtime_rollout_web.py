@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -34,9 +35,15 @@ class RuntimeRolloutWebTest(unittest.TestCase):
         shutil.copytree(source / "work-dashboard", self.root / "work-dashboard",
                         ignore=shutil.ignore_patterns("__pycache__"))
         self.started = []
+        self.runtime_identity = "a" * 64
+        self.boot_id = "11111111-2222-3333-4444-555555555555"
+        self.uid = os.getuid()
         self.ops = RuntimeRolloutWeb(
             {PROJECT: self.root}, state_dir=self.base / "state",
             launcher=lambda argv: self.started.append(argv) or True,
+            runtime_reader=lambda: self.runtime_identity,
+            boot_reader=lambda: self.boot_id,
+            uid_reader=lambda: self.uid,
             test_only=True,
         )
         self.assertGreater(_catalog(self.root)["count"], 40)
@@ -122,6 +129,184 @@ class RuntimeRolloutWebTest(unittest.TestCase):
         )
         self.assertEqual(finished["state"], "succeeded")
         self.assertEqual(self.ops.get(PROJECT, plan["operation_id"])["state"], "succeeded")
+
+    def test_boot_change_after_approval_rejects_execute_without_launch(self):
+        plan = self.prepare()
+        self.approve(plan)
+        self.boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        self.assert_error(
+            "ROLLOUT_APPROVAL_STALE",
+            lambda: self.ops.execute(PROJECT, plan["operation_id"]),
+        )
+
+        self.assertFalse(self.started)
+        state = self.ops.get(PROJECT, plan["operation_id"])
+        self.assertEqual((state["state"], state["code"]),
+                         ("expired", "ROLLOUT_APPROVAL_STALE"))
+
+    def test_boot_change_after_queue_fails_claim_and_preserves_receipt(self):
+        plan = self.prepare()
+        self.approve(plan)
+        self.ops.execute(PROJECT, plan["operation_id"])
+        receipt = self.ops.receipts_dir / (plan["operation_id"] + ".json")
+        self.boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        self.assertEqual(
+            self.ops.get(PROJECT, plan["operation_id"])["state"], "queued"
+        )
+
+        self.assert_error(
+            "ROLLOUT_APPROVAL_STALE",
+            lambda: self.ops.claim_for_worker(plan["operation_id"]),
+        )
+
+        state = self.ops.get(PROJECT, plan["operation_id"])
+        self.assertEqual((state["state"], state["phase"], state["code"]),
+                         ("failed", "PRECHECK", "ROLLOUT_APPROVAL_STALE"))
+        self.assertTrue(receipt.is_file())
+
+    def test_new_plan_pins_exact_issuer_context_in_digest(self):
+        plan = self.prepare()
+        stored = self.ops._load(plan["operation_id"])
+
+        self.assertEqual(stored["immutable"]["approval_context"], {
+            "version": 1,
+            "runtime_identity": self.runtime_identity,
+            "boot_id": self.boot_id,
+            "uid": self.uid,
+        })
+        self.assertEqual(stored["plan_digest"],
+                         runtime_rollout_web._digest(stored["immutable"]))
+
+    def test_runtime_and_uid_changes_after_approval_reject_execute(self):
+        for field, changed in (("runtime_identity", "b" * 64), ("uid", self.uid + 1)):
+            with self.subTest(field=field):
+                plan = self.prepare("stale-" + field)
+                self.approve(plan)
+                if field == "runtime_identity":
+                    self.runtime_identity = changed
+                else:
+                    self.uid = changed
+                self.assert_error(
+                    "ROLLOUT_APPROVAL_STALE",
+                    lambda: self.ops.execute(PROJECT, plan["operation_id"]),
+                )
+                self.assertFalse(self.started)
+                self.runtime_identity = "a" * 64
+                self.uid = os.getuid()
+
+    def test_pending_context_mismatch_expires_and_allows_new_request(self):
+        plan = self.prepare()
+        self.runtime_identity = "b" * 64
+
+        stale = self.ops.get(PROJECT, plan["operation_id"])
+
+        self.assertEqual((stale["state"], stale["phase"], stale["code"]),
+                         ("expired", "APPROVAL", "ROLLOUT_APPROVAL_STALE"))
+        replacement = self.prepare("replacement-after-context-change")
+        self.assertEqual(replacement["state"], "pending_host_approval")
+
+    def test_context_read_failure_is_not_misclassified_as_stale(self):
+        plan = self.prepare()
+        self.ops.runtime_reader = lambda: (_ for _ in ()).throw(
+            HostRuntimeError("UNSAFE_RUNTIME")
+        )
+
+        self.assert_error(
+            "UNSAFE_RUNTIME", lambda: self.ops.get(PROJECT, plan["operation_id"])
+        )
+
+        self.assertEqual(self.ops._load(plan["operation_id"])["state"],
+                         "pending_host_approval")
+
+    def test_legacy_unbound_approval_is_retired_without_rebinding(self):
+        plan = self.prepare()
+        self.approve(plan)
+        stored = self.ops._load(plan["operation_id"])
+        del stored["immutable"]["approval_context"]
+        stored["plan_digest"] = runtime_rollout_web._digest(stored["immutable"])
+        receipt_path = self.ops.receipts_dir / (plan["operation_id"] + ".json")
+        receipt = json.loads(receipt_path.read_text())
+        receipt["plan_digest"] = stored["plan_digest"]
+        receipt_path.write_text(json.dumps(receipt))
+        self.ops._save(stored)
+
+        retired = self.ops.get(PROJECT, plan["operation_id"])
+
+        self.assertEqual((retired["state"], retired["code"]),
+                         ("expired", "ROLLOUT_APPROVAL_STALE"))
+        self.assertNotIn("approval_context", retired)
+
+    def test_legacy_unbound_pending_plan_is_retired_without_rebinding(self):
+        plan = self.prepare()
+        stored = self.ops._load(plan["operation_id"])
+        del stored["immutable"]["approval_context"]
+        stored["plan_digest"] = runtime_rollout_web._digest(stored["immutable"])
+        self.ops._save(stored)
+
+        retired = self.ops.get(PROJECT, plan["operation_id"])
+
+        self.assertEqual((retired["state"], retired["phase"], retired["code"]),
+                         ("expired", "APPROVAL", "ROLLOUT_APPROVAL_STALE"))
+
+    def test_running_and_succeeded_are_not_freshness_reconciled(self):
+        plan = self.prepare()
+        self.approve(plan)
+        self.ops.execute(PROJECT, plan["operation_id"])
+        self.ops.claim_for_worker(plan["operation_id"])
+        self.boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        self.assertEqual(
+            self.ops.get(PROJECT, plan["operation_id"])["state"], "running"
+        )
+        self.ops.finish_from_worker(plan["operation_id"], {
+            "status": "ready", "snapshot": "b" * 20,
+        })
+        self.runtime_identity = "c" * 64
+        self.assertEqual(
+            self.ops.get(PROJECT, plan["operation_id"])["state"], "succeeded"
+        )
+
+    def test_malformed_new_context_is_invalid_not_legacy(self):
+        plan = self.prepare()
+        stored = self.ops._load(plan["operation_id"])
+        del stored["immutable"]["approval_context"]["uid"]
+        stored["plan_digest"] = runtime_rollout_web._digest(stored["immutable"])
+        self.ops._save(stored)
+
+        self.assert_error(
+            "ROLLOUT_PLAN_INVALID",
+            lambda: self.ops.get(PROJECT, plan["operation_id"]),
+        )
+        self.assert_error(
+            "ROLLOUT_PLAN_INVALID",
+            lambda: self.ops._validated_approval_context({
+                "version": True,
+                "runtime_identity": self.runtime_identity,
+                "boot_id": self.boot_id,
+                "uid": self.uid,
+            }),
+        )
+
+    def test_invalid_receipt_at_claim_is_durable_failed_and_preserved(self):
+        plan = self.prepare()
+        self.approve(plan)
+        self.ops.execute(PROJECT, plan["operation_id"])
+        receipt_path = self.ops.receipts_dir / (plan["operation_id"] + ".json")
+        receipt = json.loads(receipt_path.read_text())
+        receipt["unexpected"] = True
+        receipt_path.write_text(json.dumps(receipt))
+
+        self.assert_error(
+            "ROLLOUT_APPROVAL_DENIED",
+            lambda: self.ops.claim_for_worker(plan["operation_id"]),
+        )
+
+        state = self.ops.get(PROJECT, plan["operation_id"])
+        self.assertEqual((state["state"], state["phase"], state["code"]),
+                         ("failed", "PRECHECK", "ROLLOUT_APPROVAL_DENIED"))
+        self.assertTrue(receipt_path.is_file())
 
     def test_worker_claim_rejects_approval_that_expired_after_queue(self):
         plan = self.prepare()

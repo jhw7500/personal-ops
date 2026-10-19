@@ -37,6 +37,7 @@ import host_command_tools
 import toss_console_codex
 import toss_console_tools
 import host_command_ui
+import runtime_rollout_ui
 import host_execution_tools
 import host_operation_ui
 from runtime_rollout_web import RuntimeRolloutWeb
@@ -238,7 +239,8 @@ async def serve(projects):
     console_connection = (toss_console_codex.CodexConsoleConnection(
         projects, state_dir / "toss-console") if "tossApp" in projects else None)
     console = (toss_console_tools.TossConsoleReadOnlyTools(
-        provider_factory=console_connection.get_provider)
+        provider_factory=console_connection.get_provider,
+        ux019_provider_factory=console_connection.get_ux019_provider)
         if console_connection is not None else None)
     console_specs = toss_console_tools.TOSS_CONSOLE_TOOL_SPECS if console is not None else []
     console_names = console.names if console is not None else set()
@@ -246,6 +248,8 @@ async def serve(projects):
                         if "personal-ops" in projects else None)
     rollout_specs = RUNTIME_ROLLOUT_TOOL_SPECS if runtime_rollouts is not None else []
     rollout_names = {spec["name"] for spec in rollout_specs}
+    rollout_approvals = (runtime_rollout_ui.RuntimeRolloutApprovalTools(runtime_rollouts)
+                         if runtime_rollouts is not None else None)
     job_names = {spec["name"] for spec in JOB_TOOL_SPECS}
     git_names = {spec["name"] for spec in GIT_TOOL_SPECS}
     discovered = []
@@ -393,6 +397,9 @@ async def serve(projects):
                                title="호스트 권한 승인", mimeType=UI_MIME),
                 types.Resource(uri=host_command_ui.UI_URI, name="host-command-approval",
                                title="호스트 명령 계획 승인", mimeType=UI_MIME),
+                *([types.Resource(uri=runtime_rollout_ui.UI_URI, name="runtime-rollout-approval",
+                                  title="MCP 런타임 전환 승인", mimeType=UI_MIME)]
+                  if rollout_approvals is not None else []),
                 *([types.Resource(uri=host_operation_ui.UI_URI,
                                   name="schema014-operation-approval",
                                   title="Schema 014 계획 승인", mimeType=UI_MIME)]
@@ -402,7 +409,7 @@ async def serve(projects):
     # Register the typed handler directly to preserve the UI's CSP and border hints.
     async def read_resource(request):
         uri = str(request.params.uri)
-        known = uri in {UI_URI, host_access_ui.UI_URI, host_command_ui.UI_URI} | (
+        known = uri in ({runtime_rollout_ui.UI_URI} if rollout_approvals is not None else set()) | {UI_URI, host_access_ui.UI_URI, host_command_ui.UI_URI} | (
             {host_operation_ui.UI_URI} if schema014_approvals is not None else set())
         log_ui_event("resources/read", known_uri=known, ui_resource=uri if known else None)
         if not known:
@@ -410,7 +417,9 @@ async def serve(projects):
         access_approval = uri == host_access_ui.UI_URI
         schema014_approval = uri == host_operation_ui.UI_URI
         command_approval = uri == host_command_ui.UI_URI
-        filename = ("host-access-approval.html" if access_approval else
+        rollout_approval = uri == runtime_rollout_ui.UI_URI
+        filename = ("runtime-rollout-approval.html" if rollout_approval else
+                    "host-access-approval.html" if access_approval else
                     "host-operation-approval.html" if schema014_approval else
                     "host-command-approval.html" if command_approval else
                     "project-picker.html")
@@ -421,6 +430,8 @@ async def serve(projects):
                           "csp": {"connectDomains": [], "resourceDomains": []}},
                    "openai/ui": {"availableDisplayModes": ["inline"]},
                    "openai/widgetDescription": (
+                       "정확한 MCP 런타임 계획과 재시작·보존 대상을 확인하는 1회 승인 카드. "
+                       "승인만으로 설치·재시작하지 않습니다." if rollout_approval else
                        "호스트 사용자 권한·기간·Codex 사용을 확인하고 직접 승인하는 카드. "
                        "카드를 열기만 해서는 승인되지 않습니다." if access_approval else
                        "고정된 Schema 014 계획과 digest를 확인하고 1회 승인하는 카드. "
@@ -488,6 +499,8 @@ async def serve(projects):
         # Privileged app callbacks have reviewed visibility separate from execution tools.
         execution_tools.extend(types.Tool(**spec) for spec in host_access_ui.tool_specs(projects))
         execution_tools.extend(types.Tool(**spec) for spec in host_command_ui.tool_specs(projects))
+        if rollout_approvals is not None:
+            execution_tools.extend(types.Tool(**spec) for spec in runtime_rollout_ui.tool_specs())
         if schema014_approvals is not None:
             execution_tools.extend(types.Tool(**spec) for spec in host_operation_ui.tool_specs())
         memory_output_schema = {
@@ -813,6 +826,8 @@ async def serve(projects):
                 content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
                 structuredContent=payload,
             )
+        if rollout_approvals is not None and name in rollout_approvals.names:
+            return types.CallToolResult(**(await rollout_approvals.call(name, arguments)))
         if name in access_approvals.names:
             # _meta is component-only; do not serialize this envelope into public content.
             return types.CallToolResult(**(await access_approvals.call(name, arguments)))
@@ -1091,6 +1106,8 @@ async def serve(projects):
             validator = access_approvals
         elif request.params.name in schema014_approval_names:
             validator = schema014_approvals
+        elif rollout_approvals is not None and request.params.name in rollout_approvals.names:
+            validator = rollout_approvals
         elif request.params.name in command_approvals.names:
             validator = command_approvals
         if validator is not None:

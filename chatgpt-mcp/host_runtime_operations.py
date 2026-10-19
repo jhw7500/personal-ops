@@ -47,7 +47,7 @@ VERIFIED_RUNTIME_FILES = (
     "approve-host-operation.py", "host_runtime_web.py", "host_db_migration.py", "host_schema014.py",
     "toss_console_evidence.py", "toss_console_tools.py", "toss_console_sdk_bridge.py",
     "toss_console_codex.py",
-    "runtime_rollout_web.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py",
+    "runtime_rollout_web.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py", "runtime_rollout_ui.py", "runtime-rollout-approval.html",
     "admin_server.py", "admin.html", "admin.js", "admin.css", "agent-admin.js",
     "runtime-rollout-admin.js",
     "workroom-frame.html", "workroom-frame.js", "workroom-bridge.js",

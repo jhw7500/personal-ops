@@ -20,7 +20,7 @@ HOST_TOOLS = {
     "execute_test_deploy", "get_host_operation", "get_db_migration_status", "prepare_db_migration",
     "get_predecessor_migration_status", "prepare_predecessor_migration",
     "execute_predecessor_migration", "execute_db_migration",
-    "get_toss_test_console_status",
+    "get_toss_test_console_status", "get_toss_ux019_test_console_status",
 }
 
 
@@ -80,6 +80,18 @@ class HostRuntimeRouterTest(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(result["code"], "CONSOLE_OAUTH_NOT_CONFIGURED")
                             self.assertFalse(result["provider_verified"])
                             self.assertFalse(result["test_bundle_ready"])
+                            self.assertEqual(result["deployment_id"], "01a13e37-27f3-7f9c-923d-6dbd690a5a09")
+                            self.assertTrue(descriptors["get_toss_ux019_test_console_status"].annotations.readOnlyHint)
+                            ux019 = await client.call_tool("get_toss_ux019_test_console_status", {
+                                "project": "tossApp", "target": "tarororo-test",
+                            })
+                            self.assertFalse(ux019.isError)
+                            next_result = json.loads("".join(item.text for item in ux019.content
+                                                             if item.type == "text"))
+                            self.assertEqual(next_result["deployment_id"], "01a151bd-4015-75cf-8275-fa6b6aef9a47")
+                            self.assertEqual(next_result["code"], "CONSOLE_OAUTH_NOT_CONFIGURED")
+                            self.assertFalse(next_result["provider_verified"])
+                            self.assertFalse(next_result["test_bundle_ready"])
                             self.assertTrue(descriptors["get_db_migration_status"].annotations.readOnlyHint)
                             self.assertTrue(descriptors["get_predecessor_migration_status"].annotations.readOnlyHint)
                             self.assertTrue(descriptors["execute_predecessor_migration"].annotations.destructiveHint)

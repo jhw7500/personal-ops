@@ -26,7 +26,11 @@ class RuntimeRolloutHTTPTest(unittest.TestCase):
         self.launched = []
         self.manager = RuntimeRolloutWeb(
             {"personal-ops": self.repo}, state_dir=self.base / "state",
-            launcher=lambda command: self.launched.append(command) or True, test_only=True)
+            launcher=lambda command: self.launched.append(command) or True,
+            runtime_reader=lambda: "a" * 64,
+            boot_reader=lambda: "11111111-2222-3333-4444-555555555555",
+            uid_reader=lambda: 1000,
+            test_only=True)
         self.plan = self.manager.prepare("personal-ops", "web-approval-test")
         private = self.base / "private"
         private.mkdir(mode=0o700)

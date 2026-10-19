@@ -18,7 +18,7 @@ import json
 import re
 from typing import Any, Mapping
 
-from toss_console_evidence import DEPLOYMENT_ID, MINIAPP_ID, WORKSPACE_ID
+from toss_console_evidence import ALLOWED_DEPLOYMENT_IDS, DEPLOYMENT_ID, MINIAPP_ID, WORKSPACE_ID
 from toss_console_tools import (
     CALL_TIMEOUT_SECONDS, CONSOLE_MCP_ORIGIN, OAUTH_CLIENT_ID, VerifiedProviderContext,
 )
@@ -47,6 +47,13 @@ class ConsoleSessionContractError(ValueError):
     """Constant, non-sensitive error code. No provider exception content."""
 
 
+def reviewed_console_arguments(deployment_id: str = DEPLOYMENT_ID) -> dict[str, str | int]:
+    """Return a fresh canonical query for one source-reviewed deployment only."""
+    if type(deployment_id) is not str or deployment_id not in ALLOWED_DEPLOYMENT_IDS:
+        raise ConsoleSessionContractError("CONSOLE_ARGUMENTS_NOT_REVIEWED")
+    return {**dict(_REVIEWED_CONSOLE_ARGUMENT_ITEMS), "search": deployment_id}
+
+
 @dataclass(frozen=True)
 class ReviewedBundleListContract:
     """Owned, source-pinned contract, based on the *actual* OAuth tool schema.
@@ -61,8 +68,12 @@ class ReviewedBundleListContract:
     oauth_resource: str = OAUTH_RESOURCE
     client_id: str = OAUTH_CLIENT_ID
     readonly_policy: str = "provider_hint"
+    deployment_id: str = DEPLOYMENT_ID
 
     def __post_init__(self):
+        canonical = reviewed_console_arguments(self.deployment_id)
+        if self.deployment_id != DEPLOYMENT_ID and self.readonly_policy != "pinned_bundle_list":
+            raise ConsoleSessionContractError("CONSOLE_SCOPE_NOT_REVIEWED")
         if (self.endpoint != CONSOLE_MCP_ORIGIN
                 or self.oauth_resource != OAUTH_RESOURCE
                 or self.client_id != OAUTH_CLIENT_ID):
@@ -77,7 +88,7 @@ class ReviewedBundleListContract:
             if type(self.arguments) is not dict or len(self.arguments) != len(
                     _REVIEWED_CONSOLE_ARGUMENT_ITEMS):
                 raise ConsoleSessionContractError("CONSOLE_ARGUMENTS_NOT_REVIEWED")
-            for key, expected in _REVIEWED_CONSOLE_ARGUMENT_ITEMS:
+            for key, expected in canonical.items():
                 actual = self.arguments.get(key)
                 if type(actual) is not type(expected) or actual != expected:
                     raise ConsoleSessionContractError("CONSOLE_ARGUMENTS_NOT_REVIEWED")

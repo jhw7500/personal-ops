@@ -16,6 +16,8 @@ APP_NAME = "tarororo"
 WORKSPACE_ID = "93125"
 MINIAPP_ID = "75257"
 DEPLOYMENT_ID = "01a13e37-27f3-7f9c-923d-6dbd690a5a09"
+UX019_DEPLOYMENT_ID = "01a151bd-4015-75cf-8275-fa6b6aef9a47"
+ALLOWED_DEPLOYMENT_IDS = frozenset({DEPLOYMENT_ID, UX019_DEPLOYMENT_ID})
 MAX_BUNDLES = 200
 
 
@@ -91,7 +93,7 @@ def project_bundle_list(
         raise ConsoleEvidenceError("UNAUTHORIZED_CONSOLE_TOOL")
     _require_identifier(workspace_id, WORKSPACE_ID)
     _require_identifier(miniapp_id, MINIAPP_ID)
-    if type(deployment_id) is not str or deployment_id != DEPLOYMENT_ID:
+    if type(deployment_id) is not str or deployment_id not in ALLOWED_DEPLOYMENT_IDS:
         raise ConsoleEvidenceError("WRONG_CONSOLE_TARGET")
 
     matches: list[dict[str, Any]] = []
@@ -103,7 +105,7 @@ def project_bundle_list(
         return {
             "project": "tossApp", "app": APP_NAME,
             "workspace_id": WORKSPACE_ID, "miniapp_id": MINIAPP_ID,
-            "deployment_id": DEPLOYMENT_ID, "found": False,
+            "deployment_id": deployment_id, "found": False,
             "test_bundle_ready": False,
             "remote_digest_verified": False,
             "evidence": "BUNDLE_NOT_CONFIRMED_IN_PAGE",
@@ -139,7 +141,7 @@ def project_bundle_list(
     return {
         "project": "tossApp", "app": APP_NAME,
         "workspace_id": WORKSPACE_ID, "miniapp_id": MINIAPP_ID,
-        "deployment_id": DEPLOYMENT_ID,
+        "deployment_id": deployment_id,
         "found": True,
         "test_bundle_ready": ready,
         "review_status": review_status,

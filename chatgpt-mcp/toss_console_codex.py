@@ -17,9 +17,9 @@ import stat
 from typing import Any
 
 from jobs import private_directory
-from toss_console_evidence import ConsoleEvidenceError
+from toss_console_evidence import ConsoleEvidenceError, DEPLOYMENT_ID, UX019_DEPLOYMENT_ID
 from toss_console_sdk_bridge import (
-    REVIEWED_CONSOLE_ARGUMENTS, REVIEWED_CONSOLE_SCHEMA_SHA256,
+    REVIEWED_CONSOLE_SCHEMA_SHA256, reviewed_console_arguments, ConsoleSessionContractError,
     ReviewedBundleListContract, ReviewedMcpBundleListProvider,
 )
 from toss_console_tools import CONSOLE_MCP_ORIGIN, VerifiedProviderContext
@@ -274,13 +274,18 @@ class _CodexClient:
         return {"tools": selected}
 
     async def call_tool(self, name, *, arguments):
-        if (name != "bundle_list" or type(arguments) is not dict
-                or arguments != REVIEWED_CONSOLE_ARGUMENTS
-                or any(type(arguments[k]) is not type(v) for k, v in REVIEWED_CONSOLE_ARGUMENTS.items())):
+        if name != "bundle_list" or type(arguments) is not dict:
+            raise _error("UNAUTHORIZED_CONSOLE_TOOL")
+        try:
+            canonical = reviewed_console_arguments(arguments.get("search"))
+        except ConsoleSessionContractError:
+            raise _error("UNAUTHORIZED_CONSOLE_TOOL") from None
+        if (arguments != canonical
+                or any(type(arguments[k]) is not type(v) for k, v in canonical.items())):
             raise _error("UNAUTHORIZED_CONSOLE_TOOL")
         return await self.request("mcpServer/tool/call", {
             "threadId": self.thread_id, "server": SERVER_NAME, "tool": "bundle_list",
-            "arguments": dict(REVIEWED_CONSOLE_ARGUMENTS)})
+            "arguments": canonical})
 
     async def close(self) -> None:
         process, self.process = self.process, None
@@ -328,7 +333,15 @@ class CodexConsoleConnection:
         self._identity = None
         self._lock = asyncio.Lock()
 
-    async def get_provider(self):
+    async def get_ux019_provider(self):
+        return await self.get_provider(deployment_id=UX019_DEPLOYMENT_ID)
+
+    async def get_provider(self, *, deployment_id: str = DEPLOYMENT_ID):
+        # Validate before reading configuration, creating a process or resetting a session.
+        try:
+            canonical = reviewed_console_arguments(deployment_id)
+        except ConsoleSessionContractError:
+            raise _error("WRONG_CONSOLE_TARGET") from None
         async with self._lock:
             try:
                 configuration = _configuration(self.config_path, self.roots)
@@ -350,7 +363,8 @@ class CodexConsoleConnection:
                     _CatalogSession(self._client, catalog),
                     ReviewedBundleListContract(
                         schema_sha256=REVIEWED_CONSOLE_SCHEMA_SHA256,
-                        arguments=dict(REVIEWED_CONSOLE_ARGUMENTS), readonly_policy="pinned_bundle_list"),
+                        arguments=canonical, readonly_policy="pinned_bundle_list",
+                        deployment_id=deployment_id),
                     trusted_oauth_session=True)
                 await provider.verify_catalog()
                 return _ManagedProvider(provider)

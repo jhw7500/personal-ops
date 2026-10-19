@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 
+import host_access
 from host_runtime_config import HostRuntimeError, TRUSTED_APPROVAL_ORIGIN, private_dir
 from host_runtime_operations import (_digest, _lock, _read_private_json,
                                      _save_private_json, _verified_installation,
@@ -43,10 +44,11 @@ CONTROL = ("rollout-host-runtime.py", "rollout_tunnel.py",
            "install-runtime.py", "configure-host-runtime.py")
 RUNNER_NAME = "runtime_rollout_worker.py"
 TERMINAL = frozenset({"succeeded", "failed", "verification_required",
-                       "outcome_unknown", "expired"})
+                       "outcome_unknown", "expired", "cancelled"})
 UNIT = re.compile(r"personal-ops-runtime-rollout-[0-9a-f]{32}\.service\Z")
 UNIT_FIELDS = ("Id", "LoadState", "Transient", "ActiveState", "SubState", "Result")
 BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+APPROVAL_CONTEXT_FIELDS = frozenset({"version", "runtime_identity", "boot_id", "uid"})
 
 
 def _utc():
@@ -330,7 +332,7 @@ class WebRolloutGrant:
 
 class RuntimeRolloutWeb:
     def __init__(self, projects: dict, *, state_dir: Path, launcher=None, observer=None,
-                 boot_reader=None, test_only=False):
+                 boot_reader=None, runtime_reader=None, uid_reader=None, test_only=False):
         if PROJECT not in projects:
             raise HostRuntimeError("ROLLOUT_SCOPE_UNAVAILABLE")
         self.root = Path(projects[PROJECT]).resolve(strict=True)
@@ -345,6 +347,8 @@ class RuntimeRolloutWeb:
         self.launcher = launcher
         self.observer = observer or _observe_unit
         self.boot_reader = boot_reader or _boot_id
+        self.runtime_reader = runtime_reader or host_access._installed_runtime_identity
+        self.uid_reader = uid_reader or os.getuid
         self._trusted = _verified_installation() or bool(test_only and launcher is not None)
 
     def _trusted_only(self):
@@ -364,10 +368,88 @@ class RuntimeRolloutWeb:
                 or plan.get("plan_digest") != _digest(fixed)
                 or fixed.get("operation_id") != operation_id):
             raise HostRuntimeError("ROLLOUT_PLAN_INVALID")
+        if "approval_context" in fixed:
+            self._stored_approval_context(plan)
         return plan
 
     def _save(self, plan):
         _save_private_json(self._plan_path(plan["operation_id"]), plan)
+
+    @staticmethod
+    def _validated_approval_context(value):
+        if (not isinstance(value, dict) or set(value) != APPROVAL_CONTEXT_FIELDS
+                or type(value.get("version")) is not int or value["version"] != 1
+                or type(value.get("uid")) is not int
+                or value["uid"] < 0
+                or not isinstance(value.get("runtime_identity"), str)
+                or HEX64.fullmatch(value["runtime_identity"]) is None
+                or not isinstance(value.get("boot_id"), str)
+                or BOOT_ID.fullmatch(value["boot_id"]) is None):
+            raise HostRuntimeError("ROLLOUT_PLAN_INVALID")
+        return value
+
+    def _stored_approval_context(self, plan):
+        fixed = plan["immutable"]
+        if "approval_context" not in fixed:
+            return None
+        return self._validated_approval_context(fixed["approval_context"])
+
+    def _current_approval_context(self):
+        try:
+            value = {
+                "version": 1,
+                "runtime_identity": self.runtime_reader(),
+                "boot_id": self.boot_reader(),
+                "uid": self.uid_reader(),
+            }
+        except HostRuntimeError:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise HostRuntimeError("UNSAFE_RUNTIME") from None
+        try:
+            return dict(self._validated_approval_context(value))
+        except HostRuntimeError:
+            raise HostRuntimeError("UNSAFE_RUNTIME") from None
+
+    def _approval_context_is_current(self, plan):
+        expected = self._stored_approval_context(plan)
+        return expected is not None and expected == self._current_approval_context()
+
+    def _verify_receipt(self, plan):
+        fixed = plan["immutable"]
+        expected = {
+            "operation_id": plan["operation_id"],
+            "plan_digest": plan["plan_digest"],
+            "nonce": fixed["nonce"],
+        }
+        try:
+            receipt = _read_private_json(
+                self.receipts_dir / (plan["operation_id"] + ".json")
+            )
+            approved_at = _expires(receipt["approved_at"])
+            if (set(receipt) != {*expected, "approved_at"}
+                    or any(receipt.get(key) != value for key, value in expected.items())
+                    or not _expires(plan["created_at"]) <= approved_at <= _utc()
+                    or approved_at >= _expires(fixed["expires_at"])):
+                raise HostRuntimeError("ROLLOUT_APPROVAL_DENIED")
+        except (OSError, KeyError, TypeError, ValueError, HostRuntimeError):
+            raise HostRuntimeError("ROLLOUT_APPROVAL_DENIED") from None
+        return receipt
+
+    def verify_approval(self, plan):
+        if not self._approval_context_is_current(plan):
+            raise HostRuntimeError("ROLLOUT_APPROVAL_STALE")
+        return self._verify_receipt(plan)
+
+    def _reconcile_approval_context(self, plan):
+        if plan.get("state") not in {"pending_host_approval", "approved"}:
+            return plan
+        if self._approval_context_is_current(plan):
+            return plan
+        plan.update(state="expired", phase="APPROVAL", code="ROLLOUT_APPROVAL_STALE",
+                    finished_at=_utc().isoformat())
+        self._save(plan)
+        return plan
 
     @staticmethod
     def _public(plan):
@@ -388,6 +470,9 @@ class RuntimeRolloutWeb:
                     and isinstance(plan.get("started_at"), str)
                     and (_utc() - _expires(plan["started_at"])).total_seconds() > 1320),
                 "approval_required": plan["state"] == "pending_host_approval",
+                "approval_card": {"tool": "open_runtime_rollout_approval", "arguments": {
+                    "project": PROJECT, "operation_id": plan["operation_id"]}}
+                    if plan["state"] in {"pending_host_approval", "approved"} else None,
                 "impact": {"restart": ["personal-ops-tunnel.service", "personal-ops-admin.service"],
                            "preserve": ["API", "Worker", "PostgreSQL", "Toss TEST bundle"]},
                 "approval_url": TRUSTED_APPROVAL_ORIGIN + "/runtime-rollouts?operation_id="
@@ -396,6 +481,7 @@ class RuntimeRolloutWeb:
 
     def _reconcile(self, plan):
         """Conservatively settle only stale workers proven absent by their exact unit."""
+        plan = self._reconcile_approval_context(plan)
         state = plan.get("state")
         if state not in {"queued", "running"}:
             return plan
@@ -496,6 +582,7 @@ class RuntimeRolloutWeb:
                          "source_digest": base["digest"],
                          "target_snapshot": target, "control_digest": control,
                          "source_files": base["count"], "source_bytes": base["bytes"],
+                         "approval_context": self._current_approval_context(),
                          "nonce": secrets.token_hex(32),
                          "expires_at": (_utc() + PLAN_TTL).isoformat()}
                 plan = {"project": PROJECT, "operation_id": operation_id,
@@ -531,7 +618,7 @@ class RuntimeRolloutWeb:
         if not isinstance(plan_digest, str) or not HEX64.fullmatch(plan_digest):
             raise HostRuntimeError("ROLLOUT_APPROVAL_DENIED")
         with _lock(self.lock):
-            plan = self._load(operation_id)
+            plan = self._reconcile(self._load(operation_id))
             if (plan["state"] != "pending_host_approval" or plan["plan_digest"] != plan_digest
                     or plan["immutable"]["source_digest"] != source_digest
                     or _expires(plan["immutable"]["expires_at"]) <= _utc()):
@@ -541,18 +628,7 @@ class RuntimeRolloutWeb:
             expected = {"operation_id": operation_id, "plan_digest": plan_digest,
                         "nonce": plan["immutable"]["nonce"]}
             if receipt.exists() or receipt.is_symlink():
-                recovered = _read_private_json(receipt)
-                if (set(recovered) != {*expected, "approved_at"}
-                        or any(recovered.get(key) != value for key, value in expected.items())):
-                    raise HostRuntimeError("ROLLOUT_APPROVAL_DENIED")
-                try:
-                    approved_at = _expires(recovered.get("approved_at"))
-                    created_at = _expires(plan["created_at"])
-                    expires_at = _expires(plan["immutable"]["expires_at"])
-                except (HostRuntimeError, KeyError, TypeError):
-                    raise HostRuntimeError("ROLLOUT_APPROVAL_DENIED") from None
-                if not created_at <= approved_at <= _utc() or approved_at >= expires_at:
-                    raise HostRuntimeError("ROLLOUT_APPROVAL_DENIED")
+                self.verify_approval(plan)
             else:
                 fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                              0o600)
@@ -570,7 +646,9 @@ class RuntimeRolloutWeb:
         if project != PROJECT:
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
         with _lock(self.lock):
-            plan = self._load(operation_id)
+            plan = self._reconcile(self._load(operation_id))
+            if plan.get("code") == "ROLLOUT_APPROVAL_STALE":
+                raise HostRuntimeError("ROLLOUT_APPROVAL_STALE")
             if plan["state"] in TERMINAL | {"queued", "running"}:
                 return self._public(plan)
             if (plan["state"] != "approved"
@@ -588,11 +666,7 @@ class RuntimeRolloutWeb:
                                           or not node_binary.is_file()
                                           or not os.access(node_binary, os.X_OK)):
                 raise HostRuntimeError("ROLLOUT_RUNTIME_NOT_READY")
-            receipt = _read_private_json(self.receipts_dir / (operation_id + ".json"))
-            if (receipt.get("plan_digest") != plan["plan_digest"]
-                    or receipt.get("nonce") != plan["immutable"]["nonce"]
-                    or receipt.get("operation_id") != operation_id):
-                raise HostRuntimeError("ROLLOUT_APPROVAL_DENIED")
+            self.verify_approval(plan)
             plan.update(state="queued", phase="QUEUED", started_at=_utc().isoformat(),
                         launch_boot_id=self.boot_reader())
             self._save(plan)
@@ -645,6 +719,7 @@ class RuntimeRolloutWeb:
                 raise HostRuntimeError("ROLLOUT_APPROVAL_EXPIRED")
             try:
                 self._check_source(plan)
+                self.verify_approval(plan)
             except HostRuntimeError as exc:
                 # The independent worker has not claimed or executed any side
                 # effect yet. Record an explicit failed preflight, not a
@@ -653,11 +728,6 @@ class RuntimeRolloutWeb:
                             finished_at=_utc().isoformat())
                 self._save(plan)
                 raise
-            receipt = _read_private_json(self.receipts_dir / (operation_id + ".json"))
-            if (receipt.get("plan_digest") != plan["plan_digest"]
-                    or receipt.get("nonce") != plan["immutable"]["nonce"]
-                    or receipt.get("operation_id") != operation_id):
-                raise HostRuntimeError("ROLLOUT_APPROVAL_DENIED")
             plan.update(state="running", phase="PRECHECK", worker_pid=os.getpid())
             self._save(plan)
             (self.receipts_dir / (operation_id + ".json")).unlink()

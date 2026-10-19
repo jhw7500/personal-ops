@@ -55,7 +55,7 @@ class RolloutTest(unittest.TestCase):
         expected = {
             "get_runtime_status", "compare_deployment", "get_db_migration_status",
             "get_predecessor_migration_status", "get_schema014_migration_status",
-            "get_toss_test_console_status",
+            "get_toss_test_console_status", "get_toss_ux019_test_console_status",
             "prepare_schema014_migration", "execute_schema014_migration",
             "prepare_db_migration", "prepare_predecessor_migration",
             "execute_db_migration", "execute_predecessor_migration",
@@ -69,6 +69,7 @@ class RolloutTest(unittest.TestCase):
             "request_host_access", "get_host_access", "start_host_execution",
             "get_host_execution", "read_host_execution_log", "cancel_host_execution",
             "prepare_runtime_rollout", "get_runtime_rollout", "execute_runtime_rollout",
+            "open_runtime_rollout_approval", "confirm_runtime_rollout_approval", "cancel_runtime_rollout_approval",
             "open_host_access_approval", "update_host_access_approval",
             "confirm_host_access_approval", "cancel_host_access_approval",
             "open_schema014_approval", "confirm_schema014_approval",
@@ -77,6 +78,7 @@ class RolloutTest(unittest.TestCase):
             "cancel_host_command_approval",
         }
         self.assertEqual(module.TOOL_NAMES, expected)
+        self.assertIn("tests.test_toss_console_ux019", module.TESTS)
         self.assertIn("tests.test_host_predecessor_migration", module.TESTS)
         self.assertIn("tests.test_host_registered_operations", module.TESTS)
         self.assertIn("tests.test_stage1_activation_fixes", module.TESTS)

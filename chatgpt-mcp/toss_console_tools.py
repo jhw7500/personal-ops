@@ -11,11 +11,13 @@ bundle payloads or a Claude/Codex session token as provider evidence.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+from functools import partial
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
 from toss_console_evidence import (
-    APP_NAME, DEPLOYMENT_ID, MINIAPP_ID, WORKSPACE_ID,
+    APP_NAME, DEPLOYMENT_ID, UX019_DEPLOYMENT_ID, MINIAPP_ID, WORKSPACE_ID,
     ConsoleEvidenceError, project_bundle_list,
 )
 
@@ -24,6 +26,10 @@ TARGET = "tarororo-test"
 CONSOLE_MCP_ORIGIN = "https://mcp.toss.im/adapters/apps-in-toss-console/mcp"
 OAUTH_CLIENT_ID = "mcp-gateway"
 CALL_TIMEOUT_SECONDS = 10
+_DEPLOYMENTS_BY_TOOL = {
+    "get_toss_test_console_status": DEPLOYMENT_ID,
+    "get_toss_ux019_test_console_status": UX019_DEPLOYMENT_ID,
+}
 
 TOSS_CONSOLE_TOOL_SPECS = [
     {
@@ -51,6 +57,18 @@ TOSS_CONSOLE_TOOL_SPECS = [
         },
     },
 ]
+# Keep the legacy descriptor and its call arguments unchanged. No arbitrary ID input.
+TOSS_CONSOLE_TOOL_SPECS.append({
+    **deepcopy(TOSS_CONSOLE_TOOL_SPECS[0]),
+    "name": "get_toss_ux019_test_console_status",
+    "title": "Toss UX019 TEST 콘솔 번들 읽기 전용 검증",
+    "description": (
+        "Read only the exact tarororo UX019 TEST deployment "
+        "01a151bd-4015-75cf-8275-fa6b6aef9a47 via the owner-approved console connection. "
+        "Preserves the legacy UX014 tool. No arbitrary IDs, raw responses, credentials, "
+        "OAuth login, uploads, invitations or review actions are accepted."
+    ),
+})
 
 
 @dataclass(frozen=True)
@@ -80,14 +98,14 @@ class ReadOnlyBundleProvider(Protocol):
 ProviderFactory = Callable[[], Awaitable[ReadOnlyBundleProvider | None]]
 
 
-def _blocked(code: str) -> dict[str, Any]:
+def _blocked(code: str, deployment_id: str = DEPLOYMENT_ID) -> dict[str, Any]:
     return {
         "project": PROJECT,
         "target": TARGET,
         "app": APP_NAME,
         "workspace_id": WORKSPACE_ID,
         "miniapp_id": MINIAPP_ID,
-        "deployment_id": DEPLOYMENT_ID,
+        "deployment_id": deployment_id,
         "state": "blocked",
         "code": code,
         "provider_verified": False,
@@ -99,37 +117,44 @@ def _blocked(code: str) -> dict[str, Any]:
 class TossConsoleReadOnlyTools:
     """Only the injected provider may read the bundle; never runs MCP writes."""
 
-    names = frozenset({"get_toss_test_console_status"})
+    names = frozenset(_DEPLOYMENTS_BY_TOOL)
 
     def __init__(self, provider: ReadOnlyBundleProvider | None = None, *,
-                 provider_factory: ProviderFactory | None = None) -> None:
+                 provider_factory: ProviderFactory | None = None,
+                 ux019_provider_factory: ProviderFactory | None = None) -> None:
         self._provider = provider
         self._provider_factory = provider_factory
+        self._ux019_provider_factory = ux019_provider_factory
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if name != "get_toss_test_console_status" or type(arguments) is not dict:
+        if type(name) is not str or name not in self.names or type(arguments) is not dict:
             raise ValueError("INVALID_CONSOLE_ARGUMENTS")
         if arguments != {"project": PROJECT, "target": TARGET}:
             raise ValueError("UNSUPPORTED_SCOPE")
-        provider = self._provider
-        if provider is None and self._provider_factory is not None:
+        deployment_id = _DEPLOYMENTS_BY_TOOL[name]
+        blocked = partial(_blocked, deployment_id=deployment_id)
+        provider_factory = (self._provider_factory if deployment_id == DEPLOYMENT_ID
+                            else self._ux019_provider_factory)
+        # The original injected provider authorizes only the legacy UX014 route.
+        provider = self._provider if deployment_id == DEPLOYMENT_ID else None
+        if provider is None and provider_factory is not None:
             try:
                 provider = await asyncio.wait_for(
-                    self._provider_factory(), timeout=CALL_TIMEOUT_SECONDS)
+                    provider_factory(), timeout=CALL_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
-                return _blocked("CONSOLE_READ_TIMEOUT")
+                return blocked("CONSOLE_READ_TIMEOUT")
             except ConsoleEvidenceError as exc:
-                return _blocked(exc.code)
+                return blocked(exc.code)
             except Exception:
-                return _blocked("CONSOLE_READ_FAILED")
+                return blocked("CONSOLE_READ_FAILED")
         if provider is None:
-            return _blocked("CONSOLE_OAUTH_NOT_CONFIGURED")
+            return blocked("CONSOLE_OAUTH_NOT_CONFIGURED")
 
         context = getattr(provider, "context", None)
         if type(context) is not VerifiedProviderContext:
-            return _blocked("CONSOLE_TRUST_NOT_ESTABLISHED")
+            return blocked("CONSOLE_TRUST_NOT_ESTABLISHED")
         if context.endpoint != CONSOLE_MCP_ORIGIN:
-            return _blocked("CONSOLE_TRUST_NOT_ESTABLISHED")
+            return blocked("CONSOLE_TRUST_NOT_ESTABLISHED")
         trusted_authentication = (
             (context.authentication_source == "direct_mcp"
              and context.client_id == OAUTH_CLIENT_ID)
@@ -137,11 +162,11 @@ class TossConsoleReadOnlyTools:
                 and context.client_id is None)
         )
         if not trusted_authentication:
-            return _blocked("CONSOLE_TRUST_NOT_ESTABLISHED")
+            return blocked("CONSOLE_TRUST_NOT_ESTABLISHED")
         if context.oauth_verified is not True:
-            return _blocked("CONSOLE_OAUTH_NOT_CONFIGURED")
+            return blocked("CONSOLE_OAUTH_NOT_CONFIGURED")
         if context.reviewed_tool_schema is not True:
-            return _blocked("CONSOLE_TOOL_SCHEMA_NOT_REVIEWED")
+            return blocked("CONSOLE_TOOL_SCHEMA_NOT_REVIEWED")
 
         try:
             # The provider implementation must itself pin official bundle_list,
@@ -154,15 +179,15 @@ class TossConsoleReadOnlyTools:
             summary = project_bundle_list(
                 raw, tool_name="bundle_list",
                 workspace_id=WORKSPACE_ID, miniapp_id=MINIAPP_ID,
-                deployment_id=DEPLOYMENT_ID,
+                deployment_id=deployment_id,
             )
         except asyncio.TimeoutError:
-            return _blocked("CONSOLE_READ_TIMEOUT")
+            return blocked("CONSOLE_READ_TIMEOUT")
         except ConsoleEvidenceError as exc:
-            return _blocked(exc.code)
+            return blocked(exc.code)
         except Exception:
             # Do not echo exceptions, URL arguments or raw provider content.
-            return _blocked("CONSOLE_READ_FAILED")
+            return blocked("CONSOLE_READ_FAILED")
 
         # Provider origin and authorized metadata were checked before the call.
         # This is NOT a remote bundle-SHA claim and is NOT native WebView QA.

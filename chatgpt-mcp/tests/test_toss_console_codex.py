@@ -175,9 +175,8 @@ class CodexConsoleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_reaps_the_owned_client_and_allows_retry(self):
         self.write_scenario(hang="mcpServerStatus/list")
-        with self.assertRaises(TimeoutError):
-            async with asyncio.timeout(1):
-                await self.connection.get_provider()
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(self.connection.get_provider(), timeout=1)
         self.write_scenario()
         self.assertTrue((await self.status())["test_bundle_ready"])
         await self.connection.close()
