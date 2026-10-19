@@ -466,11 +466,12 @@
     }
 
     function boardPriority(task) {
+      if (task.sessionActivity && (active.has(task.state) || task.state === 'queued')) return 3;
       if (active.has(task.state)) return 0;
       if (task.state === 'prepared') return 1;
       if (task.state === 'queued') return 2;
-      if (task.state === 'unknown') return 3;
-      return 4;
+      if (task.state === 'unknown') return 4;
+      return 5;
     }
 
     function boardStatus(task) {
@@ -522,7 +523,9 @@
       const rows = [...tasks].sort((a, b) => boardPriority(a) - boardPriority(b)
         || Date.parse(b.time) - Date.parse(a.time));
       const work = rows[0]; missionTaskId = work?.id || ''; mission.disabled = !work;
-      mission.querySelector('small').textContent = work && active.has(work.state) ? '현재 임무' : '최근 작업 기록';
+      mission.querySelector('small').textContent = work?.sessionActivity ? '세션 상태'
+        : work && active.has(work.state) ? '현재 임무'
+          : ['prepared', 'queued'].includes(work?.state) ? '대기 중인 업무' : '최근 작업 기록';
       mission.querySelector('strong').textContent = work ? readableTaskTitle(work) : '수신된 작업 없음';
       mission.querySelector('.wd-mission-state').textContent = work ? `${actorName(actors.find(row => row.id === work.actorId))} · ${boardStatus(work)}` : '캐릭터는 실제 호출 후 입장합니다';
     }

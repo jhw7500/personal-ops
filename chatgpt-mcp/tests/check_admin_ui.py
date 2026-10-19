@@ -549,9 +549,72 @@ class AdminBrowserTest(unittest.TestCase):
         expect(actor).to_have_attribute('data-state', 'queued')
         expect(actor).to_have_attribute('data-room', 'waiting')
         expect(actor).to_have_attribute('data-working', 'false')
+        expect(self.room.locator('#wd-mission strong')).to_have_text('터미널 도구 호출 요청')
+        expect(self.room.locator('#wd-mission small')).to_have_text('대기 중인 업무')
+        expect(self.room.locator('#wd-mission .wd-mission-state')).to_contain_text('대기')
+        expect(self.room.locator('#wd-work-board .wd-work-item').first).to_have_attribute(
+            'data-task-id', 'task:codex-local:terminal-native:call-native-request')
         actor.click()
         expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('터미널 도구 호출 요청')
         expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('exec_command')
+
+    def test_native_mission_tracks_real_call_then_returns_to_session_liveness(self):
+        now = datetime.now(timezone.utc)
+        base = {'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',
+                'actor_id': 'terminal-mission', 'actor_kind': 'agent', 'actor_label': 'Codex',
+                'task_id': 'session-activity', 'task_kind': 'agent',
+                'task_label': 'Codex session active', 'action': 'execute', 'state': 'running',
+                'time': now.isoformat()}
+        call = {**base, 'task_id': 'call-mission', 'task_kind': 'call',
+                'task_label': '명령 상태 확인', 'tool_name': 'exec_command',
+                'time': (now - timedelta(seconds=2)).isoformat()}
+        self.store.record_work_events('alpha', [call, base], provenance='observed')
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.locator('#refresh').click()
+        mission = self.room.locator('#wd-mission')
+        expect(mission.locator('strong')).to_have_text('명령 상태 확인')
+        expect(mission.locator('small')).to_have_text('현재 임무')
+        expect(self.room.locator('#wd-work-board .wd-work-item').first).to_have_attribute(
+            'data-task-id', 'task:codex-local:terminal-mission:call-mission')
+        mission.click()
+        expect(self.room.locator('#wd-detail .wd-summary-purpose')).to_have_text('명령 상태 확인')
+        self.room.get_by_role('button', name='지금 뭐 해?', exact=True).click()
+        expect(self.room.locator('#wd-talk-answer')).to_contain_text('명령 상태 확인')
+
+        self.store.record_work_events('alpha', [
+            {**call, 'state': 'returned', 'time': (now - timedelta(seconds=1)).isoformat()},
+            base], provenance='observed')
+        self.page.locator('#refresh').click()
+        expect(mission.locator('strong')).to_have_text('세션 활동 중')
+        expect(mission.locator('small')).to_have_text('세션 상태')
+        expect(self.room.locator('#wd-work-board .wd-work-item').first).to_have_attribute(
+            'data-task-id', 'task:codex-local:terminal-mission:session-activity')
+        mission.click()
+        expect(self.room.locator('#wd-detail .wd-summary-purpose')).to_have_text('세션 활동 중')
+        recent = self.room.locator('.wd-native-activity [data-native-group="recent"]')
+        expect(recent).to_contain_text('명령 상태 확인')
+        expect(recent).to_contain_text('요청 반환')
+
+    def test_native_mission_does_not_let_other_owners_heartbeat_hide_a_pending_call(self):
+        now = datetime.now(timezone.utc)
+        base = {'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',
+                'actor_id': 'waiting-owner', 'actor_kind': 'agent', 'actor_label': 'Codex',
+                'task_id': 'actual-call', 'task_kind': 'call', 'task_label': '호출 응답 대기',
+                'tool_name': 'exec_command', 'action': 'execute', 'state': 'queued',
+                'time': (now - timedelta(seconds=1)).isoformat()}
+        heartbeat = {**base, 'actor_id': 'other-owner', 'task_id': 'session-activity',
+                     'task_kind': 'agent', 'task_label': 'Codex session active',
+                     'state': 'running', 'time': now.isoformat()}
+        self.store.record_work_events('alpha', [base, heartbeat], provenance='observed')
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.locator('#refresh').click()
+        mission = self.room.locator('#wd-mission')
+        expect(mission.locator('strong')).to_have_text('호출 응답 대기')
+        expect(mission.locator('small')).to_have_text('대기 중인 업무')
+        mission.click()
+        expect(self.room.locator('#wd-detail .wd-summary-purpose')).to_have_text('호출 응답 대기')
+        expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('응답 대기')
+        expect(self.room.locator('#wd-detail .wd-work-summary')).not_to_contain_text('실행 중으로 관측')
 
     def test_native_terminal_result_remains_readable_after_a_newer_heartbeat(self):
         now = datetime.now(timezone.utc)
