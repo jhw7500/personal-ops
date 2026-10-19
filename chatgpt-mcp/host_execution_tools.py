@@ -29,6 +29,15 @@ OPTIONAL = {
     "read_host_execution_log": {"stream", "cursor", "max_bytes"},
     "cancel_host_execution": set(),
 }
+_RENEWABLE_ACCESS_REASONS = frozenset({
+    "NO_GRANT", "EXPIRED", "REVOKED", "RUNTIME_CHANGED", "BOOT_CHANGED",
+})
+
+
+def _access_approval_route(result, project, reason):
+    return {**result, "approval_kind": "host_access", "approval_reason": reason,
+            "approval_card": {"tool": "open_host_access_approval",
+                              "arguments": {"project": project}}}
 
 
 def _spec(name, title, description, fields, *, readonly):
@@ -43,13 +52,19 @@ def _spec(name, title, description, fields, *, readonly):
 
 
 HOST_EXECUTION_TOOL_SPECS = [
-    _spec("request_host_access", "호스트 접근 요청", "Create a short owner-visible access request. "
+    _spec("request_host_access", "호스트 접근 요청", "Legacy management-web access request. "
+          "For chat approval, call open_host_access_approval directly instead of this tool. "
           "This tool cannot approve, issue, or extend a grant.", {}, readonly=False),
-    _spec("get_host_access", "호스트 접근 상태", "Read the current owner-controlled host access state.",
+    _spec("get_host_access", "호스트 접근 상태", "Read the current owner-controlled host access state. "
+          "Reuse an active grant; chat/plugin refresh does not revoke or extend it. When renewal "
+          "is needed, follow the supplied approval_card to the inline chat card.",
           {}, readonly=True),
     _spec("start_host_execution", "호스트 명령 시작",
           "Start an argv-only command under the current expiring grant. The selected project is "
-          "cwd context, not filesystem containment. Provide task_label so the dashboard can "
+          "cwd context, not filesystem containment. Ordinary commands reuse the active grant "
+          "without per-command approval. Preserve the user's execution request; an already "
+          "requested action with all required valid approvals needs no extra execution prompt. "
+          "Separate operation plans retain their approval requirements. Provide task_label so the dashboard can "
           "identify the work without inspecting private execution inputs.", {
               "executable": {"type": "string", "minLength": 1, "maxLength": 4096},
               "argv": {"type": "array", "items": {"type": "string", "maxLength": 1024},
@@ -127,7 +142,10 @@ class HostExecutionTools:
         if name == "request_host_access":
             return await asyncio.to_thread(self.access().request, project)
         if name == "get_host_access":
-            return await asyncio.to_thread(self.access().get, project)
+            result = await asyncio.to_thread(self.access().get, project)
+            if result.get("active") is False and result.get("reason") in _RENEWABLE_ACCESS_REASONS:
+                return _access_approval_route(result, project, result["reason"])
+            return result
         manager = self.manager()
         if name == "start_host_execution":
             values = {key: value for key, value in arguments.items() if key != "project"}

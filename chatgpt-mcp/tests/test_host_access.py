@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import host_access  # noqa: E402
 import host_runtime_operations  # noqa: E402
 from host_access import HostAccess  # noqa: E402
+from host_access_ui import HostAccessApprovals  # noqa: E402
 from host_runtime_config import HostRuntimeError  # noqa: E402
 
 
@@ -144,6 +145,55 @@ class HostAccessTests(unittest.TestCase):
         self.assertTrue(self.access.get("personal-ops")["active"])
         self.now += timedelta(seconds=1)
         self.assertEqual(self.access.get("personal-ops")["reason"], "EXPIRED")
+
+    def test_valid_grant_survives_reconnect_and_status_refresh_without_extension(self):
+        grant = self.approve(allow_codex=True, duration_seconds=28_800)
+        before = self.access._record_path("personal-ops").read_bytes()
+        for _ in range(3):
+            self.now += timedelta(minutes=1)
+            reconnected = HostAccess(
+                {"personal-ops": self.project_root}, self.state_root,
+                trusted_runtime=lambda: self.runtime_identity,
+            )
+            status = reconnected.get("personal-ops")
+            self.assertTrue(status["active"])
+            self.assertIsNone(status["reason"])
+            for key in ("grant_id", "expires_at", "allow_codex"):
+                self.assertEqual(status[key], grant[key])
+            self.assertEqual(reconnected.require(
+                "personal-ops", grant_id=grant["grant_id"], codex=True), grant)
+            self.assertEqual(reconnected._record_path("personal-ops").read_bytes(), before)
+
+    def test_new_unapproved_request_does_not_replace_or_revoke_valid_grant(self):
+        grant = self.approve(allow_codex=False, duration_seconds=28_800)
+        self.now += timedelta(minutes=1)
+        requested = self.access.request("personal-ops")
+        reconnected = HostAccess(
+            {"personal-ops": self.project_root}, self.state_root,
+            trusted_runtime=lambda: self.runtime_identity,
+        )
+        status = reconnected.get("personal-ops")
+        self.assertTrue(status["active"])
+        self.assertEqual(status["requests"][0]["request_id"], requested["request_id"])
+        self.assertEqual(reconnected.require("personal-ops"), grant)
+        self.assertFalse(status["allow_codex"])
+        self.assertEqual(status["expires_at"], grant["expires_at"])
+
+    def test_opening_and_cancelling_card_preserves_existing_grant_options(self):
+        grant = self.approve(allow_codex=True, duration_seconds=28_800)
+        approvals = HostAccessApprovals(self.access)
+        result = approvals.open("personal-ops", duration_seconds=60, allow_codex=False)
+        self.assertEqual(self.access.require("personal-ops", codex=True), grant)
+        card = result["structuredContent"]
+        approvals.cancel(
+            "personal-ops", card_id=card["card_id"],
+            confirmation_token=result["_meta"]["host_access_confirmation"],
+        )
+        reconnected = HostAccess(
+            {"personal-ops": self.project_root}, self.state_root,
+            trusted_runtime=lambda: self.runtime_identity,
+        )
+        self.assertEqual(reconnected.require("personal-ops", codex=True), grant)
 
     def test_approval_receipt_require_expiry_and_revoke(self):
         grant = self.approve(duration_seconds=60)
