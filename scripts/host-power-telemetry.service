@@ -1,0 +1,11 @@
+# /etc/systemd/system/host-power-telemetry.service  (host-power-telemetry.timer 가 1분마다 부른다)
+[Unit]
+Description=Log CPU package temperature, throttle counter and RAPL limits (one line per minute, #57)
+Documentation=https://github.com/jhw7500/personal-ops/issues/57
+
+[Service]
+Type=oneshot
+ExecStart=/home/jhw/ai/opencode/projects/personal-ops/scripts/host-power-telemetry.sh
+SyslogIdentifier=host-power-telemetry
+StandardOutput=journal
+StandardError=journal

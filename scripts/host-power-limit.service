@@ -1,0 +1,21 @@
+# /etc/systemd/system/host-power-limit.service
+[Unit]
+Description=Apply Intel-spec CPU package power limits (RAPL PL1/PL2) at boot (#57 reboot experiment)
+Documentation=https://github.com/jhw7500/personal-ops/issues/57
+# powercap sysfs 는 intel_rapl 모듈이 올라온 뒤에 생긴다. 서비스 시작 시점이면 충분하다.
+After=sysinit.target systemd-modules-load.service
+# BIOS 기본값(4095 W)이 부팅마다 되살아나므로 매 부팅 다시 건다.
+
+[Service]
+Type=oneshot
+# 적용 상태를 systemctl status 에서 active 로 보이게 한다.
+RemainAfterExit=yes
+Environment=PL1_W=150
+Environment=PL2_W=241
+ExecStart=/home/jhw/ai/opencode/projects/personal-ops/scripts/host-power-limit.sh --apply
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

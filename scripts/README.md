@@ -12,6 +12,8 @@ SSH 이슈 알림은 일반 사용자로 상태만 조회한다. 도구별 영�
 |---|---|---|
 | `host-bert-collect.sh` · `host-bert-decode.py` | 비정상 재부팅 후 ACPI BERT 하드웨어 오류 레코드 수집·판독 | 수동, 읽기 전용 (`sudo` 읽기 1회) |
 | `host-bert-autocollect.sh` · `host-bert-autocollect.service` | 부팅 시 BERT 레코드가 있을 때만 자동 수집 (정상 부팅은 건너뜀) | systemd oneshot, 부팅마다 |
+| `host-power-limit.sh` · `host-power-limit.service` | 부팅마다 RAPL PL1 150 W / PL2 241 W 적용 + 되읽기 검증 (#57 전력 가설 실험, 2026-10-19~). 값은 유닛 `Environment=`로 변경 | systemd oneshot, 부팅마다 |
+| `host-power-telemetry.sh` · `.service` · `.timer` | 1분마다 패키지 온도·스로틀 누적·현재 PL을 journal(`-t host-power-telemetry`)에 기록. 재발 시 `journalctl -b -1 -t host-power-telemetry` | systemd timer, 1분 |
 | `host-bios-preflight.sh` | BIOS/ME 업데이트 착수 전 준비 상태 GO/NO-GO 점검 | 수동, 읽기 전용 |
 | `host-bios-postcheck.sh` | BIOS/ME 업데이트 직후 기준선 대조 검증 | 수동, 읽기 전용 |
 | `ssh-issue-reminder.py` · `ssh-issue-reminder-profile.sh` | 다음 재부팅 이후 매 대화형 SSH 로그인에 미완료 GitHub 이슈 표시 | 사용자 `.profile`, 읽기 전용 조회 |
