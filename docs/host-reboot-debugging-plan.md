@@ -211,6 +211,16 @@ OS 쪽 증거가 포화된 뒤 처음 시작한 **변수 조작 실험**이다. 
   `journalctl -b -1 -t host-power-telemetry | tail`로 크래시 직전 PL 값과 스로틀 증가를 먼저 본다.
 - **같이 바꾸지 않은 것**: `chroma-mcp` 제한(`CLAUDE_MEM_CHROMA_ENABLED=false` 또는 E코어 고정)과
   BIOS 설정은 변수 분리를 위해 보류했다. 쿨러 물리 점검은 소프트웨어 변수가 아니므로 병행 가능하다.
+- **드리프트 (13:52, 적용 5분 뒤)**: PL1만 4095 W로 되돌아가고 PL2 241 W는 유지된 채 15:07까지 73분 지속됐다.
+  이 호스트의 전력 데몬은 thermald(`--adaptive`)뿐이고 `/etc/thermald/thermal-cpu-cdev-order.xml`의 냉각
+  1순위가 `rapl_controller`다. 과열 때 PL1을 낮췄다가 식으면 시작 때 기억한 최대값(4095 W)으로 복구하는
+  동작이 "온도 스파이크 직후 PL1만 4095" 패턴과 맞는다 — **추정**이며, 아래 조치 뒤 DRIFT가 멈추면 확정한다.
+  `host-power-telemetry.sh`에 드리프트 감시를 넣어 목표와 다르면 `DRIFT`를 기록하고 root 틱에서 즉시
+  재적용한다(15:07:32 첫 자동 복구 확인). 근본 조치(sudo)는 cdev-order에서 `rapl_controller` 한 줄 제거 후
+  thermald 재시작, 그래도 드리프트면 thermald 비활성. **실험 시작 시각은 PL1이 안정적으로 유지된 시점부터
+  다시 센다** — `journalctl -t host-power-telemetry | grep -c DRIFT`로 확인.
+- **쿨러 한계**: PL2 241 W만 걸린 14:43에도 1분에 스로틀 2,690회(chroma-mcp 버스트, load 18)가 났다.
+  이 쿨러는 241 W도 받아 내지 못하므로 PL1 150 W 유지와 쿨러 물리 점검이 더 중요해졌다.
 - **빌드 영향**: 56초 이상 전 코어 부하는 150 W로 제한돼 Yocto 빌드 시간이 최대 10% 안팎 늘 수 있다.
   부담이면 유닛의 `Environment=PL1_W=`만 200~241로 올린다. 재부팅 시 BIOS 값으로 원복되므로 유닛이
   꺼져 있으면 실험도 끝난 것이다.

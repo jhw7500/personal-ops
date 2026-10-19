@@ -20,3 +20,17 @@ z=/sys/class/powercap/intel-rapl:0
 pl1=$(( $(cat $z/constraint_0_power_limit_uw 2>/dev/null || echo 0) / 1000000 ))
 pl2=$(( $(cat $z/constraint_1_power_limit_uw 2>/dev/null || echo 0) / 1000000 ))
 printf 'pkg=%sC maxcore=%sC pkg_throttle=%s PL1=%sW PL2=%sW load1=%s\n' "${pkg:-?}" "$maxc" "$thr" "$pl1" "$pl2" "$(cut -d' ' -f1 /proc/loadavg)"
+
+# 드리프트 감시: 다른 쓰기 주체(예: thermald rapl_controller)가 제한을 되돌리면 기록하고,
+# root 로 돌 때(systemd 타이머)는 host-power-limit.sh --apply 로 다시 건다.
+# 목표값은 host-power-limit.service 의 Environment 에서 읽고, 없으면 스크립트 기본값을 쓴다.
+# 2026-10-19 13:52 실측: 적용 5분 뒤 PL1 만 4095 W 로 되돌아갔다(PL2 는 유지).
+want1=150; want2=241
+envs=$(systemctl show host-power-limit.service -p Environment --value 2>/dev/null)
+for kv in $envs; do case "$kv" in PL1_W=*) want1=${kv#PL1_W=};; PL2_W=*) want2=${kv#PL2_W=};; esac; done
+if [ "$pl1" != "$want1" ] || [ "$pl2" != "$want2" ]; then
+    printf 'DRIFT: PL1=%sW PL2=%sW (목표 %s/%s) — 다른 주체가 제한을 바꿨다\n' "$pl1" "$pl2" "$want1" "$want2"
+    if [ "$(id -u)" -eq 0 ] && [ -x "$(dirname "$0")/host-power-limit.sh" ]; then
+        PL1_W="$want1" PL2_W="$want2" "$(dirname "$0")/host-power-limit.sh" --apply | sed 's/^/  reapply: /'
+    fi
+fi
