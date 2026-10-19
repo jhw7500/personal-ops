@@ -687,6 +687,37 @@ class AdminBrowserTest(unittest.TestCase):
         expect(child.locator('.wd-actor-observation')).to_have_count(0)
         self.assertEqual(self.errors, [])
 
+    def test_claude_live_registry_shows_two_children_and_concrete_work_without_double_counting_agents(self):
+        self.page.emulate_media(reduced_motion='reduce')
+        fixture = self.create_called_character_fixture()
+        self.room_page.evaluate("""() => {
+            calledRecords = ['first', 'second'].map(id => callRecord('unused', 1, {
+                source_id: 'claude-local', source_kind: 'claude-cli', actor_id: 'sub:session:' + id,
+                actor_label: id, task_id: 'agent:session:' + id, task_kind: 'call',
+                task_label: 'Claude subagent', action: 'execute'}));
+            calledRecords.push(callRecord('unused', 2, {source_id: 'claude-local', source_kind: 'claude-cli',
+                actor_id: 'sub:session:first', actor_label: 'first', task_id: 'tool:live',
+                task_kind: 'call', task_label: 'Edit', action: 'code'}));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        expect(fixture.locator('.wd-actor')).to_have_count(2)
+        expect(fixture.locator('#wd-status')).to_contain_text('하위 에이전트 활동 관측 2명')
+        expect(fixture.locator('#wd-mission strong')).to_have_text('Edit')
+        first = fixture.locator('.wd-actor[data-actor-id="entity:claude-local:sub%3Asession%3Afirst"]')
+        expect(first).to_have_attribute('data-room', 'coding')
+        first.click()
+        expect(fixture.locator('#wd-detail .wd-summary-purpose')).to_have_text('Edit')
+        second = fixture.locator('.wd-actor[data-actor-id="entity:claude-local:sub%3Asession%3Asecond"]')
+        expect(second).to_have_attribute('data-state', 'running')
+        second.click()
+        expect(fixture.locator('#wd-detail .wd-summary-purpose')).to_have_text('하위 에이전트 활동')
+        expect(fixture.locator('#wd-detail .wd-summary-action')).not_to_contain_text('명령 실행')
+        expect(fixture.locator('#wd-detail .wd-summary-result')).to_contain_text('에이전트 활동')
+        self.room_page.evaluate("""() => calledFixture.update({project: 'alpha', records: calledRecords,
+            now: Date.now() + 121000})""")
+        expect(fixture.locator('#wd-status')).to_contain_text('하위 에이전트 활동 관측 0명')
+        expect(fixture.locator('.wd-actor[data-state="running"]')).to_have_count(0)
+
     def test_native_terminal_result_remains_readable_after_a_newer_heartbeat(self):
         now = datetime.now(timezone.utc)
         base = {'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',

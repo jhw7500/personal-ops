@@ -48,7 +48,8 @@
     ? actionTitles[actor.action] || actor.label : sessionTitles[actor.label] || actor.label);
   const kindFor = item => ({call: item.sourceKind === 'mcp' ? 'MCP 호출' : '도구 호출', job: '명령 실행', agent: '에이전트 작업',
     mcp: 'MCP 서버', executor: '명령 실행기'}[item.kind] || '객체');
-  const stateFor = item => item.kind === 'agent' && item.state === 'succeeded' ? '작업 완료' : states[item.state];
+  const stateFor = item => item.agentActivity && item.state === 'running' ? '에이전트 활동 관측'
+    : item.kind === 'agent' && item.state === 'succeeded' ? '작업 완료' : states[item.state];
   const observationTitle = owner => owner?.observationStatus?.kind === 'subagent' ? '서브에이전트 종료 미확인'
     : owner?.observationStatus?.kind === 'prompt' ? '요청 종료 미확인' : '';
   const actionTitles = {read: '책 읽기', search: '자료 탐색', reason: '추론 신호', code: '코드 작성', build: '빌드 조립',
@@ -80,7 +81,7 @@
     ? `${task.skill.name || task.skill.id} (${task.skill.id})` : null;
   const readableTaskTitle = task => missingHostPurpose(task)
     ? `작업 목적 미수집${hostReference(task) ? ' · ' + hostReference(task) : ''}`
-    : isRawHostCodexTitle(task) ? 'Codex 실행' : titleFor(task);
+    : task?.agentActivity ? '하위 에이전트 활동' : isRawHostCodexTitle(task) ? 'Codex 실행' : titleFor(task);
   const visualAction = task => (task?.hostExecutionId && task.hostActionKnown !== true)
     || (task?.action === 'code' && /^Host Codex task [A-Za-z0-9_-]+$/.test(task.label || ''))
     ? 'execute' : task?.action || 'idle';
@@ -91,6 +92,7 @@
     if (task.state === 'queued') return '실행 대기';
     if (task.state === 'unknown') return '행동 상태 미확인';
     if (task.state === 'canceling') return '취소 처리 중';
+    if (task.agentActivity) return '하위 에이전트 활동';
     if (active.has(task.state)) return actionPhrases[task.action] || actionTitles[task.action] || '활동 중';
     return `${actionTitles[task.action] || '활동'} 기록`;
   }
@@ -469,7 +471,7 @@
     }
 
     function boardPriority(task) {
-      if (task.sessionActivity && (active.has(task.state) || task.state === 'queued')) return 3;
+      if ((task.sessionActivity || task.agentActivity) && (active.has(task.state) || task.state === 'queued')) return 3;
       if (active.has(task.state)) return 0;
       if (task.state === 'prepared') return 1;
       if (task.state === 'queued') return 2;
@@ -527,6 +529,7 @@
         || Date.parse(b.time) - Date.parse(a.time));
       const work = rows[0]; missionTaskId = work?.id || ''; mission.disabled = !work;
       mission.querySelector('small').textContent = work?.sessionActivity ? '세션 상태'
+        : work?.agentActivity ? '하위 에이전트 상태'
         : work && active.has(work.state) ? '현재 임무'
           : ['prepared', 'queued'].includes(work?.state) ? '대기 중인 업무' : '최근 작업 기록';
       mission.querySelector('strong').textContent = work ? readableTaskTitle(work) : '수신된 작업 없음';
@@ -586,8 +589,7 @@
     function appendNativeActivity(owner, work) {
       if (!['codex-cli', 'claude-cli'].includes(owner?.sourceKind)) return;
       const rows = window.WorkDashboardModel.recentTasks(tasks.filter(task =>
-        task.actorId === owner.id && task.kind === 'call' && !task.sessionActivity
-        && (owner.sourceKind !== 'claude-cli' || task.tool)));
+        task.actorId === owner.id && task.kind === 'call' && !task.sessionActivity && !task.agentActivity));
       if (!rows.length) return;
       const pending = task => active.has(task.state) || task.state === 'queued';
       const current = rows.filter(pending).slice(0, 3);
@@ -683,7 +685,11 @@
       };
       const archived = !tasks.some(task => task.id === work.id);
       const hostResult = work.hostExecutionId ? window.WorkDashboardModel.hostResultSummary(work) : null;
-      const stateResult = hostResult || results[work.state] || '';
+      const stateResult = hostResult || (work.agentActivity && active.has(work.state)
+        ? '하위 에이전트 활동이 관측됐습니다. 개별 도구 실행과 내부 추론 상태는 이 신호만으로 알 수 없습니다.'
+        : work.agentActivity && work.state === 'returned'
+          ? '하위 에이전트의 반환 상태가 관측됐습니다. 전체 업무의 성공을 뜻하지 않습니다.'
+          : results[work.state] || '');
       const explanation = archived ? `현재 조회 범위를 벗어난 이전 기록입니다. ${stateResult}`
         : (stale || resumeSnapshot || !following) && active.has(work.state)
           ? '마지막으로 확인한 실행 상태입니다. 최신 관측 결과를 기다리고 있습니다.'
@@ -1381,8 +1387,11 @@
         lastObservedAt = input.hostObservedAt ?? null;
         if (!Object.hasOwn(input, 'hostObservedAt') || Number.isFinite(Date.parse(input.hostObservedAt))) speechReady = true;
       }
+      const claudeChildren = actors.filter(actor => actor.sourceKind === 'claude-cli' && actor.localId.startsWith('sub:'));
+      const activeChildren = claudeChildren.filter(actor => active.has(actor.state) && actor.provenance === 'observed').length;
+      const childStatus = claudeChildren.length ? ` · 하위 에이전트 활동 관측 ${activeChildren}명` : '';
       status.textContent = input.error ? `조회 실패 · 마지막 확인 기록 유지 · ${input.error}` :
-        `${following ? '관찰 중' : '관찰 일시정지'} · 진행 ${data.counts.active} · 미확인 ${data.counts.unknown} · 실패·중단 기록 ${data.counts.attention}`;
+        `${following ? '관찰 중' : '관찰 일시정지'} · 진행 ${data.counts.active}건 · 미확인 ${data.counts.unknown} · 실패·중단 기록 ${data.counts.attention}${childStatus}`;
       status.title = `현재 조회 범위: 객체 ${data.entityCount} · ${data.counts.total}개 일감 · 반환/성공 ${data.counts.done}. 실패·중단 기록은 미해결 장애 수가 아닙니다.`;
       pipelineValues[2].textContent = actors.length ? [...new Set(actors.map(actor => actor.sourceKind))].join(' · ') + ' · 최근 ' + localTime(data.latestEventAt) : '수집 객체 없음';
       showModel(); showChanges(); renderWorkContext(); renderThinkingRoles();

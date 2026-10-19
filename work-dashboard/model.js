@@ -415,6 +415,7 @@
         _claudeStartedAt: lifecycleStarts.get(id),
         _telemetryRows: metadata.get(id), _taskLabelKnown: taskLabelKnown,
         ...(sessionActivity ? {sessionActivity: true} : {}),
+        ...(claudeLifecycleFor(row) === 'subagent' ? {agentActivity: true} : {}),
         ...(skill ? {skill} : {}),
         ...(result ? {result} : {})};
     });
@@ -661,8 +662,8 @@
       if (!work.length) return {...known.get(id), project, state: 'unobserved', room: 'waiting', sourceRoom: 'waiting',
         action: 'idle', taskId: null, lastTaskId: null, time: null, jobId: null, activeCount: 0, taskCount: 0, telemetry: {}};
       const latest = work.reduce((a, b) => a._milliseconds >= b._milliseconds ? a : b);
-      const nativeCall = work.some(task => task.sessionActivity)
-        ? work.find(task => task.kind === 'call' && ACTIVE_STATES.has(task.state)) : null;
+      const nativeCall = work.some(task => task.sessionActivity || task.agentActivity)
+        ? work.find(task => task.kind === 'call' && !task.agentActivity && ACTIVE_STATES.has(task.state)) : null;
       const pending = nativeCall || work.find(task => ACTIVE_STATES.has(task.state) || task.state === 'unknown');
       const activeWork = work.filter(task => ACTIVE_STATES.has(task.state));
       const current = pending || latest;
@@ -681,7 +682,7 @@
         provenance: current.provenance,
         telemetry: telemetryFor(work.flatMap(task => task._telemetryRows || [])),
         ...(observationStatus ? {observationStatus} : {}),
-        activeCount: activeWork.filter(task => !(nativeCall && task.sessionActivity)).length,
+        activeCount: activeWork.filter(task => !(nativeCall && (task.sessionActivity || task.agentActivity))).length,
         taskCount: work.length};
     });
     const labels = new Map();
@@ -753,6 +754,10 @@
       const nativeCall = tasks.find(task => task.kind === 'call' && ACTIVE_STATES.has(task.state));
       if (nativeCall) return nativeCall;
     }
+    if (owner.sourceKind === 'claude-cli' && tasks.some(task => task.agentActivity)) {
+      const concrete = tasks.find(task => task.kind === 'call' && !task.agentActivity && ACTIVE_STATES.has(task.state));
+      if (concrete) return concrete;
+    }
     const active = tasks.find(task => ['started', 'running', 'canceling'].includes(task.state));
     if (active) return active;
     return tasks.find(task => ['returned', 'succeeded'].includes(task.state)) || null;
@@ -761,7 +766,7 @@
   function latestConcreteTask(tasks, ownerId) {
     if (typeof ownerId !== 'string') return null;
     return recentTasks((Array.isArray(tasks) ? tasks : []).filter(task =>
-      task?.actorId === ownerId && task.kind === 'call' && task.sessionActivity !== true))[0] || null;
+      task?.actorId === ownerId && task.kind === 'call' && task.sessionActivity !== true && task.agentActivity !== true))[0] || null;
   }
 
   function sprite(owner, task, displayType, role = null, invocationTask = task) {
@@ -1065,7 +1070,9 @@
       if (result.skill && result.state === 'returned') {
         return '스킬 호출이 반환됐습니다. 스킬이 지시한 워크플로 전체의 완료가 확인된 것은 아닙니다.';
       }
-      if (result.state === 'returned') return '도구 요청이 반환됐습니다. 실행 성공 여부는 별도 실행 결과에서 확인하세요.';
+      if (result.state === 'returned') return result.agentActivity
+        ? '하위 에이전트의 반환 상태가 관측됐습니다. 전체 업무의 성공을 뜻하지 않습니다.'
+        : '도구 요청이 반환됐습니다. 실행 성공 여부는 별도 실행 결과에서 확인하세요.';
       return outcomes[result.state] ? `${outcomes[result.state]} 상태가 기록됐습니다.${code}` : null;
     })();
     const contextText = result => {
@@ -1110,7 +1117,7 @@
     if (result.state === 'unknown') return prefix + '마지막 기록 이후의 진행·종료 상태를 확인할 수 없습니다.';
     if (['prepared', 'queued'].includes(result.state)) return prefix + '실행 전 대기 상태가 기록됐습니다.';
     if (result.state === 'canceling') return prefix + '취소 처리 중으로 기록됐습니다. 종료 결과는 아직 없습니다.';
-    return prefix + `${result.hostExecutionId && result.hostActionKnown !== true ? '세부 행동 미수신' : actions[result.action] || '작업'} · 진행 중으로 기록됐습니다. 완료 결과는 아직 없습니다.`;
+    return prefix + `${result.agentActivity ? '하위 에이전트 활동' : result.hostExecutionId && result.hostActionKnown !== true ? '세부 행동 미수신' : actions[result.action] || '작업'} · 진행 중으로 기록됐습니다. 완료 결과는 아직 없습니다.`;
   }
 
   return {snapshot, scene, changes, recentTasks, latestConcreteTask, resumeChanges, speechEvents, characterJob, recordedAnswer,

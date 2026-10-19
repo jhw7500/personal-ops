@@ -102,3 +102,45 @@ test('equal prompt start stamps preserve uncertainty without inventing a current
     assert.equal(result.counts.active, 0);
   }
 });
+
+test('fresh child lifecycle refreshes share one actor and prefer its concrete live tool', () => {
+  const child = {actor_id: 'sub:session-1:child-1', task_id: 'agent:session-1:child-1', task_label: 'Claude subagent'};
+  const result = view([row({...child, time: stamp(300)}), row({...child, state: 'running', time: stamp(1)}),
+    tool({actor_id: child.actor_id, task_id: 'tool:live', state: 'started', time: stamp(2)})]);
+  assert.equal(result.actors.length, 1);
+  const actor = result.actors[0], lifecycle = result.tasks.find(task => task.label === 'Claude subagent');
+  assert.equal(lifecycle.agentActivity, true);
+  assert.equal(actor.taskId, 'task:claude-local:sub%3Asession-1%3Achild-1:tool%3Alive');
+  assert.equal(actor.activeCount, 1);
+  assert.equal(actor.observationStatus, undefined);
+  assert.equal(scene(result).sprites[0].taskId, actor.taskId);
+  assert.equal(result.counts.active, 2); // Work items, not two agents.
+});
+
+test('two child lifecycle observations stay separate without inventing parent work or hidden reasoning', () => {
+  const records = ['first', 'second'].flatMap(id => [
+    row({actor_id: 'sub:session-1:' + id, task_id: 'agent:session-1:' + id, state: 'running', time: stamp(1)}),
+    tool({actor_id: 'sub:session-1:' + id}),
+  ]);
+  const result = view(records), sprites = scene(result).sprites;
+  assert.equal(result.actors.length, 2);
+  assert.equal(result.counts.active, 2);
+  assert.equal(sprites.length, 2);
+  assert.ok(sprites.every(sprite => sprite.state === 'running' && sprite.action === 'execute'));
+  assert.ok(result.tasks.filter(task => task.agentActivity).every(task => task.provenance === 'observed'));
+  const expired = snapshot({project, records, now: now + 121000});
+  assert.equal(expired.counts.active, 0);
+  assert.ok(expired.actors.every(actor => actor.observationStatus?.kind === 'subagent'));
+});
+
+test('valid child calls without optional tool metadata remain concrete work ahead of lifecycle refreshes', () => {
+  const actor_id = 'sub:session-1:child-1';
+  const result = view([row({actor_id, task_id: 'agent:session-1:child-1', state: 'running', time: stamp(1)}),
+    tool({actor_id, task_id: 'tool:unicode', tool_name: undefined, task_label: '도구',
+      action: 'code', state: 'started', time: stamp(2)})]);
+  const actor = result.actors[0], sprite = scene(result).sprites[0];
+  assert.equal(sprite.taskId, actor.taskId);
+  assert.equal(sprite.room, 'coding');
+  assert.equal(sprite.tool, null);
+  assert.equal(actor.activeCount, 1);
+});
