@@ -157,3 +157,32 @@ The passive full tools/list observation remains awaiting_discovery; preserve the
 
 ### RPG Stage 1 live activation (2026-10-16)
 User-approved bundled rollout activated cc1631a8718e788b9be5. Targeted 619 and full 784 checks passed; actual MCP/admin PIDs 3942758/3942903, healthy/admin_ready. Verified 73 installed files, 20 loopback/LAN asset responses, three actual projects, 12 factual-dialogue actions, three original logs, 15 viewport/tab combinations (1440/390/320), opaque iframe and zero JS errors or post-login write requests. Independent CLI sessions and original source/config/latest grant records were preserved. Passive catalog observation remains awaiting_discovery (original receipt exit 2/verification_required); an actual connector read succeeded and no tool schema changed. personal-ops host access is RUNTIME_CHANGED because parent admin assets remain authority-bound; renew in the existing owner approval UI when host execution is needed. The grant itself was not edited or rebound by deployment.
+
+
+## RPG Stage 2 explicit skill activation (2026-10-19)
+
+Extend the approved RPG skill-effect stage through the existing work-event pipeline; this is an additive extension of the current workroom, not new workers or a new rendering system. Local implementation and disposable verification are authorized. Service transitions and host hook configuration remain separate operational decisions.
+
+Event contract:
+- Optional skill_id is 1-120 ASCII characters matching [A-Za-z0-9][A-Za-z0-9_.:-]*. It identifies a skill explicitly supplied by its caller; paths, prompts, arguments, skill documents and inferred names are not collected.
+- Optional skill_name is a printable display label of 1-80 characters and requires skill_id. Existing events without these fields retain their current behavior.
+- Skill metadata is permitted only on task_kind=call. Agent/job work remains generic and cannot label an overall succeeded task as skill completion. Invocation identity reuses source_id + actor_id + task_id. Start and end of one call use the same task ID; a later invocation requires a new task ID. No skill event admits another character or changes six-seat allocation.
+- Metadata persists across lifecycle records for the same canonical call when later records omit it. Conflicting explicit identifiers suppress the skill presentation rather than combining unrelated calls. The skill retains its own provenance; a later observed generic record cannot promote reported skill metadata. Its reported marker and accessible name remain visible in captions and summaries.
+- Claude's documented Skill tool with a valid tool_input.skill can supply observed skill_id. Extract only that field. PreToolUse means call started, PostToolUse means call returned, and PostToolUseFailure is failure/interruption. A returned call does not prove the skill-directed work completed.
+- Direct Claude slash-command expansion and native Codex skill activity are not currently established by the installed collector contract. Reading SKILL.md, tool names alone, catalog listings and prompt mentions never imply invocation. ChatGPT/Codex explicit report_work_events metadata remains reported. No host hooks are enabled or changed in this source stage.
+
+Presentation contract:
+- Reuse the called character, current task, inspector, recorded dialogue, history and existing deduplicated speech lifecycle. Show the supplied skill name/ID and its state, owner, exact invocation and provenance. Selecting skill work inspects that task.
+- A genuinely new visible skill start may trigger a short activation effect; returned, failed, timed out, canceled, interrupted and unknown remain distinct. A modest working effect is permitted only for fresh known active skill work.
+- Initial history, repeated polls/heartbeats, backwards events, hidden-page catch-up and manual record replay do not trigger new live activation bursts. The same invocation transition is not replayed.
+- Effects stop or become static with pause, reduced motion, stale/unknown observations, hidden pages, project changes and destroy. Existing speech expiry, capacity and recorded output links remain intact.
+- Render supplied text with text nodes, and preserve the opaque iframe and narrow allowlisted bridge. No new dependency, model call, credential, API action, DB/Docker operation, upload or approval policy is introduced.
+
+Verification covers validation and provenance, documented hook extraction with synthetic fixtures, no raw input retention, start/end metadata continuity and conflict handling, independent invocations and concurrent owners, effect deduplication and lifecycle cleanup, exact-task inspection, truthful returned wording, old events, source boundaries, desktop/390/320px and the existing frame sandbox. Synthetic payload checks do not claim that a live native CLI emitted a Skill hook. Backend/schema/bridge changes remain authority-bound; a future deployment may invalidate existing runtime-bound host grants without renewing them.
+
+
+### RPG Stage 2 approved live activation (2026-10-19)
+
+After explicit user approval, runtime a6a788b75b5b900a6ac1 was installed and activated for the tunnel and admin web. The observer unit/PID, eight independent CLI sessions, configuration/key bytes and other-session source WIP were preserved. All six canonical check stages passed; installed schema, 18 asset responses and real operational HTTP skill metadata through the opaque frame were verified at desktop/390/320 sizes. No Docker/DB/schema/upload/profile/hook operation or commit occurred.
+
+The canonical receipt retains exit 2 / awaiting_discovery: the current connector still rejects new skill fields using its old cached schema. A plugin metadata refresh and subsequent actual MCP field call remain pending; no further host restart is needed. HostAccess currently reports EXPIRED and was not renewed. See docs/handoffs/2026-10-19-dashboard-skill-effects.md for actual runtime/process, terminal-proxy diagnosis and evidence.

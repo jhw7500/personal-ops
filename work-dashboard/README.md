@@ -62,8 +62,9 @@ MCP 요청 반환과 명령 성공을 구별하며 명령 성공은 `succeeded` 
 직접 관측하는 호스트 수집기는 로컬 `ProjectState.record_work_events(..., provenance='observed')`를 사용한다.
 조회는 기존 `/api/activity`의 `records`에 최근 200개를 추가하므로 기존 `events` 호출자는 호환된다.
 
-Codex CLI·Claude CLI의 후크 수집기는 아직 활성화하지 않았다. 다음 수집기는 도구 목록이나 모델 이름으로
-인물을 추측하지 않고, 실제 세션·에이전트 식별자를 아래 `records` 형식으로 전달하면 된다.
+CLI 도구 후크의 활성 여부는 호스트 설정에 달려 있다. Codex 관리 세션 관측기는 세션 상태를 읽지만
+개별 도구나 스킬 호출을 수집하지 않는다. 수집기는 도구 목록이나 모델 이름으로 인물을 추측하지 않고,
+실제 세션·에이전트 식별자를 아래 `records` 형식으로 전달한다.
 같은 로컬 에이전트 ID를 여러 세션에서 재사용한다면 `actor_id`에 세션 ID도 포함한다.
 
 ```js
@@ -123,10 +124,25 @@ Codex 후크를 추가할 때는 사용자가 [`/hooks`에서 정의를 검토�
 상태·일감은 해당 조회의 기록에서만 계산하며 이전 `objects`의 실행 상태를 되살리지 않는다.
 관리 UI가 프로젝트별 목록을 유지하므로 일반 호출자는 이 옵션을 관리할 필요가 없다.
 
+## 스킬 발동
+
+스킬은 기존 `task_kind=call` 호출에 연결되는 메타데이터이며 새 인물이 아니다. 일반 agent/job 성공은
+스킬 완료로 바꾸지 않는다. 선택 필드 `skill_id`와 `skill_name`으로
+캐릭터의 스킬 표식·발동 말풍선·작업 요약을 표시한다. 식별자·호출 수명·출처의 계약은
+[MCP 스킬 호출 표시](../chatgpt-mcp/README.md#스킬-호출-표시-rpg-stage-2)에 있다.
+같은 호출의 후속 기록이 스킬 필드를 생략하면 기존 값을 유지하고, 충돌하는 식별자는 표시하지 않는다.
+앞선 스킬 보고가 뒤의 일반 관측 기록 때문에 직접 관측으로 바뀌지 않도록 출처를 보존한다.
+
+새로운 실제 상태 전이에만 기존 말풍선 수명과 연결된 발동 효과를 표시한다.
+처음 읽은 이력, 반복 조회, heartbeat, 숨김 복귀와 수동 기록 재생은 새 발동이 아니다.
+실행 중 표시는 신선한 활성 호출에만 사용하고, 동작 감소·일시정지·오류·프로젝트 전환을 따른다.
+반환은 스킬 호출의 반환이며 전체 업무 성공을 뜻하지 않는다. 내부 추론과 스킬 내용은 수집하지 않는다.
+
 ```text
-Tunnel jobs/events -> adapter ---------------+
-Other MCP reports -> tool / authenticated API +-> private records -> snapshot -> RPG UI
-Codex / Claude    -> adapter (future) --------+
+Tunnel jobs/events -------> adapter -----------+
+Other MCP / skill reports -> tool / API --------+-> records -> snapshot -> RPG UI
+Codex session observer --> read-only adapter --+
+CLI tool hooks ----------> optional adapter ---+
 ```
 
 ```bash

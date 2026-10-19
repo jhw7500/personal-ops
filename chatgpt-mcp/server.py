@@ -612,6 +612,10 @@ async def serve(projects):
                 'search_scope': {'type': 'string', 'enum': ['web', 'files']},
                 'tool_name': {'type': 'string', 'pattern': '^[A-Za-z0-9_.:+/-]+$',
                               'minLength': 1, 'maxLength': 120},
+                'skill_id': {
+                    'type': 'string', 'pattern': '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$',
+                },
+                'skill_name': {'type': 'string', 'minLength': 1, 'maxLength': 80},
                 'state': {'type': 'string', 'enum': ['started', 'running', 'queued', 'canceling', 'returned', 'succeeded',
                                                    'failed', 'timed_out', 'canceled', 'interrupted', 'unknown']},
                 'time': {'type': 'string', 'format': 'date-time'},
@@ -632,10 +636,14 @@ async def serve(projects):
                             'actor_label', 'task_id', 'task_kind', 'task_label', 'action', 'state'],
             'additionalProperties': False,
             'dependentRequired': {'usage': ['usage_scope'], 'model_source': ['model'],
-                                  'reasoning_effort_source': ['reasoning_effort'], 'usage_estimated': ['usage']},
+                                  'reasoning_effort_source': ['reasoning_effort'],
+                                  'usage_estimated': ['usage'], 'skill_name': ['skill_id']},
             'allOf': [{
                 'if': {'required': ['search_scope']},
                 'then': {'properties': {'action': {'const': 'search'}}},
+            }, {
+                'if': {'anyOf': [{'required': ['skill_id']}, {'required': ['skill_name']}]},
+                'then': {'properties': {'task_kind': {'const': 'call'}}},
             }],
         }
         observer_tool = types.Tool(
@@ -646,7 +654,9 @@ async def serve(projects):
                          'provenance reflects the actual reporter: this tool is reported, while trusted local hooks are observed. '
                          'Use stable source/actor/task IDs; call completion is returned, agent completion '
                          'is succeeded. Missing terminal events expire after 120 seconds. Omit unavailable '
-                         'model, effort and usage; usage_scope is required for tokens. Never send internal reasoning content '
+                         'model, effort and usage; usage_scope is required for tokens. Optional explicit skill_id and '
+                         'skill_name identify only a caller-supplied call invocation; never send skill arguments, prompts, '
+                         'documents or responses. Never send internal reasoning content '
                          'or infer an activity role or active reasoning phase from labels, models or settings.'),
             inputSchema={'type': 'object', 'properties': {
                 'project': {'type': 'string', 'enum': list(projects)},

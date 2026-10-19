@@ -14,7 +14,7 @@
     'time', 'parent_task_id', 'parent_actor_id', 'parent_source_id', 'exit_code',
     'activity_role', 'search_scope', 'tool_name', 'model', 'reasoning_effort', 'model_source',
     'reasoning_effort_source', 'usage', 'usage_scope', 'usage_estimated', 'provenance',
-    'received_at', 'expires_at'];
+    'received_at', 'expires_at', 'skill_id', 'skill_name'];
   const HOST_KEYS = ['project', 'operation_id', 'kind', 'state', 'created_at', 'started_at',
     'finished_at', 'result', 'termination_verified'];
   const RESULT_KEYS = ['exit_code', 'duration_ms', 'stdout_bytes', 'stderr_bytes'];
@@ -25,6 +25,7 @@
   const HOST_PHASES = new Set(['PREPARED', 'QUEUED', 'PRECHECK', 'EXECUTE', 'COMPLETE', 'RECOVER']);
   const WORK_ACTIONS = new Set(['read', 'search', 'reason', 'code', 'build', 'test',
     'review', 'execute', 'commit', 'push']);
+  const SKILL_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/;
 
   const plain = value => value && typeof value === 'object' && !Array.isArray(value)
     && Object.prototype.toString.call(value) === '[object Object]';
@@ -55,6 +56,23 @@
       : value[key] >= 0 && value[key] <= 10000000));
   const displayText = value => typeof value === 'string' && value.trim().length > 0
     && Array.from(value).length <= 160 && !/\p{C}/u.test(value);
+  function workRecord(value) {
+    const result = select(value, RECORD_KEYS, {usage: USAGE_KEYS});
+    if (!result) return null;
+    const hasSkillId = Object.hasOwn(value, 'skill_id');
+    const hasSkillName = Object.hasOwn(value, 'skill_name');
+    const skillId = value.skill_id;
+    const skillName = value.skill_name;
+    const validSkillId = typeof skillId === 'string' && SKILL_ID.test(skillId);
+    const validSkillName = typeof skillName === 'string' && Array.from(skillName).length >= 1
+      && Array.from(skillName).length <= 80 && !/\p{C}/u.test(skillName);
+    if (value.task_kind !== 'call' && (hasSkillId || hasSkillName)
+        || hasSkillId && !validSkillId || hasSkillName && (!validSkillId || !validSkillName)) {
+      delete result.skill_id;
+      delete result.skill_name;
+    }
+    return result;
+  }
   function workContext(value) {
     if (!plain(value) || !displayText(value.command_label) || !WORK_ACTIONS.has(value.action)
         || !(value.label_source === 'reported' && displayText(value.task_label)
@@ -100,8 +118,8 @@
       project,
       jobs: list(input?.jobs, JOB_KEYS).filter(row => row.project === project),
       events: list(input?.events, EVENT_KEYS).filter(row => row.project === project),
-      records: list(input?.records, RECORD_KEYS, {usage: USAGE_KEYS})
-        .filter(row => row.project === project),
+      records: (Array.isArray(input?.records) ? input.records : [])
+        .slice(0, 1000).map(workRecord).filter(row => row && row.project === project),
       hostExecutions: (Array.isArray(input?.hostExecutions) ? input.hostExecutions : [])
         .slice(0, 1000).map(row => displayHost(row, project)).filter(Boolean),
       hostObservedAt: scalar(input?.hostObservedAt) ?? null,

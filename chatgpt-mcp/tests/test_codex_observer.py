@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -13,7 +15,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from codex_observer import (  # noqa: E402
     JsonRpcClient,
+    _load_projects,
     discover_managed_endpoint,
+    main,
     normalize_thread,
     observe_once,
 )
@@ -502,6 +506,7 @@ class EndpointDiscoveryTest(unittest.TestCase):
         self.socket_path = self.root / "codex-daemon-test.sock"
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(str(self.socket_path))
+        self.extra_listeners = []
         (self.proc / "net" / "unix").write_text(
             "Num RefCount Protocol Flags Type St Inode Path\n"
             f"0000: 00000002 00000000 00010000 0001 01 4242 {self.socket_path}\n",
@@ -509,8 +514,23 @@ class EndpointDiscoveryTest(unittest.TestCase):
         )
 
     def tearDown(self):
+        for listener in self.extra_listeners:
+            listener.close()
         self.listener.close()
         self.temporary.cleanup()
+
+    def make_control_dir(self):
+        control_dir = self.codex_home / "app-server-control"
+        control_dir.mkdir(mode=0o700)
+        control_dir.chmod(0o700)
+        return control_dir
+
+    def bind_socket(self, path, mode=0o600):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        path.chmod(mode)
+        self.extra_listeners.append(listener)
+        return path
 
     def test_discovers_one_stable_user_owned_listener(self):
         endpoint = discover_managed_endpoint(
@@ -519,6 +539,16 @@ class EndpointDiscoveryTest(unittest.TestCase):
 
         self.assertEqual(endpoint, self.socket_path)
         self.assertTrue(stat.S_ISSOCK(endpoint.lstat().st_mode))
+
+    def test_empty_safe_control_directory_preserves_legacy_pid_discovery(self):
+        self.make_control_dir()
+
+        endpoint = discover_managed_endpoint(
+            self.codex_home, proc_root=self.proc,
+            socket_prefix=str(self.root / "codex-daemon-"),
+        )
+
+        self.assertEqual(endpoint, self.socket_path)
 
     def test_accepts_managed_pid_file_with_host_default_read_permissions(self):
         self.pid_file.chmod(0o664)
@@ -539,6 +569,289 @@ class EndpointDiscoveryTest(unittest.TestCase):
                 self.codex_home, proc_root=self.proc,
                 socket_prefix=str(self.root / "codex-daemon-"),
             )
+
+    def test_discovers_stable_control_symlink_without_legacy_pid(self):
+        self.pid_file.unlink()
+        control_dir = self.make_control_dir()
+        control_path = control_dir / "app-server-control.sock"
+        control_path.symlink_to(self.socket_path)
+        self.socket_path.chmod(0o600)
+
+        endpoint = discover_managed_endpoint(
+            self.codex_home, proc_root=self.proc,
+            socket_prefix=str(self.root / "codex-daemon-"),
+        )
+
+        self.assertEqual(endpoint, self.socket_path)
+
+    def test_discovers_safe_direct_control_socket_without_legacy_pid(self):
+        self.pid_file.unlink()
+        control_path = self.make_control_dir() / "app-server-control.sock"
+        self.bind_socket(control_path)
+
+        endpoint = discover_managed_endpoint(
+            self.codex_home, proc_root=self.proc,
+            socket_prefix=str(self.root / "codex-daemon-"),
+        )
+
+        self.assertEqual(endpoint, control_path)
+
+    def test_present_unsafe_control_directory_never_falls_back_to_legacy_pid(self):
+        control_dir = self.make_control_dir()
+        control_dir.chmod(0o770)
+        (control_dir / "app-server-control.sock").symlink_to(self.socket_path)
+        self.socket_path.chmod(0o600)
+
+        with self.assertRaisesRegex(RuntimeError, "control listener"):
+            discover_managed_endpoint(
+                self.codex_home, proc_root=self.proc,
+                socket_prefix=str(self.root / "codex-daemon-"),
+            )
+
+    def test_control_symlink_must_resolve_to_safe_owned_socket_under_prefix(self):
+        cases = ("dangling", "outside-prefix", "unsafe-mode")
+        for case in cases:
+            with self.subTest(case=case):
+                control_dir = self.make_control_dir()
+                control_path = control_dir / "app-server-control.sock"
+                try:
+                    if case == "dangling":
+                        target = self.root / "codex-daemon-missing.sock"
+                    elif case == "outside-prefix":
+                        target = self.bind_socket(self.root / "outside.sock")
+                    else:
+                        target = self.bind_socket(
+                            self.root / "codex-daemon-unsafe.sock", 0o660,
+                        )
+                    control_path.symlink_to(target)
+                    self.pid_file.unlink(missing_ok=True)
+
+                    with self.assertRaisesRegex(RuntimeError, "control listener"):
+                        discover_managed_endpoint(
+                            self.codex_home, proc_root=self.proc,
+                            socket_prefix=str(self.root / "codex-daemon-"),
+                        )
+                finally:
+                    control_path.unlink(missing_ok=True)
+                    control_dir.rmdir()
+
+    def test_symlinked_control_directory_is_rejected(self):
+        real_control = self.codex_home / "real-control"
+        real_control.mkdir(mode=0o700)
+        real_control.chmod(0o700)
+        (real_control / "app-server-control.sock").symlink_to(self.socket_path)
+        (self.codex_home / "app-server-control").symlink_to(real_control, target_is_directory=True)
+        self.socket_path.chmod(0o600)
+
+        with self.assertRaisesRegex(RuntimeError, "control listener"):
+            discover_managed_endpoint(
+                self.codex_home, proc_root=self.proc,
+                socket_prefix=str(self.root / "codex-daemon-"),
+            )
+
+    def test_control_directory_entry_and_target_must_be_owned(self):
+        control_path = self.make_control_dir() / "app-server-control.sock"
+        control_path.symlink_to(self.socket_path)
+        self.socket_path.chmod(0o600)
+        self.pid_file.unlink()
+        original_lstat = Path.lstat
+
+        for unowned in (control_path.parent, control_path, self.socket_path):
+            with self.subTest(unowned=unowned):
+                def wrong_owner_lstat(path):
+                    info = original_lstat(path)
+                    if Path(path) != unowned:
+                        return info
+                    changed = mock.Mock()
+                    for field in ("st_mode", "st_ino", "st_dev", "st_ctime_ns"):
+                        setattr(changed, field, getattr(info, field))
+                    changed.st_uid = os.getuid() + 1
+                    return changed
+
+                with mock.patch("pathlib.Path.lstat", new=wrong_owner_lstat):
+                    with self.assertRaisesRegex(RuntimeError, "control listener"):
+                        discover_managed_endpoint(
+                            self.codex_home, proc_root=self.proc,
+                            socket_prefix=str(self.root / "codex-daemon-"),
+                        )
+
+    def test_control_symlink_identity_rotation_during_discovery_is_rejected(self):
+        self.pid_file.unlink()
+        control_path = self.make_control_dir() / "app-server-control.sock"
+        control_path.symlink_to(self.socket_path)
+        self.socket_path.chmod(0o600)
+        original_lstat = Path.lstat
+        calls = 0
+
+        def rotating_lstat(path):
+            nonlocal calls
+            info = original_lstat(path)
+            if Path(path) == control_path:
+                calls += 1
+                if calls == 2:
+                    changed = mock.Mock(wraps=info)
+                    changed.st_ino = info.st_ino + 1
+                    return changed
+            return info
+
+        with mock.patch("pathlib.Path.lstat", new=rotating_lstat):
+            with self.assertRaisesRegex(RuntimeError, "changed during discovery"):
+                discover_managed_endpoint(
+                    self.codex_home, proc_root=self.proc,
+                    socket_prefix=str(self.root / "codex-daemon-"),
+                )
+
+    def test_control_symlink_target_rotation_during_discovery_is_rejected(self):
+        self.pid_file.unlink()
+        other = self.bind_socket(self.root / "codex-daemon-other.sock")
+        control_path = self.make_control_dir() / "app-server-control.sock"
+        control_path.symlink_to(self.socket_path)
+        self.socket_path.chmod(0o600)
+        original_readlink = os.readlink
+        calls = 0
+
+        def rotating_readlink(path, *args, **kwargs):
+            nonlocal calls
+            if Path(path) == control_path:
+                calls += 1
+                if calls == 2:
+                    control_path.unlink()
+                    control_path.symlink_to(other)
+            return original_readlink(path, *args, **kwargs)
+
+        with mock.patch("codex_observer.os.readlink", new=rotating_readlink):
+            with self.assertRaisesRegex(RuntimeError, "changed during discovery"):
+                discover_managed_endpoint(
+                    self.codex_home, proc_root=self.proc,
+                    socket_prefix=str(self.root / "codex-daemon-"),
+                )
+
+
+class ProjectLoadingTest(unittest.TestCase):
+    def test_deleted_worktree_is_skipped_without_exposing_its_path(self):
+        with tempfile.TemporaryDirectory(prefix="codex-observer-projects-") as folder:
+            root = Path(folder)
+            available = root / "available"
+            available.mkdir()
+            missing = root / "private-deleted-worktree"
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": {
+                "available": str(available),
+                "removed-worktree": str(missing),
+            }}), encoding="utf-8")
+            original = config.read_bytes()
+            warning = io.StringIO()
+
+            try:
+                with contextlib.redirect_stderr(warning):
+                    loaded = _load_projects(config)
+            except RuntimeError as exc:
+                self.fail(f"A deleted worktree must be skipped: {exc}")
+
+            self.assertEqual(loaded, {"available": available.resolve()})
+            self.assertEqual(config.read_bytes(), original)
+            self.assertIn("removed-worktree", warning.getvalue())
+            self.assertIn("DIRECTORY_MISSING", warning.getvalue())
+            self.assertNotIn(str(missing), warning.getvalue())
+
+    def test_malformed_relative_file_permission_and_invalid_json_still_fail(self):
+        with tempfile.TemporaryDirectory(prefix="codex-observer-projects-") as folder:
+            root = Path(folder)
+            available = root / "available"
+            available.mkdir()
+            ordinary_file = root / "ordinary-file"
+            ordinary_file.write_text("not a directory", encoding="utf-8")
+            unreadable = root / "unreadable"
+            unreadable_child = unreadable / "child"
+            unreadable_child.mkdir(parents=True)
+            unreadable.chmod(0)
+            config = root / "projects.json"
+            cases = (
+                {"projects": {"available": str(available), "../invalid": str(root / "missing")}},
+                {"projects": {"available": str(available), "relative": "relative/path"}},
+                {"projects": {"available": str(available), "file": str(ordinary_file)}},
+                {"projects": {"available": str(available), "invalid": None}},
+                {"projects": {
+                    "available": str(available), "permission": str(unreadable_child),
+                }},
+            )
+            try:
+                for data in cases:
+                    with self.subTest(data=data):
+                        config.write_text(json.dumps(data), encoding="utf-8")
+                        with self.assertRaises(RuntimeError):
+                            _load_projects(config)
+                config.write_text("{invalid", encoding="utf-8")
+                with self.assertRaises(RuntimeError):
+                    _load_projects(config)
+            finally:
+                unreadable.chmod(0o700)
+
+    def test_all_missing_projects_cannot_start(self):
+        with tempfile.TemporaryDirectory(prefix="codex-observer-projects-") as folder:
+            root = Path(folder)
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": {
+                "first": str(root / "first-missing"),
+                "second": str(root / "second-missing"),
+            }}), encoding="utf-8")
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(
+                    RuntimeError, "No configured project directories are available",
+                ):
+                    _load_projects(config)
+
+
+class MainDiagnosticTest(unittest.TestCase):
+    def test_known_failure_logs_allowlisted_code_and_exception_class(self):
+        async def fail(_args):
+            raise RuntimeError("Invalid projects configuration")
+
+        stderr = io.StringIO()
+        with mock.patch("codex_observer._run", new=fail), contextlib.redirect_stderr(stderr):
+            result = main([])
+
+        self.assertEqual(result, 1)
+        self.assertIn("error=RuntimeError", stderr.getvalue())
+        self.assertIn("code=PROJECT_CONFIGURATION_INVALID", stderr.getvalue())
+
+    def test_each_known_failure_has_its_public_code_without_raw_message(self):
+        cases = (
+            ("Invalid projects configuration", "PROJECT_CONFIGURATION_INVALID"),
+            ("No configured project directories are available", "PROJECT_DIRECTORIES_UNAVAILABLE"),
+            ("Invalid managed PID file", "MANAGED_PID_UNAVAILABLE"),
+            ("Invalid managed Codex control listener", "CONTROL_LISTENER_INVALID"),
+        )
+        for message, expected_code in cases:
+            with self.subTest(message=message):
+                async def fail(_args, raw_message=message):
+                    raise RuntimeError(raw_message)
+
+                stderr = io.StringIO()
+                with mock.patch("codex_observer._run", new=fail), \
+                        contextlib.redirect_stderr(stderr):
+                    result = main([])
+
+                self.assertEqual(result, 1)
+                self.assertIn("error=RuntimeError", stderr.getvalue())
+                self.assertIn(f"code={expected_code}", stderr.getvalue())
+                self.assertNotIn(message, stderr.getvalue())
+
+    def test_unknown_failure_uses_generic_code_and_suppresses_raw_message(self):
+        private_message = "private path /secret/worktree and token value"
+
+        async def fail(_args):
+            raise RuntimeError(private_message)
+
+        stderr = io.StringIO()
+        with mock.patch("codex_observer._run", new=fail), contextlib.redirect_stderr(stderr):
+            result = main([])
+
+        self.assertEqual(result, 1)
+        self.assertIn("error=RuntimeError", stderr.getvalue())
+        self.assertIn("code=OBSERVER_FAILED", stderr.getvalue())
+        self.assertNotIn(private_message, stderr.getvalue())
 
 
 if __name__ == "__main__":

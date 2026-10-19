@@ -11,6 +11,7 @@ from uuid import UUID
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
 _MODEL = re.compile(r"[A-Za-z0-9_.:+/-]{1,120}\Z")
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.:+/-]{1,120}\Z")
+_SKILL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}\Z")
 _EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 
 _READ_TOOLS = {"read", "read_file", "view_image"}
@@ -182,6 +183,11 @@ def normalize_hook(payload, projects, *, source_id="claude-local", time=None):
         })
         if _TOOL_NAME.fullmatch(tool_name) is not None:
             event["tool_name"] = tool_name
+        tool_input = payload.get("tool_input")
+        skill_id = tool_input.get("skill") if isinstance(tool_input, dict) else None
+        if (tool_name == "Skill" and isinstance(skill_id, str)
+                and _SKILL_ID.fullmatch(skill_id) is not None):
+            event["skill_id"] = skill_id
         search_scope = _search_scope(tool_name)
         if search_scope is not None:
             event["search_scope"] = search_scope

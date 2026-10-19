@@ -1716,6 +1716,300 @@ class AdminBrowserTest(unittest.TestCase):
         }""")
         return self.room.locator('#called-fixture')
 
+    def create_skill_character_fixture(self, *, reduced_motion=True):
+        if reduced_motion:
+            self.page.emulate_media(reduced_motion='reduce')
+        fixture = self.create_called_character_fixture()
+        self.room_page.evaluate("""() => {
+            window.skillRecord = (actor, age = 0, extra = {}) => callRecord(actor, age, {
+                source_id: 'claude-skills', source_kind: 'claude-cli', task_kind: 'call',
+                task_id: 'skill-' + actor, action: 'execute', state: 'started',
+                task_label: '검토 스킬 호출', skill_id: 'plugin:review', skill_name: '코드 검토',
+                ...extra,
+            });
+            calledFixture.update({project: 'alpha', records: []});
+        }""")
+        return fixture
+
+    def test_skill_metadata_reaches_real_http_bridge_and_exact_task_inspector(self):
+        self.page.emulate_media(reduced_motion='reduce')
+        event = {
+            'schema_version': 1, 'source_id': 'claude-skills', 'source_kind': 'claude-cli',
+            'actor_id': 'reviewer', 'actor_kind': 'agent', 'actor_label': '검토 담당',
+            'task_id': 'skill-first', 'task_kind': 'call', 'task_label': '승인 코드 검토',
+            'action': 'execute', 'state': 'started', 'tool_name': 'Skill',
+            'skill_id': 'plugin:review', 'skill_name': '코드 검토',
+            'time': datetime.now(timezone.utc).isoformat(),
+        }
+        self.store.record_work_event('alpha', event, provenance='observed')
+        self.page.locator('#refresh').click()
+        character = self.room.locator('.wd-actor[data-skill-id="plugin:review"]')
+        expect(character).to_have_count(1)
+        expect(character.locator('.wd-skill-mark')).to_be_visible()
+        expect(character.locator('.wd-actor-task')).to_contain_text('코드 검토')
+        character.click()
+        detail = self.room.locator('#wd-detail')
+        expect(detail).to_contain_text('코드 검토')
+        expect(detail).to_contain_text('승인 코드 검토')
+        expect(detail).to_contain_text('직접 관측')
+        expect(detail).to_contain_text('skill-first')
+        self.assertEqual(self.page.locator('#workroom-frame').get_attribute('sandbox'), 'allow-scripts')
+        self.store.record_work_event('alpha', {
+            key: value for key, value in {**event, 'state': 'returned',
+                'time': datetime.now(timezone.utc).isoformat()}.items()
+            if key not in {'skill_id', 'skill_name'}
+        }, provenance='observed')
+        self.page.locator('#refresh').click()
+        expect(character).to_have_attribute('data-skill-phase', 'returned')
+        expect(detail).to_contain_text('반환')
+        expect(detail).to_contain_text('코드 검토')
+
+    def test_skill_start_effect_is_once_per_invocation_and_return_is_not_workflow_success(self):
+        fixture = self.create_skill_character_fixture()
+        self.room_page.evaluate("""() => {
+            calledRecords = [skillRecord('mage')];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+            window.firstSkillSpeech = document.querySelector('#called-fixture .wd-speech');
+        }""")
+        character = fixture.locator('.wd-actor[data-skill-id="plugin:review"]')
+        expect(character).to_have_count(1)
+        expect(character.locator('.wd-skill-mark')).to_be_visible()
+        expect(fixture.locator('.wd-speech:not([hidden])')).to_contain_text('스킬')
+        self.room_page.evaluate("""() => {
+            calledFixture.update({project: 'alpha', records: calledRecords});
+            calledRecords.unshift(skillRecord('mage', 0, {state: 'running'}));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        self.assertTrue(self.room_page.evaluate("""() => firstSkillSpeech ===
+            document.querySelector('#called-fixture .wd-speech')"""))
+        self.room_page.evaluate("""() => {
+            const returned = skillRecord('mage', 0, {state: 'returned'});
+            delete returned.skill_id; delete returned.skill_name;
+            calledRecords.unshift(returned);
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        expect(character).to_have_attribute('data-skill-phase', 'returned')
+        speech = fixture.locator('.wd-speech:not([hidden])')
+        expect(speech).to_contain_text('반환')
+        self.assertNotIn('성공!', speech.inner_text())
+        character.click()
+        expect(fixture.locator('#wd-detail')).to_contain_text('코드 검토')
+        self.page.clock.fast_forward(6500)
+        self.room_page.evaluate("""() => {
+            calledRecords.unshift(skillRecord('mage', 0, {task_id: 'skill-second'}));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        expect(fixture.locator('.wd-speech:not([hidden])')).to_contain_text('스킬')
+        expect(fixture.locator('.wd-actor')).to_have_count(1)
+
+    def test_skill_effects_clear_on_stale_hidden_pause_and_destroy_without_catchup_bursts(self):
+        fixture = self.create_skill_character_fixture()
+        self.room_page.evaluate("""() => {
+            calledRecords = [skillRecord('mage')];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        speech = fixture.locator('.wd-speech:not([hidden])')
+        expect(speech).to_have_count(1)
+        self.room_page.evaluate("""() => calledFixture.update({project: 'alpha',
+            records: calledRecords, error: 'fixture observation error'})""")
+        expect(speech).to_have_count(0)
+        self.room_page.evaluate("""() => {
+            calledRecords.unshift(skillRecord('mage', 0, {state: 'failed'}));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        expect(speech).to_contain_text('실패')
+        self.room_page.evaluate("""() => {
+            Object.defineProperty(document, 'hidden', {configurable: true, value: true});
+            document.dispatchEvent(new Event('visibilitychange'));
+            calledRecords.unshift(skillRecord('hidden-mage'));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        expect(speech).to_have_count(0)
+        self.room_page.evaluate("""() => {
+            Object.defineProperty(document, 'hidden', {configurable: true, value: false});
+            document.dispatchEvent(new Event('visibilitychange'));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+            delete document.hidden;
+        }""")
+        expect(speech).to_have_count(0)
+        self.room_page.evaluate("""() => {
+            calledRecords.unshift(skillRecord('fresh-mage'));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        expect(speech).to_have_count(1)
+        self.room_page.evaluate('calledFixture.setLive(false)')
+        expect(speech).to_have_count(0)
+        self.room_page.evaluate('calledFixture.setLive(true)')
+        expect(speech).to_have_count(0)
+        self.room_page.evaluate("""() => {
+            calledFixture.clear('beta'); calledFixture.destroy();
+        }""")
+        expect(fixture.locator('.wd-skill-mark')).to_have_count(0)
+        self.assertEqual(self.errors, [])
+
+    def test_skill_label_is_safe_reported_and_usable_on_phone(self):
+        fixture = self.create_skill_character_fixture()
+        hostile = '<img src=x onerror=window.skill_pwned=1>'
+        self.room_page.evaluate("""label => {
+            calledRecords = [skillRecord('reported-mage', 0, {skill_name: label,
+                provenance: 'reported'})];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""", hostile)
+        character = fixture.locator('.wd-actor[data-skill-id="plugin:review"]')
+        expect(character.locator('.wd-skill-mark')).to_be_visible()
+        expect(character.locator('.wd-actor-task')).to_contain_text(hostile)
+        expect(fixture.locator('.wd-speech:not([hidden])')).to_contain_text('보고')
+        character.click()
+        expect(fixture.locator('#wd-detail')).to_contain_text(hostile)
+        expect(fixture.locator('#wd-detail')).to_contain_text('보고됨')
+        self.assertEqual(fixture.locator('img').count(), 0)
+        self.assertIsNone(self.room_page.evaluate('window.skill_pwned'))
+        for width in (390, 320):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({'width': width, 'height': 844})
+                expect(character.locator('.wd-skill-mark')).to_be_visible()
+                self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                self.assertTrue(self.room_page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+
+    def test_skill_initial_history_and_ambiguous_ids_do_not_invent_activation(self):
+        fixture = self.create_skill_character_fixture()
+        self.room_page.evaluate("""() => {
+            calledFixture.clear('alpha');
+            calledRecords = [skillRecord('history-mage', 5, {state: 'returned'})];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        expect(fixture.locator('.wd-speech')).to_have_count(0)
+        expect(fixture.locator('.wd-actor[data-skill-id="plugin:review"]')).to_have_count(1)
+        self.room_page.evaluate("""() => {
+            calledRecords.unshift(skillRecord('ambiguous-mage', 1),
+                skillRecord('ambiguous-mage', 0, {skill_id: 'plugin:other', state: 'returned'}));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        ambiguous = fixture.locator('.wd-actor[data-actor-id="entity:claude-skills:ambiguous-mage"]')
+        expect(ambiguous).to_have_count(1)
+        self.assertFalse(ambiguous.get_attribute('data-skill-id'))
+        expect(ambiguous.locator('.wd-skill-mark:visible')).to_have_count(0)
+
+    def test_skill_record_replay_keeps_skill_marker_without_live_activation(self):
+        fixture = self.create_skill_character_fixture(reduced_motion=False)
+        self.room_page.evaluate("""() => {
+            calledFixture.clear('alpha');
+            calledRecords = [skillRecord('replay-mage', 20),
+                skillRecord('replay-mage', 15, {state: 'returned'})];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        character = fixture.locator('.wd-actor[data-skill-id="plugin:review"]')
+        expect(character).to_have_count(1)
+        expect(fixture.locator('.wd-speech')).to_have_count(0)
+        fixture.locator('#wd-replay').click()
+        expect(character).to_have_attribute('data-presentation', 'replay')
+        expect(character.locator('.wd-skill-mark')).to_be_visible()
+        expect(fixture.locator('.wd-speech')).to_have_count(0)
+        self.assertNotEqual(character.get_attribute('data-skill-active'), 'true')
+        fixture.locator('#wd-motion').click()
+        self.assertEqual(character.evaluate("""node => node.getAnimations({subtree: true})
+            .filter(animation => animation.playState === 'running').length"""), 0)
+
+    def test_inherited_reported_skill_keeps_visible_and_accessible_provenance(self):
+        fixture = self.create_skill_character_fixture()
+        self.room_page.evaluate("""() => {
+            const start = skillRecord('reported-mage', 1, {provenance: 'reported'});
+            const end = skillRecord('reported-mage', 0, {state: 'returned'});
+            delete end.skill_id; delete end.skill_name;
+            calledRecords = [start, end];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        character = fixture.locator('.wd-actor[data-skill-id="plugin:review"]')
+        expect(character.locator('.wd-actor-task')).to_contain_text('보고')
+        expect(character).to_have_attribute('data-skill-provenance', 'reported')
+        label = character.get_attribute('aria-label')
+        self.assertIn('코드 검토', label)
+        self.assertIn('보고됨', label)
+        board_label = fixture.locator('.wd-work-item[data-task-id="task:claude-skills:reported-mage:skill-reported-mage"]').get_attribute('aria-label')
+        self.assertIn('코드 검토', board_label)
+        self.assertIn('보고됨', board_label)
+        character.click()
+        expect(fixture.locator('.wd-summary-skill')).to_contain_text('보고됨')
+
+    def test_skill_burst_waits_for_visible_admission_and_is_not_restarted_by_polling(self):
+        fixture = self.create_skill_character_fixture(reduced_motion=False)
+        initial = self.room_page.evaluate("""() => {
+            calledRecords = [skillRecord('a-first', 1, {action: 'read'}), skillRecord('b-pending')];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+            const actor = document.querySelector('#called-fixture [data-actor-id="entity:claude-skills:b-pending"]');
+            const mark = actor.querySelector('.wd-skill-mark');
+            return {pending: actor.dataset.entryPending,
+                bursts: mark.getAnimations().filter(animation => !(animation instanceof CSSAnimation)).length};
+        }""")
+        self.assertEqual(initial['pending'], 'true')
+        self.assertEqual(initial['bursts'], 0)
+        self.room_page.evaluate("""() => {
+            calledMotion.settle();
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        character = fixture.locator('.wd-actor[data-actor-id="entity:claude-skills:b-pending"]')
+        expect(character).to_have_attribute('data-entry-pending', 'false')
+        expect(character).to_have_attribute('data-skill-active', 'true')
+        self.assertTrue(character.evaluate("""node => {
+            const mark = node.querySelector('.wd-skill-mark');
+            window.skillBurst = mark.getAnimations().find(animation => !(animation instanceof CSSAnimation));
+            return Boolean(skillBurst && skillBurst.playState === 'running')
+                && mark.getAnimations().some(animation => animation instanceof CSSAnimation
+                    && animation.animationName === 'wd-skill-rune');
+        }"""))
+        self.room_page.evaluate("""() => calledFixture.update({project: 'alpha', records: calledRecords})""")
+        self.assertTrue(character.evaluate("""node => node.querySelector('.wd-skill-mark')
+            .getAnimations().includes(skillBurst)"""))
+        fixture.locator('#wd-motion').click()
+        expect(character).to_have_attribute('data-skill-active', 'false')
+        self.assertEqual(character.evaluate("""node => node.getAnimations({subtree: true})
+            .filter(animation => animation.playState === 'running').length"""), 0)
+
+    def test_skill_role_views_show_the_same_marker_name_and_provenance(self):
+        fixture = self.create_skill_character_fixture()
+        self.room_page.evaluate("""() => {
+            calledRecords = ['review', 'search', 'reason'].map(action => skillRecord(action, 0, {
+                action, provenance: 'reported', skill_id: 'plugin:' + action,
+                skill_name: '역할 스킬 ' + action, search_scope: action === 'search' ? 'web' : undefined,
+            }));
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        for action in ('review', 'search', 'reason'):
+            with self.subTest(action=action):
+                role = fixture.locator(f'.wd-role-character[data-skill-id="plugin:{action}"]')
+                expect(role).to_have_count(1)
+                expect(role.locator('.wd-skill-mark')).to_be_visible()
+                expect(role.locator('.wd-thinking-role')).to_contain_text(f'역할 스킬 {action}')
+                expect(role.locator('.wd-thinking-state')).to_contain_text('보고됨')
+                self.assertIn(f'역할 스킬 {action}', role.get_attribute('aria-label'))
+                self.assertIn('보고됨', role.get_attribute('aria-label'))
+                role.click()
+                expect(fixture.locator('.wd-summary-skill')).to_contain_text(f'역할 스킬 {action}')
+        expect(fixture.locator('.wd-actor[data-skill-id]')).to_have_count(0)
+        self.assertEqual(fixture.locator('.wd-role-character[data-skill-id]').count(), 3)
+
+    def test_skill_role_uses_actual_burst_and_pause_cleanup(self):
+        fixture = self.create_skill_character_fixture(reduced_motion=False)
+        self.room_page.evaluate("""() => {
+            calledRecords = [skillRecord('role-mage', 0, {action: 'review', provenance: 'reported'})];
+            calledFixture.update({project: 'alpha', records: calledRecords});
+            calledMotion.settle();
+            calledFixture.update({project: 'alpha', records: calledRecords});
+        }""")
+        role = fixture.locator('.wd-role-character[data-skill-id="plugin:review"]')
+        expect(role.locator('.wd-skill-mark')).to_be_visible()
+        expect(role).to_have_attribute('data-skill-active', 'true')
+        self.assertTrue(role.evaluate("""node => {
+            const animations = node.querySelector('.wd-skill-mark').getAnimations();
+            return animations.some(animation => !(animation instanceof CSSAnimation)
+                && animation.playState === 'running') && animations.some(animation =>
+                animation instanceof CSSAnimation && animation.animationName === 'wd-skill-rune');
+        }"""))
+        fixture.locator('#wd-motion').click()
+        expect(role).to_have_attribute('data-skill-active', 'false')
+        self.assertEqual(role.evaluate("""node => node.getAnimations({subtree: true})
+            .filter(animation => animation.playState === 'running').length"""), 0)
+
     def test_archive_latest_work_moves_existing_keyed_records_back_one_slot(self):
         self.page.emulate_media(reduced_motion='reduce')
         fixture = self.create_called_character_fixture()

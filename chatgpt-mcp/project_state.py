@@ -103,6 +103,7 @@ PROJECT_TOOLS = {
 KNOWN_TOOLS = PROJECTLESS_TOOLS | PROJECT_TOOLS
 CALL_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
 ASCII_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:+/-]+\Z")
+SKILL_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}\Z")
 
 
 def _invalid_work_event():
@@ -143,6 +144,10 @@ def _work_event_label(value, maximum):
     except UnicodeEncodeError:
         return False
     return True
+
+
+def _work_event_printable_label(value, maximum):
+    return _work_event_label(value, maximum) and all(character.isprintable() for character in value)
 
 
 def _sanitize_work_event(project, event, provenance, now, *, preserved_receipt=None):
@@ -232,6 +237,15 @@ def _sanitize_work_event(project, event, provenance, now, *, preserved_receipt=N
         if not _work_event_identifier(event["tool_name"], 120):
             _invalid_work_event()
         record["tool_name"] = event["tool_name"]
+    if "skill_id" in event:
+        if (task_kind != "call" or not isinstance(event["skill_id"], str)
+                or SKILL_IDENTIFIER.fullmatch(event["skill_id"]) is None):
+            _invalid_work_event()
+        record["skill_id"] = event["skill_id"]
+    if "skill_name" in event:
+        if "skill_id" not in record or not _work_event_printable_label(event["skill_name"], 80):
+            _invalid_work_event()
+        record["skill_name"] = event["skill_name"]
 
     for field, maximum in (("model", 120), ("reasoning_effort", 32)):
         if field in event:

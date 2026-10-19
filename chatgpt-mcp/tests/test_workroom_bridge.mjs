@@ -85,6 +85,68 @@ test('update sends only allowlisted display metadata with the epoch and frame no
   assert.equal(delivery.message.snapshot.hostExecutions[0].display_view, true);
 });
 
+test('bridge forwards only valid explicit skill metadata and drops private inputs', () => {
+  const app = fixture();
+  const input = snapshot({records: [{
+    schema_version: 1, project: 'alpha', source_id: 'claude-local', source_kind: 'claude-cli',
+    actor_id: 'actor-1', actor_kind: 'agent', actor_label: 'Claude', task_id: 'tool:skill-1',
+    task_kind: 'call', task_label: 'Skill', action: 'execute', state: 'started',
+    time: '2026-10-15T00:00:00Z', provenance: 'observed',
+    skill_id: 'plugin.example:review-pr', skill_name: 'PR 검토',
+    tool_input: {skill: 'plugin.example:review-pr', args: 'private-arguments'},
+    prompt: 'private-prompt', response: 'private-response',
+  }]});
+
+  app.bridge.update(input);
+
+  const record = app.sent.at(-1).message.snapshot.records[0];
+  assert.equal(record.skill_id, 'plugin.example:review-pr');
+  assert.equal(record.skill_name, 'PR 검토');
+  for (const privateText of ['private-arguments', 'private-prompt', 'private-response']) {
+    assert.equal(JSON.stringify(record).includes(privateText), false, privateText);
+  }
+});
+
+test('bridge degrades invalid or unpaired skill metadata to generic records', () => {
+  const invalid = [
+    {skill_name: 'Review'},
+    {skill_id: 'bad/skill', skill_name: 'Review'},
+    {skill_id: 7, skill_name: 'Review'},
+    {skill_id: 'review', skill_name: 'bad\nlabel'},
+    {skill_id: 'review', skill_name: ['Review']},
+    {skill_id: 'x'.repeat(121), skill_name: 'Review'},
+    {skill_id: 'review', skill_name: 'Review', task_kind: 'agent'},
+    {skill_id: 'review', task_kind: 'job'},
+  ];
+  const app = fixture();
+  app.bridge.update(snapshot({records: invalid.map((skill, index) => ({
+    schema_version: 1, project: 'alpha', source_id: 'chat', source_kind: 'chatgpt',
+    actor_id: `actor-${index}`, actor_kind: 'agent', actor_label: 'Agent',
+    task_id: `task-${index}`, task_kind: 'call', task_label: 'Work', action: 'execute',
+    state: 'started', time: '2026-10-15T00:00:00Z', provenance: 'reported', ...skill,
+  }))}));
+
+  for (const record of app.sent.at(-1).message.snapshot.records) {
+    assert.equal(Object.hasOwn(record, 'skill_id'), false);
+    assert.equal(Object.hasOwn(record, 'skill_name'), false);
+  }
+});
+
+test('bridge preserves generic agent and job records without skill metadata', () => {
+  const app = fixture();
+  app.bridge.update(snapshot({records: ['agent', 'job'].map((taskKind, index) => ({
+    schema_version: 1, project: 'alpha', source_id: 'chat', source_kind: 'chatgpt',
+    actor_id: `generic-${index}`, actor_kind: 'agent', actor_label: 'Agent',
+    task_id: `generic-task-${index}`, task_kind: taskKind, task_label: 'Work', action: 'execute',
+    state: 'running', time: '2026-10-15T00:00:00Z', provenance: 'reported',
+  }))}));
+
+  assert.deepEqual(
+    app.sent.at(-1).message.snapshot.records.map(record => record.task_kind),
+    ['agent', 'job'],
+  );
+});
+
 test('host work purpose and observed phase cross the bridge without execution inputs or credentials', () => {
   const app = fixture();
   const input = snapshot();

@@ -34,6 +34,21 @@ _ALLOWED_CALLS = {
 _ALLOWED_NOTIFICATIONS = {"initialized"}
 _MAX_RPC_BYTES = 2 * 1024 * 1024
 _RPC_TIMEOUT_SECONDS = 10.0
+_ERROR_CODES = {
+    "Invalid projects configuration": "PROJECT_CONFIGURATION_INVALID",
+    "No configured project directories are available": "PROJECT_DIRECTORIES_UNAVAILABLE",
+    "Invalid managed PID file": "MANAGED_PID_UNAVAILABLE",
+    "Managed Codex process is not running": "MANAGED_PROCESS_UNAVAILABLE",
+    "Cannot inspect managed Codex process": "MANAGED_PROCESS_UNAVAILABLE",
+    "Cannot inspect Unix listeners": "LISTENER_INSPECTION_UNAVAILABLE",
+    "Expected exactly one managed Codex listener": "MANAGED_LISTENER_UNAVAILABLE",
+    "Invalid managed Codex listener": "MANAGED_LISTENER_INVALID",
+    "Managed Codex process changed during discovery": "MANAGED_PROCESS_CHANGED",
+    "Invalid managed Codex control listener": "CONTROL_LISTENER_INVALID",
+    "Managed Codex listener changed during discovery": "CONTROL_LISTENER_CHANGED",
+    "WebSocket transport is unavailable": "TRANSPORT_UNAVAILABLE",
+    "Codex RPC timed out": "RPC_TIMEOUT",
+}
 
 
 def _identifier(value):
@@ -470,10 +485,62 @@ def _read_managed_pid(pid_file):
     return pid
 
 
+def _control_endpoint(codex_home, socket_prefix):
+    """Read the current CLI control socket without starting or repairing a daemon."""
+    directory = codex_home / "app-server-control"
+    control = directory / "app-server-control.sock"
+    try:
+        directory_info = directory.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("Invalid managed Codex control listener") from exc
+    if (not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.getuid()
+            or stat.S_IMODE(directory_info.st_mode) & 0o022):
+        raise RuntimeError("Invalid managed Codex control listener")
+    try:
+        control_info = control.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("Invalid managed Codex control listener") from exc
+    if (control_info.st_uid != os.getuid()
+            or not (stat.S_ISLNK(control_info.st_mode) or stat.S_ISSOCK(control_info.st_mode))):
+        raise RuntimeError("Invalid managed Codex control listener")
+    try:
+        endpoint = control.resolve(strict=True)
+        endpoint_info = endpoint.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("Invalid managed Codex control listener") from exc
+    if ((stat.S_ISLNK(control_info.st_mode) and not str(endpoint).startswith(socket_prefix))
+            or not stat.S_ISSOCK(endpoint_info.st_mode)
+            or endpoint_info.st_uid != os.getuid()
+            or stat.S_IMODE(endpoint_info.st_mode) & 0o022):
+        raise RuntimeError("Invalid managed Codex control listener")
+
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_ctime_ns)
+
+    try:
+        stable = (identity(directory.lstat()) == identity(directory_info)
+                  and identity(control.lstat()) == identity(control_info)
+                  and control.resolve(strict=True) == endpoint
+                  and identity(endpoint.lstat()) == identity(endpoint_info))
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("Managed Codex listener changed during discovery") from exc
+    if not stable:
+        raise RuntimeError("Managed Codex listener changed during discovery")
+    return endpoint
+
+
 def discover_managed_endpoint(codex_home, *, proc_root=Path("/proc"),
                               socket_prefix="/tmp/codex-daemon-"):
-    """Return the single stable, user-owned listener of the managed daemon."""
+    """Return the stable CLI control listener, or the legacy PID-bound listener."""
     codex_home = Path(codex_home)
+    endpoint = _control_endpoint(codex_home, socket_prefix)
+    if endpoint is not None:
+        return endpoint
     proc_root = Path(proc_root)
     pid_file = codex_home / "app-server-daemon" / "app-server.pid"
     pid = _read_managed_pid(pid_file)
@@ -533,11 +600,17 @@ def _load_projects(path):
             raise RuntimeError("Invalid projects configuration")
         try:
             root = Path(value).resolve(strict=True)
+        except FileNotFoundError:
+            print(f"codex-observer project={name} code=DIRECTORY_MISSING",
+                  file=sys.stderr, flush=True)
+            continue
         except (OSError, RuntimeError) as exc:
             raise RuntimeError("Invalid projects configuration") from exc
         if not root.is_dir():
             raise RuntimeError("Invalid projects configuration")
         projects[name] = root
+    if not projects:
+        raise RuntimeError("No configured project directories are available")
     return projects
 
 
@@ -604,7 +677,9 @@ def main(argv=None):
     except (KeyboardInterrupt, asyncio.CancelledError):
         return 130
     except Exception as exc:
-        print(f"codex-observer error={type(exc).__name__}", file=sys.stderr, flush=True)
+        code = _ERROR_CODES.get(str(exc), "OBSERVER_FAILED")
+        print(f"codex-observer error={type(exc).__name__} code={code}",
+              file=sys.stderr, flush=True)
         return 1
     return 0
 

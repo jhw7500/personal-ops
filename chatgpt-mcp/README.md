@@ -788,8 +788,44 @@ UI는 최근 100개 작업과 최근 호출만 표시하며, 개별 명령 로�
 Host/Origin 검사를 받는다. 본문은 `{"events":[...]}`이며 원격 입력의 출처는 항상 `reported`다.
 활성 보고는 최대 120초 유효하고 종료 신호나 갱신이 없으면 미확인으로 표시한다.
 명시적인 `reason` 이벤트에만 추론 동작을 표시한다. ChatGPT 모델·추론을 자동으로 읽는 기능은 없으며
-Codex·Claude의 후크 수집기는 아직 활성화하지 않았다. 형식과 확장 경계는
+CLI 후크의 활성 여부는 호스트 설정에 달려 있다. Codex 관리 세션 관측은 개별 스킬 호출을 포함하지 않는다.
+형식과 확장 경계는
 [업무 작업실 수집 계약](../work-dashboard/README.md#다른-mcp와-에이전트-수집)을 따른다.
+
+### 스킬 호출 표시 (RPG Stage 2)
+
+공통 v1 작업 이벤트에 선택 필드 `skill_id`와 `skill_name`을 추가한다.
+`skill_id`는 `[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}` 형식이고,
+`skill_name`은 출력 가능한 1~80자 표시명이다. 표시명만 보내는 것은 허용하지 않는다.
+기존 이벤트에는 두 필드가 필요하지 않다. `task_kind: "call"`에만 허용하며,
+일반 agent/job 성공을 스킬 완료로 표시하지 않는다. 스킬 경로·본문·인자·프롬프트는 수집하지 않는다.
+
+한 호출의 시작과 반환에는 같은 `source_id/actor_id/task_id`를 사용하고,
+다음 호출은 새로운 `task_id`를 사용한다. 예를 들어 기존 이벤트 필드에
+`"tool_name":"Skill", "skill_id":"plugin:review", "skill_name":"코드 검토"`를 넣는다.
+같은 호출의 후속 기록이 스킬 필드를 생략해도 화면은 앞선 메타데이터를 유지한다.
+서로 다른 스킬 ID가 같은 호출 ID에 섞이면 스킬 표시는 생략한다.
+
+| 입력 경로 | 스킬 식별 근거 | 화면의 출처 |
+|---|---|---|
+| Claude의 `Skill` 도구 후크 | 유효한 `tool_input.skill`만 추출 | 직접 관측 |
+| ChatGPT·Codex 등의 `report_work_events` 또는 HTTP 보고 | 호출자가 명시한 `skill_id` | 보고됨 |
+| Codex 관리 세션 관측 | 개별 스킬 호출 신호 없음 | 스킬 발동으로 표시하지 않음 |
+| `SKILL.md` 읽기·프롬프트의 스킬 언급·도구명만 존재 | 호출 식별 근거 부족 | 스킬 발동으로 표시하지 않음 |
+
+Claude의 `PreToolUse`는 호출 시작, `PostToolUse`는 호출 반환이다.
+**반환은 스킬이 지시한 전체 업무가 완료됐다는 의미가 아니다.** 실패·중단은 해당 실패 후크로만
+표시한다. 직접 입력한 `/skillname`은 `Skill` 도구 후크를 거치지 않을 수 있으므로 이 수집 범위에
+포함하지 않는다. [Claude 후크 문서](https://code.claude.com/docs/en/hooks#userpromptexpansion)와
+[스킬 권한의 입력 매개변수](https://code.claude.com/docs/en/skills#restrict-claudes-skill-access)를 참조한다.
+
+캐릭터의 스킬 표식, 말풍선, 작업 요약에서 이름과 상태를 확인한다. 새 캐릭터를 만들지 않으며
+같은 호출을 반복 조회해도 발동 효과를 재생하지 않는다. 초기 이력·숨김 복귀·기록 재생에는 새 발동
+효과가 없고, 관측 지연·일시정지·동작 감소 설정을 따른다. 작업 목록에서 해당 호출을 선택하면
+소유자·출처·호출 ID와 상태를 확인할 수 있다. 별도의 AI 호출은 발생하지 않는다.
+
+이 소스 변경만으로 운영 서비스나 호스트 후크 설정은 바뀌지 않는다. MCP 입력 스키마와 부모 프레임
+브리지가 바뀌므로 운영 반영 시 런타임 전환과 기존 호스트 권한의 재승인이 필요할 수 있다.
 
 ## Host Runtime Management — Toss 테스트 API 전용 (P0, 코드 구현)
 
@@ -1089,8 +1125,9 @@ endpoint가 없다. 후보 설정은 `python3 chatgpt-mcp/configure-host-runtime
 ## 검증
 
 ```bash
+cd chatgpt-mcp
 ~/.local/share/uv/tools/serena-agent/bin/python -m unittest discover \
-  -s chatgpt-mcp/tests -v
+  -s tests -v
 ```
 
 임시 프로젝트와 임시 상태 디렉터리에서 실제 MCP 초기화, 도구 목록,

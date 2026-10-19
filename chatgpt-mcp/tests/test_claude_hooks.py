@@ -140,6 +140,54 @@ class ClaudeHookTest(unittest.TestCase):
             self.projects, time=NOW,
         ), [])
 
+    def test_skill_tool_extracts_only_valid_explicit_identifier_across_lifecycle(self):
+        cases = [
+            ("PreToolUse", {}, "started"),
+            ("PostToolUse", {"tool_response": {"secret": "private-response"}}, "returned"),
+            ("PostToolUseFailure", {"error": "private-error"}, "failed"),
+            ("PostToolUseFailure", {"error": "private-error", "is_interrupt": True},
+             "interrupted"),
+        ]
+        for hook_name, extra, state in cases:
+            with self.subTest(hook_name=hook_name, state=state):
+                _, event = normalize_hook(self.payload(
+                    hook_name,
+                    tool_name="Skill",
+                    tool_use_id="skill-call-7",
+                    tool_input={
+                        "skill": "plugin.example:review-pr",
+                        "args": "private-arguments",
+                        "prompt": "private-prompt",
+                    },
+                    **extra,
+                ), self.projects, time=NOW)[0]
+
+                self.assertEqual(event["task_id"], "tool:skill-call-7")
+                self.assertEqual(event["state"], state)
+                self.assertEqual(event["skill_id"], "plugin.example:review-pr")
+                self.assertNotIn("skill_name", event)
+                self.assertNotEqual(event["state"], "succeeded")
+                self.assertNotIn("private", json.dumps(event))
+
+    def test_skill_metadata_is_omitted_for_other_tools_or_invalid_skill_input(self):
+        cases = [
+            ("Bash", {"skill": "plugin.example:review-pr"}),
+            ("Skill", None),
+            ("Skill", {}),
+            ("Skill", {"skill": "bad/skill"}),
+            ("Skill", {"skill": "x" * 121}),
+            ("Skill", {"skill": 7}),
+        ]
+        for tool_name, tool_input in cases:
+            with self.subTest(tool_name=tool_name, tool_input=tool_input):
+                _, event = normalize_hook(self.payload(
+                    "PreToolUse", tool_name=tool_name, tool_use_id="tool-11",
+                    tool_input=tool_input,
+                ), self.projects, time=NOW)[0]
+
+                self.assertNotIn("skill_id", event)
+                self.assertNotIn("skill_name", event)
+
     def test_tool_metadata_distinguishes_web_file_generic_and_unknown_search_names(self):
         cases = [
             ("Read", "read", None),

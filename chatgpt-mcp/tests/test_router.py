@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 
+from jsonschema import Draft202012Validator
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
@@ -144,6 +145,36 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                     'type': 'string', 'pattern': '^[A-Za-z0-9_.:+/-]+$',
                                     'minLength': 1, 'maxLength': 120,
                                 })
+                                self.assertEqual(event_properties['skill_id'], {
+                                    'type': 'string', 'pattern': '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$',
+                                })
+                                self.assertEqual(event_properties['skill_name'], {
+                                    'type': 'string', 'minLength': 1, 'maxLength': 80,
+                                })
+                                self.assertEqual(
+                                    observer.inputSchema['properties']['events']['items'][
+                                        'dependentRequired'
+                                    ]['skill_name'],
+                                    ['skill_id'],
+                                )
+                                skill_schema = observer.inputSchema['properties']['events']['items']
+                                validator = Draft202012Validator(skill_schema)
+                                for task_kind in ('agent', 'job'):
+                                    with self.subTest(task_kind=task_kind):
+                                        invalid_skill = {
+                                            'schema_version': 1,
+                                            'source_id': 'chat', 'source_kind': 'chatgpt',
+                                            'actor_id': 'agent', 'actor_kind': 'agent',
+                                            'actor_label': 'Agent', 'task_id': f'{task_kind}-1',
+                                            'task_kind': task_kind, 'task_label': 'Work',
+                                            'action': 'execute', 'state': 'running',
+                                            'skill_id': 'review',
+                                        }
+                                        self.assertFalse(validator.is_valid(invalid_skill))
+                                        generic = dict(invalid_skill)
+                                        generic.pop('skill_id')
+                                        self.assertTrue(validator.is_valid(generic))
+                                self.assertIn('explicit skill', observer.description)
                                 self.assertIn('explicit activity_role', observer.description)
                                 self.assertIn('search_scope', observer.description)
                                 self.assertIn('trusted local hooks are observed', observer.description)
@@ -153,7 +184,8 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                          'task_id': 'fetch-1', 'task_kind': 'call', 'task_label': '프레임 조회',
                                          'action': 'search', 'state': 'started',
                                          'activity_role': 'research', 'search_scope': 'files',
-                                         'tool_name': 'search_for_pattern'}
+                                         'tool_name': 'search_for_pattern',
+                                         'skill_id': 'figma.frames:inspect', 'skill_name': '프레임 검사'}
                                 reported = await client.call_tool('report_work_events', {'project': 'alpha', 'events': [event]})
                                 self.assertFalse(reported.isError, result_text(reported))
                                 self.assertEqual(reported.structuredContent,
@@ -175,6 +207,8 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                 self.assertEqual(saved[0]['activity_role'], 'research')
                                 self.assertEqual(saved[0]['search_scope'], 'files')
                                 self.assertEqual(saved[0]['tool_name'], 'search_for_pattern')
+                                self.assertEqual(saved[0]['skill_id'], 'figma.frames:inspect')
+                                self.assertEqual(saved[0]['skill_name'], '프레임 검사')
                                 self.assertIn('expires_at', saved[0])
                                 for name in EXECUTION_TOOLS | GIT_TOOLS | HOST_EXECUTION_TOOLS:
                                     descriptor = tools_by_name[name]

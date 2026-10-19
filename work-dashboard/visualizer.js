@@ -73,6 +73,9 @@
     && task.workContext?.labelSource === 'unavailable';
   const hostReference = task => window.WorkDashboardModel.hostExecutionReference(task);
   const commandLabel = task => window.WorkDashboardModel.hostCommandLabel(task);
+  const skillLabel = task => task?.skill?.name || task?.skill?.id || null;
+  const skillDescription = task => task?.skill
+    ? `${task.skill.name || task.skill.id} (${task.skill.id})` : null;
   const readableTaskTitle = task => missingHostPurpose(task)
     ? `작업 목적 미수집${hostReference(task) ? ' · ' + hostReference(task) : ''}`
     : isRawHostCodexTitle(task) ? 'Codex 실행' : titleFor(task);
@@ -399,6 +402,11 @@
 
     function roleStatus(sprite, work) {
       const state = roleState(work);
+      if (work?.skill) {
+        const status = ['stale', 'paused', 'unknown'].includes(state) ? brainStatus(state)
+          : `${sprite.state === 'idle' ? '대기 · ' : ''}${stateFor(work)}`;
+        return `${evidenceTitle(work.skill.provenance)} · 스킬 ${skillLabel(work)} · ${status}`;
+      }
       if (['stale', 'paused', 'unknown'].includes(state)) return brainStatus(state);
       if (sprite.state === 'idle' && work) return `대기 · ${stateFor(work)}`;
       if (!work || !active.has(work.state)) return work ? stateFor(work) : '활동 미수신';
@@ -412,10 +420,11 @@
       const button = element('button', 'wd-thinking-character wd-role-character');
       const icon = brainIcon(), mark = element('span', 'wd-role-mark'); mark.setAttribute('aria-hidden', 'true');
       const avatar = element('canvas', 'wd-thinking-avatar'); avatar.setAttribute('aria-hidden', 'true');
+      const skillMark = element('span', 'wd-skill-mark', '✦'); skillMark.setAttribute('aria-hidden', 'true');
       const copy = element('span', 'wd-thinking-copy');
       copy.append(element('strong', 'wd-thinking-role'), element('small', 'wd-thinking-owner'), element('span', 'wd-thinking-state'),
         element('small', 'wd-thinking-model'), element('small', 'wd-thinking-work'));
-      button.append(icon, mark, avatar, copy);
+      button.append(icon, mark, avatar, skillMark, copy);
       button.addEventListener('click', () => selectThinking(sprite.id));
       stage.append(button);
       token = {button, avatar, sprite, work: null, state: 'unobserved', poseKey: ''};
@@ -436,7 +445,7 @@
         token.button.classList.toggle('selected', key === selectedThinking || Boolean(selectedTask && selectedTask === sprite.taskId));
         token.button.querySelector('.wd-role-mark').textContent = sprite.role === 'research'
           ? sprite.searchScope === 'web' ? 'WEB' : sprite.searchScope === 'files' ? 'FILE' : '?' : roleGlyphs[sprite.role];
-        token.button.querySelector('.wd-thinking-role').textContent = roleTitle(sprite);
+        token.button.querySelector('.wd-thinking-role').textContent = skillLabel(work) || roleTitle(sprite);
         token.button.querySelector('.wd-thinking-owner').textContent = actorName(owner);
         token.button.querySelector('.wd-thinking-state').textContent = roleStatus(sprite, work);
         token.button.querySelector('.wd-thinking-model').textContent = telemetrySummary(owner, work);
@@ -491,13 +500,15 @@
         item.dataset.state = task.state; item.dataset.provenance = task.provenance || 'reported';
         item.classList.toggle('selected', task.id === selectedTask);
         item.querySelector('.wd-work-person').textContent = actorName(actor);
-        item.querySelector('.wd-work-action').textContent = readableAction(task);
+        const actionText = task.skill
+          ? `스킬 · ${skillLabel(task)} · ${evidenceTitle(task.skill.provenance)}` : readableAction(task);
+        item.querySelector('.wd-work-action').textContent = actionText;
         item.querySelector('.wd-work-title').textContent = readableTaskTitle(task);
         item.querySelector('.wd-work-state').textContent = boardStatus(task);
         const relation = item.querySelector('.wd-work-parent');
         relation.textContent = parent ? `상위 업무 · ${readableTaskTitle(parent)}` : '';
         relation.hidden = !parent;
-        item.setAttribute('aria-label', `${actorName(actor)} · ${readableAction(task)} · ${readableTaskTitle(task)} · ${stateFor(task)}`);
+        item.setAttribute('aria-label', `${actorName(actor)} · ${actionText} · ${readableTaskTitle(task)} · ${stateFor(task)}`);
         if (workBoard.children[index] !== item) workBoard.insertBefore(item, workBoard.children[index] || null);
       });
       for (const [id, item] of workItems) if (!visible.has(id)) { item.remove(); workItems.delete(id); }
@@ -603,9 +614,13 @@
       } else {
         summary.append(element('p', 'wd-summary-action', `${readableAction(work)}${work.tool ? ' · ' + work.tool : ''}`));
       }
+      if (work.skill) summary.append(element('p', 'wd-summary-skill',
+        `스킬 · ${skillDescription(work)} · ${stateFor(work)} · ${evidenceTitle(work.skill.provenance)}`));
       const results = {
         succeeded: '성공 상태가 기록됐습니다.', failed: '실패 상태가 기록됐습니다.',
-        returned: '도구 요청이 반환됐습니다. 실행 성공 여부는 별도 실행 결과에서 확인하세요.',
+        returned: work.skill
+          ? '스킬 호출이 반환됐습니다. 스킬이 지시한 워크플로 전체의 완료가 확인된 것은 아닙니다.'
+          : '도구 요청이 반환됐습니다. 실행 성공 여부는 별도 실행 결과에서 확인하세요.',
         timed_out: '제한 시간을 넘긴 것으로 기록됐습니다.', canceled: '취소 상태가 기록됐습니다.',
         interrupted: '중단 상태가 기록됐습니다.', unknown: '완료 결과를 확인하지 못했습니다.',
         queued: '실행 대기 중인 일감입니다.', prepared: '실행 전 준비 상태입니다.',
@@ -737,6 +752,7 @@
       if (work) entries.push([actor?.taskId === work.id ? '현재 일감' : '기록 일감', readableTaskTitle(work)],
         ['기록 출처', evidenceTitle(work.provenance)], ['수집 상태', stateFor(work)], ['처리 영역', roomTitle(work.sourceRoom)],
         ['기록 시각', localTime(work.time)], ['일감 식별자', work.hostExecutionId || work.jobId || work.id]);
+      if (work?.skill) entries.push(['스킬', skillDescription(work)], ['스킬 출처', evidenceTitle(work.skill.provenance)]);
       if (work?.parentTaskId) entries.push(['상위 일감 식별자', work.parentTaskId]);
       const telemetry = (selectedTask ? work?.telemetry : actor?.telemetry) || work?.telemetry || {};
       if (actor?.kind === 'agent' || work?.kind === 'agent' || Object.keys(telemetry).length) {
@@ -844,14 +860,16 @@
         const node = element('span', 'wd-speech'); node.hidden = true;
         node.dataset.speakerId = sprite.id; node.dataset.taskId = work.id;
         node.dataset.tone = work.speech.tone; node.dataset.event = work.speech.kind;
-        node.dataset.provenance = work.provenance;
+        const speechProvenance = work.speech.kind.startsWith('skill-')
+          ? work.skill?.provenance || work.provenance : work.provenance;
+        node.dataset.provenance = speechProvenance;
         node.setAttribute('role', 'status'); node.setAttribute('aria-atomic', 'true');
-        const text = `${work.provenance === 'reported' ? '보고 · ' : ''}${work.speech.text}`;
+        const text = `${speechProvenance === 'reported' ? '보고 · ' : ''}${work.speech.text}`;
         const label = readableTaskTitle(work);
         node.append(element('strong', 'wd-speech-message', text), element('small', 'wd-speech-label', label));
-        node.title = `${text} · ${label} · ${evidenceTitle(work.provenance)}`;
+        node.title = `${text} · ${label} · ${evidenceTitle(speechProvenance)}`;
         speechLayer.append(node);
-        speeches.set(sprite.id, {node, work, createdAt: Date.now(), shownAt: null});
+        speeches.set(sprite.id, {node, work, createdAt: Date.now(), shownAt: null, skillEffectShown: false});
       }
     }
 
@@ -888,7 +906,21 @@
           if (!row.node.hidden) row.node.hidden = true;
           continue;
         }
-        if (row.shownAt === null) row.shownAt = now;
+        if (row.shownAt === null) {
+          row.shownAt = now;
+          if (!row.skillEffectShown && row.work.speech.kind === 'skill-start' && canMove()) {
+            row.skillEffectShown = true;
+            const token = tokens.get(id) || thinkingTokens.get(id), mark = token?.button.querySelector('.wd-skill-mark');
+            if (mark && typeof mark.animate === 'function') {
+              const effect = mark.animate([
+                {opacity: 0, transform: 'translateX(-50%) scale(.45) rotate(-25deg)'},
+                {opacity: 1, transform: 'translateX(-50%) scale(1.35) rotate(8deg)', offset: .42},
+                {opacity: 1, transform: 'translateX(-50%) scale(1) rotate(0)'},
+              ], {duration: 1050, easing: 'ease-out'});
+              effects.add(effect); effect.finished.then(() => effects.delete(effect), () => effects.delete(effect));
+            }
+          }
+        }
         nextExpiry = Math.min(nextExpiry, row.shownAt + row.work.speech.durationMs);
         row.node.style.left = left + 'px'; row.node.style.top = top + 'px';
         row.node.style.setProperty('--wd-speech-pointer', Math.max(8, Math.min(128, position.x - left - 6)) + 'px');
@@ -1007,8 +1039,9 @@
             const job = window.WorkDashboardModel.characterJob(sprite);
             const mark = element('span', 'wd-job-mark', job.label); mark.setAttribute('aria-hidden', 'true');
             const actionMark = element('span', 'wd-action-mark'); actionMark.setAttribute('aria-hidden', 'true');
+            const skillMark = element('span', 'wd-skill-mark', '✦'); skillMark.setAttribute('aria-hidden', 'true');
             button.dataset.job = job.id;
-            button.append(avatar, sparks, mark, actionMark, element('span', 'wd-actor-label'), caption);
+            button.append(avatar, sparks, mark, actionMark, skillMark, element('span', 'wd-actor-label'), caption);
             button.addEventListener('click', () => select(sprite.id));
             stage.append(button); token = {button, avatar, caption, poseKey: ''}; tokens.set(sprite.id, token);
           }
@@ -1064,6 +1097,21 @@
           || (replaying && item.displayRoom === replayTask?.sourceRoom));
         const action = work ? visualAction(work) : actor.action;
         token.button.dataset.action = working ? action : 'idle'; token.button.dataset.working = String(working);
+        const skill = work?.skill;
+        if (skill) {
+          token.button.dataset.skillId = skill.id;
+          token.button.dataset.skillPhase = work.state;
+          token.button.dataset.skillProvenance = skill.provenance;
+        } else {
+          delete token.button.dataset.skillId;
+          delete token.button.dataset.skillPhase;
+          delete token.button.dataset.skillProvenance;
+        }
+        const skillActive = Boolean(skill && working && active.has(work.state) && !replaying && canMove());
+        token.button.dataset.skillActive = String(skillActive);
+        const skillMark = token.button.querySelector('.wd-skill-mark');
+        if (skillMark) skillMark.title = skill ? `스킬 · ${skillDescription(work)} · ${stateFor(work)} · ${
+          evidenceTitle(skill.provenance)}` : '';
         const actionMark = token.button.querySelector('.wd-action-mark');
         if (actionMark) {
           actionMark.textContent = working ? taskGlyphs[action] || '>_' : '';
@@ -1076,14 +1124,20 @@
           role.button.querySelector('.wd-thinking-state').textContent = item.departing
             ? `${evicted.has(item.id) ? '정원 교체' : stateFor(work)} · 퇴장` : roleStatus(actor, work);
         } else {
-          const actionText = actor.state === 'idle' ? '대기' : work ? readableAction(work)
+          const actionText = work?.skill ? `${evidenceTitle(work.skill.provenance)} · 스킬 ${skillLabel(work)}`
+            : actor.state === 'idle' ? '대기' : work ? readableAction(work)
             : actor.state === 'unobserved' ? '활동 미수신' : '대기';
           const taskText = work ? `${readableTaskTitle(work)}${actor.activeCount > 1 ? ` +${actor.activeCount - 1}` : ''}` : states[actor.state];
           const exitText = evicted.has(item.id) ? '정원 교체' : stateFor(work);
           const caption = item.departing ? `${exitText} · 퇴장\n${taskText}` : replaying ? `기록 재생 · ${actionText}\n${taskText}`
             : `${actionText} · ${work ? stateFor(work) : states[actor.state]}\n${taskText}`;
-          token.caption.textContent = provenance === 'reported' ? `보고 · ${caption}` : caption;
+          token.caption.textContent = work?.skill ? caption : provenance === 'reported' ? `보고 · ${caption}` : caption;
           token.caption.title = work ? `${readableAction(work)} · ${readableTaskTitle(work)}` : states[actor.state];
+          if (work?.skill && !item.departing) {
+            const accessible = `${actorName(actor)} · 스킬 ${skillDescription(work)} · ${
+              evidenceTitle(work.skill.provenance)} · ${stateFor(work)} · ${readableTaskTitle(work)} · ${roomTitle(item.displayRoom)}`;
+            if (token.button.getAttribute('aria-label') !== accessible) token.button.setAttribute('aria-label', accessible);
+          }
           if (item.departing) {
             token.button.dataset.state = work?.state || actor.state;
             token.button.setAttribute('aria-label', `${actorName(actor)} · ${exitText} · 퇴장 · ${roomTitle(item.displayRoom)}`);

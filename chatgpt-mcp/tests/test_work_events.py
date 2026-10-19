@@ -126,6 +126,26 @@ class WorkEventTest(unittest.TestCase):
         self.assertEqual(planning["action"], "execute")
         self.assertEqual(planning["tool_name"], "functions.exec")
 
+    def test_explicit_skill_metadata_round_trips_without_copying_private_inputs(self):
+        event = {
+            **BASE_EVENT,
+            "task_kind": "call",
+            "state": "started",
+            "skill_id": "plugin.example:review-pr",
+            "skill_name": "PR 검토",
+            "tool_input": {"skill": "plugin.example:review-pr", "args": "private"},
+            "prompt": "private prompt",
+            "response": "private response",
+        }
+
+        saved = self.store.record_work_event("alpha", event, provenance="reported")
+
+        self.assertEqual(saved["skill_id"], "plugin.example:review-pr")
+        self.assertEqual(saved["skill_name"], "PR 검토")
+        self.assertEqual(saved["provenance"], "reported")
+        self.assertTrue({"tool_input", "prompt", "response"}.isdisjoint(saved))
+        self.assertNotIn("private", json.dumps(saved))
+
     def test_labels_require_utf8_and_batch_rejects_before_persistence(self):
         unicode_event = {
             **BASE_EVENT,
@@ -226,6 +246,16 @@ class WorkEventTest(unittest.TestCase):
             ({**BASE_EVENT, "tool_name": "bad tool"}, {}),
             ({**BASE_EVENT, "tool_name": "x" * 121}, {}),
             ({**BASE_EVENT, "tool_name": 1}, {}),
+            ({**BASE_EVENT, "skill_id": "bad/skill"}, {}),
+            ({**BASE_EVENT, "skill_id": "x" * 121}, {}),
+            ({**BASE_EVENT, "skill_id": 1}, {}),
+            ({**BASE_EVENT, "skill_name": "Review"}, {}),
+            ({**BASE_EVENT, "skill_id": "review", "skill_name": "bad\nlabel"}, {}),
+            ({**BASE_EVENT, "skill_id": "review", "skill_name": "x" * 81}, {}),
+            ({**BASE_EVENT, "task_kind": "agent", "skill_id": "review"}, {}),
+            ({**BASE_EVENT, "task_kind": "job", "skill_id": "review"}, {}),
+            ({**BASE_EVENT, "task_kind": "agent", "skill_id": "review",
+              "skill_name": "Review"}, {}),
             (BASE_EVENT, {"provenance": "inferred"}),
         ]
         for event, arguments in invalid:

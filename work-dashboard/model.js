@@ -26,6 +26,7 @@
     test: 'testing', review: 'review', execute: 'execution', commit: 'review', push: 'review'};
   const SOURCE_KINDS = new Set(['mcp', 'chatgpt', 'codex-cli', 'claude-cli']);
   const METADATA_ID = /^[A-Za-z0-9_.:+/-]+$/;
+  const SKILL_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/;
   const ACTIVITY_ROLES = new Set(['analysis', 'research', 'planning', 'debugging', 'review', 'summary']);
   const ROLE_ROOMS = {analysis: 'analysis', research: 'analysis', planning: 'analysis', debugging: 'analysis',
     review: 'review', summary: 'review'};
@@ -286,7 +287,27 @@
         if (typeof row.usage_estimated === 'boolean') result.usageEstimated = row.usage_estimated;
       }
     }
+    const skillMatch = typeof row.skill_id === 'string' ? SKILL_ID.exec(row.skill_id) : null;
+    if (row.task_kind === 'call' && skillMatch?.[0] === row.skill_id && !/\p{C}/u.test(row.skill_id)) {
+      result.skillId = row.skill_id;
+      if (typeof row.skill_name === 'string' && Array.from(row.skill_name).length >= 1
+          && Array.from(row.skill_name).length <= 80 && !/\p{C}/u.test(row.skill_name)) {
+        result.skillName = row.skill_name;
+      }
+    }
     return result;
+  }
+
+  function skillFor(rows) {
+    const withSkill = rows.filter(row => row.skillId);
+    const ids = new Set(withSkill.map(row => row.skillId));
+    if (ids.size !== 1) return null;
+    const id = withSkill[0].skillId;
+    const named = [...withSkill].sort((a, b) => a.milliseconds - b.milliseconds
+      || a.receivedMilliseconds - b.receivedMilliseconds || b.order - a.order)
+      .filter(row => row.skillId === id && row.skillName).at(-1);
+    const provenance = withSkill.some(row => row.provenance === 'reported') ? 'reported' : 'observed';
+    return {id, ...(named ? {name: named.skillName} : {}), provenance};
   }
 
   function telemetryFor(rows) {
@@ -358,6 +379,7 @@
         && METADATA_ID.test(row.tool_name) ? row.tool_name : null;
       const result = numericResult(row.exit_code);
       const taskLabelKnown = typeof row.task_label === 'string' && Boolean(row.task_label);
+      const skill = row.task_kind === 'call' ? skillFor(metadata.get(id)) : null;
       return {id, kind: row.task_kind, actorId: actor.id, label: typeof row.task_label === 'string'
         && row.task_label ? row.task_label.slice(0, 200) : row.action, action: row.action,
         state, room, sourceRoom, time: parsed.iso, tool, activityRole, searchScope, jobId: null,
@@ -374,6 +396,7 @@
         _entity: actor, _milliseconds: parsed.milliseconds,
         _observationMilliseconds: received?.milliseconds ?? parsed.milliseconds,
         _telemetryRows: metadata.get(id), _taskLabelKnown: taskLabelKnown,
+        ...(skill ? {skill} : {}),
         ...(result ? {result} : {})};
     });
   }
@@ -723,6 +746,7 @@
       searchScope: task.searchScope ?? null,
       parentTaskId: task.parentTaskId ?? null,
       jobId: task.jobId ?? null,
+      ...(task.skill ? {skill: {...task.skill}} : {}),
       ...(task.hostExecutionId ? {hostExecutionId: task.hostExecutionId,
         hostActionKnown: task.hostActionKnown === true} : {})};
     if (displayType === 'role') row.role = role;
@@ -743,7 +767,8 @@
       tool: task.tool ?? null,
       activityRole: task.activityRole ?? null,
       searchScope: task.searchScope ?? null,
-      parentTaskId: task.parentTaskId ?? null};
+      parentTaskId: task.parentTaskId ?? null,
+      ...(task.skill ? {skill: {...task.skill}} : {})};
   }
 
   function waitingSprite(owner, task, displayType, role = null, invocationTask = task) {
@@ -882,6 +907,29 @@
     commit: '커밋 준비 중!', push: '전송 중!',
   };
 
+  function skillLabel(task) {
+    return task?.skill?.name || task?.skill?.id || null;
+  }
+
+  function skillSpeech(task, before) {
+    const label = skillLabel(task);
+    if (!label) return null;
+    const terminal = {
+      returned: {kind: 'skill-returned', tone: 'info', text: `${label} 호출 반환`, priority: 1, durationMs: 4000},
+      failed: {kind: 'skill-failed', tone: 'danger', text: `${label} 스킬 실패`, priority: 3, durationMs: 6000},
+      timed_out: {kind: 'skill-timed-out', tone: 'warning', text: `${label} 시간 초과`, priority: 2, durationMs: 6000},
+      canceled: {kind: 'skill-canceled', tone: 'neutral', text: `${label} 스킬 취소`, priority: 2, durationMs: 6000},
+      interrupted: {kind: 'skill-interrupted', tone: 'warning', text: `${label} 스킬 중단`, priority: 2, durationMs: 6000},
+      unknown: {kind: 'skill-unknown', tone: 'warning', text: `${label} 결과 확인 필요`, priority: 2, durationMs: 6000},
+    };
+    if (terminal[task.state] && before?.state !== task.state) return terminal[task.state];
+    if (['started', 'running'].includes(task.state)
+        && (!before || !['started', 'running'].includes(before.state))) {
+      return {kind: 'skill-start', tone: 'info', text: `${label} 스킬 발동!`, priority: 2, durationMs: 4000};
+    }
+    return null;
+  }
+
   function invokedTask(task) {
     const invoked = Date.parse(task?.invokedAt);
     const transitioned = Date.parse(task?.time);
@@ -892,6 +940,8 @@
   }
 
   function speechFor(task, before) {
+    const skill = skillSpeech(task, before);
+    if (skill) return skill;
     if (Object.hasOwn(SPEECH_BY_STATE, task.state) && before?.state !== task.state) {
       return SPEECH_BY_STATE[task.state];
     }
@@ -971,12 +1021,17 @@
     const outcomes = {succeeded: '성공', failed: '실패', timed_out: '시간 초과', canceled: '취소', interrupted: '중단', returned: '요청 반환'};
     const resultText = result => result.hostExecutionId ? hostResultSummary(result) : (() => {
       const code = Number.isInteger(result.result?.exit_code) ? ` 종료 코드 ${result.result.exit_code}.` : '';
+      if (result.skill && result.state === 'returned') {
+        return '스킬 호출이 반환됐습니다. 스킬이 지시한 워크플로 전체의 완료가 확인된 것은 아닙니다.';
+      }
       if (result.state === 'returned') return '도구 요청이 반환됐습니다. 실행 성공 여부는 별도 실행 결과에서 확인하세요.';
       return outcomes[result.state] ? `${outcomes[result.state]} 상태가 기록됐습니다.${code}` : null;
     })();
     const contextText = result => {
       const purpose = result.label || '선택한 작업';
-      if (!result.hostExecutionId) return `${purpose} · ${result.provenance === 'observed' ? '직접 관측' : '보고됨'}. `;
+      const skill = result.skill ? ` 스킬 ${result.skill.name || result.skill.id} (${result.skill.id}) · ${
+        result.skill.provenance === 'observed' ? '직접 관측' : '보고됨'}.` : '';
+      if (!result.hostExecutionId) return `${purpose} · ${result.provenance === 'observed' ? '직접 관측' : '보고됨'}.${skill} `;
       const reference = hostExecutionReference(result);
       const missingPurpose = result.workContext?.labelSource === 'unavailable';
       const purposeText = missingPurpose
