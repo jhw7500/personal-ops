@@ -578,18 +578,48 @@
     }
 
     function appendNativeActivity(owner, work) {
-      if (owner?.sourceKind !== 'codex-cli' || !work?.sessionActivity) return;
-      const latest = window.WorkDashboardModel.latestConcreteTask(tasks, owner.id);
-      if (!latest || latest.id === work.id) return;
+      if (owner?.sourceKind !== 'codex-cli') return;
+      const rows = window.WorkDashboardModel.recentTasks(tasks.filter(task =>
+        task.actorId === owner.id && task.kind === 'call' && !task.sessionActivity));
+      if (!rows.length) return;
+      const pending = task => active.has(task.state) || task.state === 'queued';
+      const current = rows.filter(pending).slice(0, 3);
+      const recent = rows.filter(task => !pending(task)).slice(0, 6 - current.length);
       const panel = element('section', 'wd-detail-summary wd-native-activity');
       panel.setAttribute('aria-label', '최근 터미널 활동');
-      panel.append(element('small', 'wd-summary-heading', '최근 터미널 활동'),
-        element('strong', 'wd-summary-purpose', readableTaskTitle(latest)),
-        element('p', 'wd-summary-action', `${latest.tool ? `도구 · ${latest.tool} · ` : ''}상태 · ${stateFor(latest)}`));
-      if (Number.isInteger(latest.result?.exit_code)) {
-        panel.append(element('p', 'wd-summary-numeric', `종료 코드 ${latest.result.exit_code}`));
+      panel.append(element('small', 'wd-summary-heading', '최근 터미널 활동'));
+      const currentTitle = stale || resumeSnapshot || !following ? '마지막 확인 호출' : '현재 호출';
+      for (const [id, title, entries, empty] of [
+        ['current', currentTitle, current, '현재 호출 기록 없음'],
+        ['recent', '최근 결과', recent, '종료·미확인 기록 없음'],
+      ]) {
+        const group = element('section', 'wd-native-group');
+        group.dataset.nativeGroup = id;
+        group.append(element('h4', '', title));
+        if (!entries.length) group.append(element('p', 'wd-native-meta', empty));
+        const list = element('ol', 'wd-native-history');
+        for (const task of entries) {
+          const entry = element('li', 'wd-native-entry');
+          entry.dataset.taskId = task.id; entry.dataset.state = task.state;
+          const title = readableTaskTitle(task);
+          const label = task.tool ? `${task.tool} · ${title}` : title;
+          const button = taskLink(task, '작업 상세');
+          button.textContent = label; button.setAttribute('aria-label', `작업 상세 · ${label}`);
+          if (task.id === work?.id) button.setAttribute('aria-current', 'true');
+          const state = element('p', 'wd-native-state', task.state === 'queued' ? '응답 대기' : stateFor(task));
+          if (Number.isInteger(task.result?.exit_code)) {
+            state.append(' · ', element('span', 'wd-summary-numeric', `종료 코드 ${task.result.exit_code}`));
+          }
+          const time = element('time', '', localTime(task.time));
+          time.dateTime = task.time;
+          const metadata = element('p', 'wd-native-meta', `${evidenceTitle(task.provenance)} · `);
+          metadata.append(time);
+          entry.append(button, state, metadata); list.append(entry);
+        }
+        group.append(list); panel.append(group);
       }
-      panel.append(taskLink(latest, '작업 상세'));
+      if (rows.length > current.length + recent.length) panel.append(element('p', 'wd-native-meta',
+        `현재·최근 ${current.length + recent.length}개 표시 · 다른 호출은 관련 기록에서 확인`));
       inspector.append(panel);
     }
 

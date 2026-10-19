@@ -579,6 +579,135 @@ class AdminBrowserTest(unittest.TestCase):
         panel.get_by_role('button', name=re.compile('^작업 상세')).click()
         expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('터미널 명령 결과')
 
+    def test_native_activity_groups_survive_exact_call_selection_and_exclude_other_actors(self):
+        now = datetime.now(timezone.utc)
+        base = {'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',
+                'actor_id': 'terminal-native', 'actor_kind': 'agent', 'actor_label': 'Codex',
+                'task_kind': 'call', 'action': 'execute'}
+        rows = [
+            {**base, 'task_id': 'native-current', 'task_label': '현재 터미널 호출',
+             'tool_name': 'exec_command', 'state': 'running',
+             'time': (now - timedelta(seconds=1)).isoformat()},
+            {**base, 'task_id': 'native-result', 'task_label': '실패한 터미널 결과',
+             'tool_name': 'CommandExecution', 'state': 'started',
+             'time': (now - timedelta(seconds=5)).isoformat()},
+            {**base, 'task_id': 'native-result', 'task_label': '실패한 터미널 결과',
+             'tool_name': 'CommandExecution', 'state': 'failed', 'exit_code': 7,
+             'time': (now - timedelta(seconds=2)).isoformat()},
+            {**base, 'actor_id': 'other-terminal', 'task_id': 'other-call',
+             'task_label': '다른 세션 호출', 'tool_name': 'read_file', 'state': 'running',
+             'time': now.isoformat()},
+        ]
+        self.store.record_work_events('alpha', rows, provenance='observed')
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.locator('#refresh').click()
+        self.room.locator('.wd-actor[data-actor-id="entity:codex-local:terminal-native"]').click()
+        panel = self.room.locator('#wd-detail .wd-native-activity')
+        expect(panel).to_be_visible()
+        current = panel.locator('[data-native-group="current"]')
+        recent = panel.locator('[data-native-group="recent"]')
+        expect(current).to_contain_text('현재 호출')
+        expect(recent).to_contain_text('최근 결과')
+        expect(current.locator('.wd-native-entry')).to_have_count(1)
+        expect(recent.locator('.wd-native-entry')).to_have_count(1)
+        expect(current.locator('.wd-native-entry')).to_have_attribute(
+            'data-task-id', 'task:codex-local:terminal-native:native-current')
+        result = recent.locator('.wd-native-entry')
+        expect(result).to_have_attribute('data-task-id', 'task:codex-local:terminal-native:native-result')
+        expect(result).to_have_attribute('data-state', 'failed')
+        expect(result).to_contain_text('종료 코드 7')
+        expect(panel).not_to_contain_text('다른 세션 호출')
+        result.locator('button[data-task-id="task:codex-local:terminal-native:native-result"]').click()
+        expect(self.room.locator('#wd-detail .wd-work-summary')).to_contain_text('실패한 터미널 결과')
+        persisted = self.room.locator('#wd-detail .wd-native-activity')
+        expect(persisted).to_be_visible()
+        expect(persisted.locator('.wd-native-entry')).to_have_count(2)
+        expect(persisted).to_contain_text('종료 코드 7')
+        expect(persisted.locator(
+            'button[data-task-id="task:codex-local:terminal-native:native-result"]'
+        )).to_have_attribute('aria-current', 'true')
+        self.page.locator('#follow').click()
+        expect(persisted.locator('[data-native-group="current"] h4')).to_have_text('마지막 확인 호출')
+
+    def test_native_activity_caps_current_first_and_treats_expired_queue_as_recent_unknown(self):
+        now = datetime.now(timezone.utc)
+        base = {'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',
+                'actor_id': 'terminal-cap', 'actor_kind': 'agent', 'actor_label': 'Codex',
+                'task_kind': 'call', 'task_label': '터미널 호출', 'action': 'execute',
+                'tool_name': 'exec_command'}
+        rows = [
+            {**base, 'task_id': 'current-new', 'state': 'running',
+             'time': (now - timedelta(seconds=1)).isoformat()},
+            {**base, 'task_id': 'current-mid', 'state': 'queued',
+             'time': (now - timedelta(seconds=2)).isoformat()},
+            {**base, 'task_id': 'current-old', 'state': 'started',
+             'time': (now - timedelta(seconds=3)).isoformat()},
+            {**base, 'task_id': 'current-overflow', 'state': 'canceling',
+             'time': (now - timedelta(seconds=4)).isoformat()},
+            {**base, 'task_id': 'expired-queue', 'task_label': '만료된 호출 요청',
+             'state': 'queued', 'time': (now - timedelta(seconds=121)).isoformat()},
+            {**base, 'task_id': 'recent-new', 'state': 'returned',
+             'time': (now - timedelta(seconds=130)).isoformat()},
+            {**base, 'task_id': 'recent-old', 'state': 'failed', 'exit_code': 9,
+             'time': (now - timedelta(seconds=140)).isoformat()},
+        ]
+        self.store.record_work_events('alpha', rows, provenance='observed')
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.locator('#refresh').click()
+        self.room.locator('.wd-actor[data-actor-id="entity:codex-local:terminal-cap"]').click()
+        panel = self.room.locator('#wd-detail .wd-native-activity')
+        entries = panel.locator('.wd-native-entry')
+        expect(entries).to_have_count(6)
+        current = panel.locator('[data-native-group="current"] .wd-native-entry')
+        recent = panel.locator('[data-native-group="recent"] .wd-native-entry')
+        expect(current).to_have_count(3)
+        expect(recent).to_have_count(3)
+        self.assertEqual(current.evaluate_all('rows => rows.map(row => row.dataset.taskId)'), [
+            'task:codex-local:terminal-cap:current-new',
+            'task:codex-local:terminal-cap:current-mid',
+            'task:codex-local:terminal-cap:current-old',
+        ])
+        self.assertEqual(recent.evaluate_all('rows => rows.map(row => row.dataset.taskId)'), [
+            'task:codex-local:terminal-cap:expired-queue',
+            'task:codex-local:terminal-cap:recent-new',
+            'task:codex-local:terminal-cap:recent-old',
+        ])
+        expired = panel.locator('.wd-native-entry[data-task-id="task:codex-local:terminal-cap:expired-queue"]')
+        expect(expired).to_have_attribute('data-state', 'unknown')
+        expect(expired).to_contain_text('상태 미확인')
+        expect(expired).not_to_contain_text('성공')
+        expect(expired).not_to_contain_text('완료')
+        expect(panel.locator('[data-task-id="task:codex-local:terminal-cap:current-overflow"]')).to_have_count(0)
+        expect(self.room.locator(
+            '#wd-related-records button[data-task-id="task:codex-local:terminal-cap:current-overflow"]'
+        )).to_have_count(1)
+
+    def test_native_activity_long_tool_name_stays_inside_frame_at_supported_widths(self):
+        now = datetime.now(timezone.utc)
+        long_tool = 't' * 120
+        self.store.record_work_event('alpha', {
+            'schema_version': 1, 'source_id': 'codex-local', 'source_kind': 'codex-cli',
+            'actor_id': 'terminal-long', 'actor_kind': 'agent', 'actor_label': 'Codex',
+            'task_id': 'long-tool', 'task_kind': 'call', 'task_label': '긴 도구 이름 확인',
+            'action': 'execute', 'tool_name': long_tool, 'state': 'failed', 'exit_code': 19,
+            'time': now.isoformat(),
+        }, provenance='observed')
+        self.page.emulate_media(reduced_motion='reduce')
+        self.page.locator('#refresh').click()
+        self.room.locator('.wd-actor[data-actor-id="entity:codex-local:terminal-long"]').click()
+        for width in (1440, 390, 320):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({'width': width, 'height': 900})
+                panel = self.room.locator('#wd-detail .wd-native-activity')
+                expect(panel).to_contain_text(long_tool)
+                expect(panel).to_contain_text('종료 코드 19')
+                self.assertEqual(self.page.evaluate('document.documentElement.scrollWidth'), width)
+                self.assertTrue(self.room_page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                self.assertTrue(panel.evaluate("""node => {
+                    const box = node.getBoundingClientRect();
+                    return box.left >= 0 && box.right <= document.documentElement.clientWidth;
+                }"""))
+
     def test_workroom_precedes_approvals_and_navigation_is_keyboard_operable(self):
         original_map = self.page.locator('#work-map').element_handle()
         expect(self.page.locator('#nav-workroom')).to_have_attribute('aria-selected', 'true')
