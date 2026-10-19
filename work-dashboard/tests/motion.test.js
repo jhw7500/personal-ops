@@ -228,6 +228,233 @@ test('clear removes actors and prevents stale replay after an initial reload', (
   );
 });
 
+test('opt-in active arrivals launch in supplied order while historical idle actors are placed', () => {
+  const {create, WORLD, slot} = require(motionPath);
+  const engine = create();
+  const first = actor('job:entry-first', 'coding', 'running');
+  const second = actor('job:entry-second', 'review', 'running');
+  const historical = persistentActor('agent:historical');
+
+  engine.sync([first, second, historical], {initial: true, staggerEntries: true});
+
+  assert.deepEqual(
+    {x: byId(engine, first.id).x, y: byId(engine, first.id).y,
+      walking: byId(engine, first.id).walking, entryPending: byId(engine, first.id).entryPending},
+    {...WORLD.entry, walking: true, entryPending: undefined},
+  );
+  assert.deepEqual(
+    {x: byId(engine, second.id).x, y: byId(engine, second.id).y,
+      walking: byId(engine, second.id).walking, entryPending: byId(engine, second.id).entryPending},
+    {...WORLD.entry, walking: false, entryPending: true},
+  );
+  assert.deepEqual(
+    {x: byId(engine, historical.id).x, y: byId(engine, historical.id).y,
+      walking: byId(engine, historical.id).walking, entryPending: byId(engine, historical.id).entryPending},
+    {...slot('waiting', 0), walking: false, entryPending: undefined},
+  );
+
+  engine.advance(0.39);
+  assert.equal(byId(engine, second.id).entryPending, true);
+  engine.advance(0.02);
+  assert.equal(byId(engine, second.id).entryPending, undefined);
+  assert.equal(byId(engine, second.id).walking, true);
+});
+
+test('identical polling does not reorder or restart pending staggered arrivals', () => {
+  const {create} = require(motionPath);
+  const engine = create();
+  const first = actor('job:stable-first', 'analysis', 'running');
+  const second = actor('job:stable-second', 'analysis', 'running');
+  const third = actor('job:stable-third', 'analysis', 'running');
+
+  engine.sync([first, second, third], {staggerEntries: true});
+  engine.advance(0.25);
+  engine.sync([
+    {...third, label: 'third refreshed'},
+    {...second, label: 'second refreshed'},
+    {...first, label: 'first refreshed'},
+  ], {staggerEntries: true});
+  engine.advance(0.16);
+
+  assert.equal(byId(engine, second.id).entryPending, undefined);
+  assert.equal(byId(engine, second.id).walking, true);
+  assert.equal(byId(engine, third.id).entryPending, true);
+  assert.equal(byId(engine, third.id).actor.label, 'third refreshed');
+
+  engine.advance(0.4);
+  assert.equal(byId(engine, third.id).entryPending, undefined);
+  assert.equal(byId(engine, third.id).walking, true);
+});
+
+test('a full room admits a replacement only after the departing occupant reaches the corridor', () => {
+  const {create} = require(motionPath);
+  const engine = create();
+  const residents = Array.from({length: 6}, (_, index) =>
+    actor(`job:resident-${index}`, 'coding', 'running'));
+  const replacement = actor('job:replacement', 'coding', 'running');
+
+  engine.sync(residents, {initial: true});
+  engine.depart([residents[0].id]);
+  engine.sync([...residents.slice(1), replacement], {staggerEntries: true});
+  assert.equal(byId(engine, replacement.id).entryPending, true);
+
+  let admittedWhileDepartingInside = false;
+  let maximumOccupancy = 0;
+  for (let index = 0; index < 1000 && byId(engine, replacement.id).entryPending; index += 1) {
+    engine.advance(0.01);
+    const snapshot = engine.snapshot();
+    const leaving = byId(engine, residents[0].id);
+    const incoming = byId(engine, replacement.id);
+    if (leaving && leaving.displayRoom === 'coding' && !incoming.entryPending) {
+      admittedWhileDepartingInside = true;
+    }
+    maximumOccupancy = Math.max(maximumOccupancy,
+      snapshot.filter(item => item.displayRoom === 'coding').length);
+  }
+
+  assert.equal(admittedWhileDepartingInside, false);
+  assert.equal(maximumOccupancy, 6);
+  assert.equal(byId(engine, replacement.id).entryPending, undefined);
+  assert.equal(byId(engine, replacement.id).walking, true);
+
+  for (let index = 0; index < 1000 && byId(engine, replacement.id).walking; index += 1) {
+    engine.advance(0.01);
+    maximumOccupancy = Math.max(maximumOccupancy,
+      engine.snapshot().filter(item => item.displayRoom === 'coding').length);
+  }
+  assert.equal(maximumOccupancy, 6);
+});
+
+test('a newly observed idle call waits outside a full waiting room until its replacement exits', () => {
+  const {create, WORLD} = require(motionPath);
+  const engine = create();
+  const residents = Array.from({length: 6}, (_, index) =>
+    persistentActor(`agent:waiting-${index}`));
+  const completedCall = persistentActor('agent:completed-before-observation');
+
+  engine.sync(residents, {initial: true, staggerEntries: true});
+  engine.depart([residents[0].id]);
+  engine.sync([...residents.slice(1), completedCall], {staggerEntries: true});
+
+  assert.deepEqual(
+    {x: byId(engine, completedCall.id).x, y: byId(engine, completedCall.id).y,
+      walking: byId(engine, completedCall.id).walking,
+      entryPending: byId(engine, completedCall.id).entryPending},
+    {...WORLD.entry, walking: false, entryPending: true},
+  );
+
+  let maximumOccupancy = 0;
+  let admittedWhileDepartingInside = false;
+  for (let index = 0; index < 1000 && byId(engine, completedCall.id).entryPending; index += 1) {
+    engine.advance(0.01);
+    const leaving = byId(engine, residents[0].id);
+    const incoming = byId(engine, completedCall.id);
+    if (leaving && leaving.displayRoom === 'waiting' && !incoming.entryPending) {
+      admittedWhileDepartingInside = true;
+    }
+    maximumOccupancy = Math.max(maximumOccupancy,
+      engine.snapshot().filter(item => item.displayRoom === 'waiting').length);
+  }
+
+  assert.equal(admittedWhileDepartingInside, false);
+  assert.equal(maximumOccupancy, 6);
+  assert.equal(byId(engine, completedCall.id).entryPending, undefined);
+  assert.equal(byId(engine, completedCall.id).walking, true);
+});
+
+test('an active arrival that completes while queued defers its recorded work until admission', () => {
+  const {create, WORLD, slot} = require(motionPath);
+  const engine = create();
+  const leading = actor('job:leading-arrival', 'coding', 'running');
+  const queued = persistentActor('agent:fast-call', 'running', 'analysis');
+  const completed = {...queued, state: 'idle', room: 'waiting', sourceRoom: 'waiting'};
+  const replayTask = completedTask('task:fast-call', queued.id, {sourceRoom: 'analysis'});
+
+  engine.sync([leading, queued], {staggerEntries: true});
+  assert.equal(byId(engine, queued.id).entryPending, true);
+  engine.advance(0.2);
+  engine.sync([leading, completed], {staggerEntries: true, replayTasks: [replayTask]});
+
+  assert.deepEqual(
+    {x: byId(engine, queued.id).x, y: byId(engine, queued.id).y,
+      walking: byId(engine, queued.id).walking,
+      replaying: byId(engine, queued.id).replaying,
+      entryPending: byId(engine, queued.id).entryPending},
+    {...WORLD.entry, walking: false, replaying: false, entryPending: true},
+  );
+  assert.equal(byId(engine, queued.id).actor.state, 'idle');
+
+  engine.advance(0.21);
+  const admitted = byId(engine, queued.id);
+  assert.equal(admitted.entryPending, undefined);
+  assert.equal(admitted.walking, true);
+  assert.equal(admitted.replaying, true);
+  assert.equal(admitted.replayTask.id, replayTask.id);
+
+  const observed = [];
+  for (let index = 0; index < 3000 && byId(engine, queued.id).replaying; index += 1) {
+    engine.advance(0.01);
+    observed.push(byId(engine, queued.id));
+  }
+  assert.ok(observed.some(item => item.displayRoom === 'analysis'));
+  assert.ok(observed.some(item => item.displayRoom === 'done'));
+  assert.deepEqual(
+    {x: byId(engine, queued.id).x, y: byId(engine, queued.id).y,
+      displayRoom: byId(engine, queued.id).displayRoom,
+      replaying: byId(engine, queued.id).replaying,
+      replayTask: byId(engine, queued.id).replayTask},
+    {...slot('waiting', 0), displayRoom: 'waiting', replaying: false, replayTask: null},
+  );
+});
+
+test('non-animated sync and settle reveal queued arrivals immediately and discard departures', () => {
+  const {create, slot} = require(motionPath);
+  const engine = create();
+  const first = actor('job:reduced-first', 'testing', 'running');
+  const second = actor('job:reduced-second', 'testing', 'running');
+
+  engine.sync([first, second], {staggerEntries: true});
+  assert.equal(byId(engine, second.id).entryPending, true);
+  engine.sync([first, second], {animate: false, staggerEntries: true});
+  assert.deepEqual(engine.snapshot().map(item => ({id: item.id, x: item.x, y: item.y,
+    walking: item.walking, entryPending: item.entryPending})), [
+    {id: first.id, ...slot('testing', 0), walking: false, entryPending: undefined},
+    {id: second.id, ...slot('testing', 1), walking: false, entryPending: undefined},
+  ]);
+
+  engine.depart([first.id]);
+  const third = actor('job:settle-third', 'review', 'running');
+  const fourth = actor('job:settle-fourth', 'review', 'running');
+  engine.sync([second, third, fourth], {staggerEntries: true});
+  assert.equal(byId(engine, fourth.id).entryPending, true);
+  engine.settle();
+  assert.equal(byId(engine, first.id), undefined);
+  assert.deepEqual(
+    {x: byId(engine, fourth.id).x, y: byId(engine, fourth.id).y,
+      walking: byId(engine, fourth.id).walking, entryPending: byId(engine, fourth.id).entryPending},
+    {...slot('review', 1), walking: false, entryPending: undefined},
+  );
+});
+
+test('clear resets stagger timing for the next observation', () => {
+  const {create, WORLD} = require(motionPath);
+  const engine = create();
+  const first = actor('job:before-clear-first', 'analysis', 'running');
+  const second = actor('job:before-clear-second', 'analysis', 'running');
+
+  engine.sync([first, second], {staggerEntries: true});
+  engine.advance(0.2);
+  engine.clear();
+
+  const after = actor('job:after-clear', 'coding', 'running');
+  engine.sync([after], {staggerEntries: true});
+  assert.deepEqual(
+    {x: byId(engine, after.id).x, y: byId(engine, after.id).y,
+      walking: byId(engine, after.id).walking, entryPending: byId(engine, after.id).entryPending},
+    {...WORLD.entry, walking: true, entryPending: undefined},
+  );
+});
+
 test('settle snaps every route to its latest destination', () => {
   const {create, slot} = require(motionPath);
   const engine = create();
@@ -244,6 +471,133 @@ test('settle snaps every route to its latest destination', () => {
     {id: 'job:a', ...slot('analysis', 0), walking: false},
     {id: 'job:b', ...slot('coding', 0), walking: false},
   ]);
+});
+
+test('departure holds its result, exits through the corridor, and disappears at the entry', () => {
+  const {create, WORLD} = require(motionPath);
+  const engine = create();
+  const leaving = actor('job:depart', 'coding', 'succeeded');
+
+  engine.sync([leaving], {initial: true});
+  const started = engine.depart([leaving.id]);
+  assert.equal(started[0].departing, true);
+  assert.equal(started[0].walking, false);
+  assert.equal(started[0].replaying, false);
+  assert.equal(started[0].replayTask, null);
+
+  engine.advance(0.99);
+  assert.equal(byId(engine, leaving.id).walking, false);
+  engine.advance(0.02);
+  assert.equal(byId(engine, leaving.id).walking, true);
+
+  const observed = [];
+  for (let index = 0; index < 1000 && byId(engine, leaving.id); index += 1) {
+    observed.push(byId(engine, leaving.id));
+    engine.advance(0.01);
+  }
+  assert.ok(observed.some(item => item.displayRoom === null && item.y === WORLD.hallY));
+  assert.ok(observed.at(-1).x > WORLD.entry.x);
+  assert.equal(byId(engine, leaving.id), undefined);
+});
+
+test('sync retains an absent departing actor until its exit completes', () => {
+  const {create} = require(motionPath);
+  const engine = create();
+  const leaving = actor('job:retained', 'review', 'succeeded');
+
+  engine.sync([leaving], {initial: true});
+  engine.depart([leaving.id]);
+  engine.sync([]);
+
+  assert.equal(byId(engine, leaving.id).departing, true);
+  engine.advance(1000);
+  assert.deepEqual(engine.snapshot(), []);
+});
+
+test('the same incoming ID preempts departure once and preserves its current position', () => {
+  const {create, slot} = require(motionPath);
+  const engine = create();
+  const leaving = actor('job:relaunched', 'analysis', 'succeeded');
+  const relaunched = {...leaving, state: 'running', time: '2026-10-12T00:00:03.000Z'};
+
+  engine.sync([leaving], {initial: true});
+  engine.depart([leaving.id]);
+  engine.advance(0.4);
+  const held = byId(engine, leaving.id);
+  engine.sync([relaunched, {...relaunched, label: 'duplicate'}]);
+
+  const current = engine.snapshot();
+  assert.equal(current.length, 1);
+  assert.equal(Object.hasOwn(current[0], 'departing'), false);
+  assert.deepEqual({x: current[0].x, y: current[0].y}, {x: held.x, y: held.y});
+  assert.equal(current[0].actor.label, relaunched.label);
+  engine.advance(1000);
+  assert.deepEqual(
+    {x: byId(engine, leaving.id).x, y: byId(engine, leaving.id).y},
+    slot('analysis', 0),
+  );
+});
+
+test('repeated and invalid departures do not restart the hold or duplicate actors', () => {
+  const {create} = require(motionPath);
+  const engine = create();
+  const leaving = actor('job:idempotent', 'testing', 'succeeded');
+
+  engine.sync([leaving], {initial: true});
+  engine.depart([leaving.id]);
+  engine.advance(0.6);
+  const before = byId(engine, leaving.id);
+  engine.depart([null, '', 'missing', leaving.id, leaving.id]);
+  const after = byId(engine, leaving.id);
+  assert.deepEqual(after, before);
+
+  engine.advance(0.41);
+  assert.equal(byId(engine, leaving.id).walking, true);
+  assert.equal(engine.snapshot().length, 1);
+});
+
+test('non-animated departure, settle, and clear remove departing actors cleanly', () => {
+  const {create, slot} = require(motionPath);
+  const engine = create();
+  const immediate = actor('job:immediate', 'coding', 'succeeded');
+  const settling = actor('job:settling', 'review', 'succeeded');
+  const staying = actor('job:staying', 'analysis', 'running');
+
+  engine.sync([immediate, settling, staying], {initial: true});
+  engine.depart([immediate.id]);
+  engine.depart([immediate.id], {animate: false});
+  assert.equal(byId(engine, immediate.id), undefined);
+
+  engine.depart([settling.id]);
+  engine.settle();
+  assert.equal(byId(engine, settling.id), undefined);
+  assert.deepEqual(
+    {x: byId(engine, staying.id).x, y: byId(engine, staying.id).y},
+    slot('analysis', 0),
+  );
+
+  engine.depart([staying.id]);
+  engine.clear();
+  assert.deepEqual(engine.snapshot(), []);
+});
+
+test('departure cancels replay metadata without changing the legacy replay contract', () => {
+  const {create} = require(motionPath);
+  const engine = create();
+  const record = actor('call:depart-replay', 'done', 'returned', 'analysis');
+
+  engine.sync([record], {initial: true});
+  engine.replay([record.id]);
+  assert.equal(byId(engine, record.id).replaying, true);
+
+  engine.depart([record.id]);
+  const leaving = byId(engine, record.id);
+  assert.equal(leaving.departing, true);
+  assert.equal(leaving.replaying, false);
+  assert.equal(leaving.replayTask, null);
+
+  engine.replay([record.id]);
+  assert.equal(byId(engine, record.id).replaying, false);
 });
 
 test('explicit replay affects only requested existing terminal records', () => {

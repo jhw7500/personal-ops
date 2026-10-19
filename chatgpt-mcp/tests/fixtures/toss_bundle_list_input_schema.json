@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "properties": {
+    "workspaceId": {
+      "type": "integer",
+      "description": "워크스페이스 ID"
+    },
+    "miniAppId": {
+      "type": "integer",
+      "description": "미니앱 ID"
+    },
+    "page": {
+      "type": "integer",
+      "description": "페이지 번호 (0-base, 기본 0)"
+    },
+    "size": {
+      "type": "integer",
+      "description": "페이지 크기 (기본 20, 최대 100)"
+    },
+    "search": {
+      "type": "string",
+      "description": "검색어. 버전명(versionName)·릴리즈 노트(releaseNote)·번들 ID(deploymentId)를 부분 일치로 찾으며 memo 는 검색 대상이 아니다."
+    }
+  },
+  "required": [
+    "workspaceId",
+    "miniAppId"
+  ],
+  "additionalProperties": false
+}

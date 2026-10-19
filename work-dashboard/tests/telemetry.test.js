@@ -76,6 +76,25 @@ test('missing usage, invalid metadata and reasoning configuration do not invent 
   assert.equal(JSON.stringify(result).includes('private-sentinel'), false);
 });
 
+test('role metadata preserves only bounded explicit values on canonical tasks', () => {
+  const valid = snapshot({project, now, records: [event({activity_role: 'planning',
+    search_scope: 'files', tool_name: 'mcp__repo__search'})]}).tasks[0];
+  assert.equal(valid.activityRole, 'planning');
+  assert.equal(valid.searchScope, null);
+  assert.equal(valid.tool, 'mcp__repo__search');
+
+  const invalid = snapshot({project, now, records: [event({action: 'search', activity_role: 'coding',
+    search_scope: 'internet', tool_name: 'x'.repeat(121)})]}).tasks[0];
+  assert.equal(invalid.activityRole, null);
+  assert.equal(invalid.searchScope, null);
+  assert.equal(invalid.tool, null);
+
+  const legacy = snapshot({project, now, records: [event()]}).tasks[0];
+  assert.equal(legacy.activityRole, null);
+  assert.equal(legacy.searchScope, null);
+  assert.equal(legacy.tool, null);
+});
+
 test('model and usage keep their own evidence provenance and do not sum request counts', () => {
   const result = snapshot({project, now, records: [event({model: 'fixture-model'}),
     event({time: '2026-10-12T01:00:20Z', provenance: 'observed', usage: {total_tokens: 5}, usage_scope: 'request'}),

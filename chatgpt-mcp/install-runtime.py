@@ -14,9 +14,33 @@ from server import CONFIG, load_projects
 
 
 FILES = ("server.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
+         "host_runtime_config.py", "host_runtime.py", "host_runtime_operations.py",
+         "host_runtime_tools.py", "host_runtime_web.py", "host_db_migration.py", "host_schema014.py",
+         "toss_console_evidence.py", "toss_console_tools.py", "toss_console_sdk_bridge.py",
+         "toss_console_codex.py",
+         "runtime_rollout_web.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py",
+         "approve-host-operation.py",
          "postgres_job.py", "git_workflows.py", "approve-git-operation.py", "context.yml",
          "project-picker.html", "project_state.py", "admin_server.py",
-         "admin.html", "admin.js", "admin.css", "workspace_view.py")
+         "admin.html", "admin.js", "admin.css", "agent-admin.js",
+         "runtime-rollout-admin.js", "workspace_view.py",
+         "workroom-frame.html", "workroom-frame.js", "workroom-bridge.js",
+         "codex_hooks.py", "codex_observer.py", "codex_hook_report.py",
+         "claude_hooks.py", "claude_hook_report.py",
+         "host_registry.py", "host_actions.py", "host_process.py", "host_source_review.py",
+         "host_registered_operations.py", "host_compose_actions.py", "host_registered_tools.py",
+         "agent_profiles.py", "agent_tasks.py", "agent_runner.py", "agent_events.py",
+         "agent_results.py", "agent_tools.py", "agent_host_broker.py",
+         "agent_broker_server.py", "agent-bootstrap.c", "agent_bootstrap.py",
+         "agent_supervisor.py", "agent_probe.py", "agent_code_mode.py", "agent_proofs.py", "agent_smoke.py",
+         "agent_profile_setup.py", "configure-agent-profile.py",
+         "host_command_profiles.py", "host_command_entry.py",
+         "host_command_runner.py", "host_command_supervisor.py",
+         "host_command_operations.py", "host_command_tools.py", "host-command-admin.js",
+         "host_access.py", "host_execution.py", "host_execution_tools.py", "host_agent.py",
+         "host-access-admin.js", "host_access_ui.py", "host-access-approval.html",
+         "host_operation_ui.py", "host-operation-approval.html",
+         "host_command_ui.py", "host-command-approval.html")
 DASHBOARD_FILES = ('model.js', 'motion.js', 'pixels.js', 'visualizer.js', 'visualizer.css')
 
 

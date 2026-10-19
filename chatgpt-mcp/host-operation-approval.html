@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Schema 014 승인</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 18px; color: light-dark(#202124, #f1f1f1); background: light-dark(#fff, #202020); }
+    main { width: 100%; max-width: 600px; margin: 0 auto; }
+    h1 { margin: 0; font-size: 21px; }
+    .lead { margin: 7px 0 15px; color: light-dark(#555b62, #c7cbd0); }
+    dl { display: grid; gap: 9px; margin: 0; padding: 14px; border: 1px solid light-dark(#d8dce2, #51555a); border-radius: 12px; background: light-dark(#f7f8fa, #292b2e); }
+    dt { color: light-dark(#666a70, #b9bdc2); font-size: 12px; }
+    dd { margin: 2px 0 0; overflow-wrap: anywhere; font-weight: 650; }
+    code { font: 12px/1.45 ui-monospace, monospace; }
+    .warning { margin-top: 13px; padding: 12px; border-radius: 10px; background: light-dark(#fff2d2, #493b18); color: light-dark(#594300, #ffe59a); }
+    .warning strong { display: block; margin-bottom: 3px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 15px; }
+    button { min-height: 44px; padding: 9px 16px; border-radius: 9px; border: 1px solid transparent; font: inherit; font-weight: 700; cursor: pointer; }
+    button:disabled { cursor: default; opacity: .55; }
+    .primary { background: light-dark(#202124, #ededed); color: light-dark(#fff, #202124); }
+    .secondary { color: inherit; border-color: light-dark(#b8bcc2, #666a70); background: transparent; }
+    #status { min-height: 23px; margin: 13px 0 0; }
+    #status[data-error="true"] { color: light-dark(#a51d24, #ffacae); }
+    .footnote { margin: 6px 0 0; color: light-dark(#666a70, #b9bdc2); font-size: 12px; }
+    @media (max-width: 420px) { body { padding: 13px; } .actions button { flex: 1 1 130px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Schema 014 적용 승인</h1>
+    <p class="lead">고정된 TEST DB 변경 계획을 확인하세요. 승인 후에도 실행은 별도 요청입니다.</p>
+    <dl>
+      <div><dt>범위</dt><dd id="scope">불러오는 중…</dd></div>
+      <div><dt>변경</dt><dd id="change">불러오는 중…</dd></div>
+      <div><dt>작업 ID</dt><dd><code id="operation">불러오는 중…</code></dd></div>
+      <div><dt>계획 SHA-256</dt><dd><code id="plan">불러오는 중…</code></dd></div>
+      <div><dt>소스 SHA-256</dt><dd><code id="source">불러오는 중…</code></dd></div>
+      <div><dt>Schema 014 SHA-256</dt><dd><code id="schema">불러오는 중…</code></dd></div>
+      <div><dt>선행 스키마</dt><dd id="predecessors">불러오는 중…</dd></div>
+      <div><dt>만료</dt><dd id="expiry">불러오는 중…</dd></div>
+    </dl>
+    <div class="warning">
+      <strong>Backup before change · No service restart</strong>
+      승인은 1회용 승인 영수증만 발급합니다. DB 변경이나 서비스 재시작은 실행하지 않습니다.
+    </div>
+    <div class="actions">
+      <button id="approve" class="primary" type="button" disabled>이 계획 승인</button>
+      <button id="cancel" class="secondary" type="button" disabled>취소</button>
+    </div>
+    <p id="status" role="status" aria-live="polite">ChatGPT에 연결하는 중…</p>
+    <p class="footnote">다른 작업 ID·소스·런타임 또는 만료된 계획에는 이 승인을 사용할 수 없습니다.</p>
+  </main>
+  <script>
+    "use strict";
+    const el = Object.fromEntries(["scope", "change", "operation", "plan", "source", "schema",
+      "predecessors", "expiry", "approve", "cancel", "status"].map(id =>
+      [id, document.getElementById(id)]));
+    const pending = new Map();
+    let rpcId = 0;
+    let card = null;
+    let confirmationToken = null;
+    let busy = false;
+    let locked = false;
+    let lastSize = null;
+    let sizeFrame = null;
+
+    function reportSize() {
+      if (sizeFrame !== null) return;
+      sizeFrame = requestAnimationFrame(() => {
+        sizeFrame = null;
+        const root = document.documentElement;
+        const previous = root.style.height;
+        root.style.height = "max-content";
+        const height = Math.ceil(root.getBoundingClientRect().height);
+        root.style.height = previous;
+        const width = Math.ceil(window.innerWidth);
+        if (height <= 0 || width <= 0 || lastSize?.height === height && lastSize?.width === width) return;
+        lastSize = { height, width };
+        window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/size-changed",
+          params: lastSize }, "*");
+      });
+    }
+
+    function setStatus(text, error = false) {
+      el.status.textContent = text;
+      el.status.dataset.error = String(error);
+      reportSize();
+    }
+
+    function request(method, params) {
+      if (method === "tools/call" && typeof window.openai?.callTool === "function") {
+        return window.openai.callTool(params.name, params.arguments);
+      }
+      return new Promise((resolve, reject) => {
+        const id = ++rpcId;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error("결과를 확인할 수 없습니다."));
+        }, method === "tools/call" ? 60000 : 15000);
+        pending.set(id, { resolve, reject, timer });
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+      });
+    }
+
+    function valid(value) {
+      return value && value.project === "tossApp" && value.target === "tarororo-test" &&
+        value.component === "schema014" && /^[0-9a-f]{32}$/.test(value.operation_id) &&
+        /^[0-9a-f]{32}$/.test(value.card_id) && ["pending", "approved", "cancelled"].includes(value.state) &&
+        [value.plan_digest, value.source_digest, value.schema014_sha256].every(
+          item => /^[0-9a-f]{64}$/.test(item || "")) &&
+        value.schema_change === "014_person_relationship_detail.sql" &&
+        value.backup_before_change === true && value.service_restart === false &&
+        value.executes_on_approval === false && typeof value.predecessor_checksums === "object" &&
+        typeof value.expires_at === "string" && !Number.isNaN(Date.parse(value.expires_at));
+    }
+
+    function sync() {
+      const expired = card ? Date.now() >= Date.parse(card.expires_at) : true;
+      const disabled = !card || card.state !== "pending" || !confirmationToken || busy || locked || expired;
+      el.approve.disabled = disabled;
+      el.cancel.disabled = disabled;
+      if (expired && card?.state === "pending" && !locked) {
+        locked = true;
+        confirmationToken = null;
+        setStatus("승인 카드가 만료되었습니다. 새 계획을 준비하거나 카드를 다시 여세요.", true);
+      }
+    }
+
+    function render() {
+      if (!card) { sync(); return; }
+      el.scope.textContent = `${card.project} / ${card.target}`;
+      el.change.textContent = card.schema_change;
+      el.operation.textContent = card.operation_id;
+      el.plan.textContent = card.plan_digest;
+      el.source.textContent = card.source_digest;
+      el.schema.textContent = card.schema014_sha256;
+      el.predecessors.textContent = `${Object.keys(card.predecessor_checksums).length}개 checksum 고정`;
+      el.expiry.textContent = new Date(card.expires_at).toLocaleString("ko-KR");
+      sync();
+      reportSize();
+    }
+
+    function accept(result) {
+      if (result?.isError || !valid(result?.structuredContent)) throw new Error("호스트가 카드를 거부했습니다.");
+      const next = result.structuredContent;
+      if (card && (next.operation_id !== card.operation_id || next.card_id !== card.card_id)) return false;
+      const token = result?._meta?.schema014_confirmation;
+      if (next.state === "pending" && !/^[0-9a-f]{64}$/.test(token || "")) {
+        card = next;
+        locked = true;
+        confirmationToken = null;
+        render();
+        setStatus("확인 정보가 없습니다. 채팅에서 카드를 다시 열어주세요.", true);
+        return true;
+      }
+      card = next;
+      confirmationToken = next.state === "pending" ? token : null;
+      if (next.state !== "pending") locked = true;
+      render();
+      return true;
+    }
+
+    async function publish() {
+      const receipt = { project: card.project, target: card.target, operation_id: card.operation_id,
+        card_id: card.card_id, state: card.state, approved: card.approved === true };
+      const context = { content: [{ type: "text", text: `Schema 014 계획 ${receipt.operation_id}: ${receipt.state}` }],
+        structuredContent: { schema014Approval: receipt } };
+      try { await request("ui/update-model-context", context); }
+      catch (_) { try { window.openai?.setWidgetState?.({ modelContent: context.structuredContent }); } catch (_) {} }
+    }
+
+    async function submit(action) {
+      if (!card || !confirmationToken || busy || locked) return;
+      busy = true;
+      sync();
+      setStatus(action === "confirm" ? "승인 중…" : "취소 중…");
+      const args = { project: card.project, target: card.target, operation_id: card.operation_id,
+        card_id: card.card_id, confirmation_token: confirmationToken };
+      try {
+        const result = await request("tools/call", { name: `${action}_schema014_approval`, arguments: args });
+        if (!accept(result)) throw new Error("다른 카드 응답입니다.");
+        await publish();
+        if (card.state === "approved") {
+          setStatus((action === "cancel" ? "이미 승인된 계획입니다. " : "승인을 확인했습니다. ") +
+            "이 버튼은 DB를 실행하지 않습니다. 실행 상태는 채팅에서 확인하세요.");
+        } else {
+          setStatus("승인 요청을 취소했습니다.");
+        }
+      } catch (_) {
+        locked = true;
+        confirmationToken = null;
+        setStatus("결과를 확정할 수 없습니다. 작업 상태를 다시 조회하거나 카드를 다시 여세요.", true);
+      } finally {
+        busy = false;
+        sync();
+      }
+    }
+
+    el.approve.addEventListener("click", () => submit("confirm"));
+    el.cancel.addEventListener("click", () => submit("cancel"));
+    window.addEventListener("message", event => {
+      const data = event.data;
+      if (data?.jsonrpc !== "2.0") return;
+      if (Object.hasOwn(data, "id") && pending.has(data.id)) {
+        const item = pending.get(data.id);
+        pending.delete(data.id);
+        clearTimeout(item.timer);
+        data.error ? item.reject(new Error("호스트 요청 실패")) : item.resolve(data.result);
+        return;
+      }
+      if (data.method === "ui/notifications/tool-result") {
+        try { accept(data.params); setStatus("계획을 확인한 뒤 승인하세요."); }
+        catch (_) { locked = true; sync(); setStatus("승인 카드 데이터를 확인할 수 없습니다.", true); }
+      }
+    });
+
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(reportSize);
+      observer.observe(document.documentElement);
+      observer.observe(document.body);
+    }
+    window.addEventListener("resize", reportSize);
+    reportSize();
+    try {
+      if (window.openai?.toolOutput) {
+        accept({ structuredContent: window.openai.toolOutput,
+          _meta: window.openai.toolResponseMetadata || {} });
+        setStatus("계획을 확인한 뒤 승인하세요.");
+      } else if (typeof window.openai?.callTool !== "function" && window.parent === window) {
+        locked = true;
+        sync();
+        setStatus("이 화면에서는 승인할 수 없습니다. ChatGPT의 승인 카드에서 여세요.", true);
+      }
+    } catch (_) {
+      locked = true;
+      sync();
+      setStatus("승인 카드 데이터를 확인할 수 없습니다.", true);
+    }
+  </script>
+</body>
+</html>

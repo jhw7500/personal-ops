@@ -21,10 +21,47 @@ from jobs import ACTIVE_STATES, JOB_ID, MAX_LOG_BYTES, MAX_READ_BYTES, private_d
 from project_state import MAX_PROGRESS_STATE_BYTES, MemoryConflict, ProjectState
 from server import CONFIG, load_projects
 from workspace_view import WorkspaceView
+from host_runtime_config import HostRuntimeError, REGISTERED_MODULES, TRUSTED_APPROVAL_ORIGIN
+from host_runtime_operations import HostRuntimeOperations
+from runtime_rollout_web import RuntimeRolloutWeb
+from agent_tasks import AgentTaskManager
+from agent_runner import CodexAgentRunner
+from host_command_tools import create_host_command_manager
+from host_access import HostAccess
+from host_execution_tools import create_host_execution_manager
+from host_runtime_web import (pending_operations, host_operation_review, approve_web, enable_extended_scope,
+                              enable_predecessor_scope, registered_operations,
+                              registered_operation, approve_registered, reject_registered,
+                              target_authorization, set_target_authorization)
+
+try:
+    from host_registered_tools import (TARGET_PATTERN, create_registered_manager, list_targets,
+                                       public_code)
+except ModuleNotFoundError as exc:
+    if exc.name not in REGISTERED_MODULES:
+        raise
+    TARGET_PATTERN = re.compile(r'[a-z0-9][a-z0-9_-]{0,62}\Z')
+
+    def create_registered_manager(projects, state_dir=None):
+        raise HostRuntimeError('REGISTERED_OPERATIONS_UNAVAILABLE')
+
+    def list_targets(get_manager, project):
+        return {'project': project, 'enabled': False,
+                'reason': 'REGISTERED_OPERATIONS_UNAVAILABLE', 'targets': []}
+
+    def public_code(error):
+        return 'REGISTERED_OPERATIONS_UNAVAILABLE'
 
 ASSETS = {'/': ('admin.html', 'text/html; charset=utf-8'),
           '/admin.js': ('admin.js', 'text/javascript; charset=utf-8'),
           '/admin.css': ('admin.css', 'text/css; charset=utf-8'),
+          '/workroom-frame.html': ('workroom-frame.html', 'text/html; charset=utf-8'),
+          '/workroom-frame.js': ('workroom-frame.js', 'text/javascript; charset=utf-8'),
+          '/workroom-bridge.js': ('workroom-bridge.js', 'text/javascript; charset=utf-8'),
+          '/agent-admin.js': ('agent-admin.js', 'text/javascript; charset=utf-8'),
+          '/host-command-admin.js': ('host-command-admin.js', 'text/javascript; charset=utf-8'),
+          '/runtime-rollout-admin.js': ('runtime-rollout-admin.js', 'text/javascript; charset=utf-8'),
+          '/host-access-admin.js': ('host-access-admin.js', 'text/javascript; charset=utf-8'),
           '/work-dashboard/model.js': ('work-dashboard/model.js', 'text/javascript; charset=utf-8'),
           '/work-dashboard/motion.js': ('work-dashboard/motion.js', 'text/javascript; charset=utf-8'),
           '/work-dashboard/pixels.js': ('work-dashboard/pixels.js', 'text/javascript; charset=utf-8'),
@@ -38,6 +75,88 @@ JOB_FIELDS = {'job_id', 'project', 'state', 'preset', 'relative_cwd', 'label',
               'timeout_seconds', 'created_at', 'started_at', 'finished_at',
               'exit_code', 'log_bytes', 'log_truncated'}
 JOB_STATES = ACTIVE_STATES | {'succeeded', 'failed', 'timed_out', 'canceled', 'interrupted'}
+# Approval POST endpoints and their exact body keys; all share Handler.fresh_approval().
+APPROVAL_BODIES = {
+    '/api/host-approve': {'operation_id', 'plan_digest', 'source_digest', 'confirmation', 'admin_token'},
+    '/api/host-scope-enable': {'confirmation', 'admin_token'},
+    '/api/host-predecessor-scope-enable': {'confirmation', 'admin_token'},
+    '/api/host-target-authorization': {'enabled', 'confirmation', 'admin_token'},
+    '/api/registered-approve': {'operation_id', 'plan_digest', 'source_digest', 'confirmation',
+                                'admin_token'},
+    '/api/registered-reject': {'operation_id', 'confirmation', 'admin_token'},
+    '/api/agent-approve': {'task_id', 'plan_digest', 'source_digest', 'confirmation', 'admin_token'},
+    '/api/host-command-approve': {'operation_id', 'plan_digest', 'source_digest',
+                                  'confirmation', 'admin_token'},
+    '/api/runtime-rollout-approve': {'operation_id', 'plan_digest', 'source_digest',
+                                     'confirmation', 'admin_token'},
+    '/api/host-access-approve': {'request_id', 'duration_seconds', 'allow_codex',
+                                 'confirmation', 'admin_token'},
+    '/api/host-access-revoke': {'grant_id', 'confirmation', 'admin_token'},
+    '/api/host-execution-cancel': {'operation_id', 'confirmation', 'admin_token'},
+}
+# The approval link handed to chat: project, target and operation ID only.
+APPROVAL_LINK = '/host-operations'
+APPROVAL_LINK_ERROR = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>승인 링크 확인</title></head><body><main>
+<h1>승인 링크를 확인해 주세요</h1>
+<p>작업을 식별하는 항목이 빠졌거나 링크 형식이 올바르지 않습니다. 이 요청으로 승인한 작업은 없습니다.</p>
+<p>채팅에서 해당 작업의 승인 카드를 다시 열어 주세요. Schema014 승인은 DB 적용과 별도입니다.</p>
+<p>관리 화면을 이용하려면 로그인 후 정확한 작업 ID를 확인해 선택하세요.</p>
+<a href="/">관리 화면 열기</a>
+</main></body></html>""".encode('utf-8')
+LINK_PROJECT = re.compile(r'[A-Za-z0-9_.-]{1,64}\Z')
+OPERATION_ID = re.compile(r'[0-9a-f]{32}\Z')
+DIAGNOSTIC_ID = re.compile(r'[0-9a-f]{32}\Z')
+
+
+class RegisteredRefusal(Exception):
+    """A registered operation refused with a sanitized code (shown by the admin page)."""
+
+    def __init__(self, error):
+        super().__init__()
+        self.code = public_code(error)
+        diagnostic = getattr(error, 'diagnostic_id', None)
+        self.diagnostic_id = (diagnostic if isinstance(diagnostic, str)
+                              and DIAGNOSTIC_ID.fullmatch(diagnostic) else None)
+
+    def payload(self):
+        body = {'error': 'Registered host operation refused', 'code': self.code}
+        if self.diagnostic_id:
+            body['diagnostic_id'] = self.diagnostic_id
+        return body
+
+
+def approval_link_valid(query):
+    """Exactly project, target and operation ID; anything else (a token) is refused."""
+    try:
+        fields = parse_qs(query, keep_blank_values=True, strict_parsing=True, max_num_fields=3)
+    except ValueError:
+        return False
+    if any(len(v) != 1 for v in fields.values()):
+        return False
+    if set(fields) == {'project', 'target', 'operation_id'}:
+        return bool(LINK_PROJECT.fullmatch(fields['project'][0])
+                    and TARGET_PATTERN.fullmatch(fields['target'][0])
+                    and OPERATION_ID.fullmatch(fields['operation_id'][0]))
+    if set(fields) == {'project', 'target', 'host_operation_id'}:
+        return bool(fields['project'][0] == 'tossApp'
+                    and fields['target'][0] == 'tarororo-test'
+                    and OPERATION_ID.fullmatch(fields['host_operation_id'][0]))
+    return False
+
+
+def host_access_link_valid(query, projects):
+    """Owner-authenticated approval page link with no token or implicit grant."""
+    try:
+        fields = parse_qs(query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
+    except ValueError:
+        return False
+    return (set(fields) == {'project', 'request_id'}
+            and all(len(values) == 1 for values in fields.values())
+            and bool(LINK_PROJECT.fullmatch(fields['project'][0]))
+            and fields['project'][0] in projects
+            and bool(OPERATION_ID.fullmatch(fields['request_id'][0])))
 
 
 def _script_action(script):
@@ -319,7 +438,11 @@ def validate_lan_host(host):
 
 
 def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_origin=None,
-                  bind_host='127.0.0.1'):
+                  bind_host='127.0.0.1', host_ops_factory=HostRuntimeOperations,
+                  registered_ops_factory=create_registered_manager,
+                  agent_ops_factory=None, command_ops_factory=create_host_command_manager,
+                  host_access_factory=HostAccess, host_execution_factory=create_host_execution_manager,
+                  runtime_rollout_factory=RuntimeRolloutWeb):
     dashboard = dashboard_root(ASSET_ROOT)
     if bind_host != '127.0.0.1':
         bind_host = validate_lan_host(bind_host)
@@ -328,6 +451,75 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
     state = ProjectState(projects, Path(state_dir))
     reader = JobReader(projects, state_dir)
     workspace = WorkspaceView(projects)
+    host_ops = None
+
+    registered_ops = None
+    agent_ops = None
+    command_ops = None
+    access_ops = None
+    execution_ops = None
+    rollout_ops = None
+
+    def runtime_rollout():
+        nonlocal rollout_ops
+        if rollout_ops is None:
+            rollout_ops = runtime_rollout_factory(projects, state_dir=Path(state_dir))
+        return rollout_ops
+
+    def host_access():
+        nonlocal access_ops
+        if access_ops is None:
+            access_ops = host_access_factory(projects, Path(state_dir))
+        return access_ops
+
+    def host_execution():
+        nonlocal execution_ops
+        if execution_ops is None:
+            execution_ops = host_execution_factory(projects, Path(state_dir), access=host_access())
+        return execution_ops
+
+    def command_manager():
+        nonlocal command_ops
+        if command_ops is None:
+            command_ops = command_ops_factory(projects, state_dir=Path(state_dir))
+        return command_ops
+
+    def agent_manager():
+        nonlocal agent_ops
+        if agent_ops is None:
+            agent_ops = (agent_ops_factory(projects, state_dir=Path(state_dir) / 'agent-tasks')
+                         if agent_ops_factory is not None else
+                         AgentTaskManager(projects, state_dir=Path(state_dir) / 'agent-tasks',
+                                          runner=CodexAgentRunner()))
+        return agent_ops
+
+    def host_operations():
+        nonlocal host_ops
+        if host_ops is None:
+            host_ops = host_ops_factory(projects, state_dir=Path(state_dir) / 'host-runtime')
+        return host_ops
+
+    def registered_manager():
+        nonlocal registered_ops
+        if registered_ops is None:
+            registered_ops = registered_ops_factory(projects,
+                                                    state_dir=Path(state_dir) / 'host-runtime')
+        return registered_ops
+
+    def registered(function, *args, **kwargs):
+        """Registered-operation calls report their sanitized code to the admin page."""
+        try:
+            return function(*args, **kwargs)
+        except HostRuntimeError as exc:
+            raise RegisteredRefusal(exc) from None
+        except OSError:
+            raise RegisteredRefusal(HostRuntimeError('STATE_UNAVAILABLE')) from None
+
+    def registered_target(query):
+        target = query.get('target', [None])[0]
+        if not isinstance(target, str) or not TARGET_PATTERN.fullmatch(target):
+            raise RegisteredRefusal(HostRuntimeError('UNSUPPORTED_SCOPE'))
+        return target
 
     class Handler(BaseHTTPRequestHandler):
         server_version = 'LocalAdmin/1.5.0'
@@ -339,7 +531,8 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
         def log_message(self, *args):
             pass  # Never log paths, headers, tokens or content.
 
-        def send(self, code, payload, content_type='application/json; charset=utf-8', cookie=None):
+        def send(self, code, payload, content_type='application/json; charset=utf-8', cookie=None,
+                 policy=None):
             if not isinstance(payload, bytes):
                 payload = json.dumps(payload, ensure_ascii=False).encode('utf-8')
             self.send_response(code)
@@ -350,9 +543,7 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
             self.send_header('Referrer-Policy', 'no-referrer')
             if cookie:
                 self.send_header('Set-Cookie', cookie)
-            self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'self'; "
-                             "style-src 'self'; connect-src 'self'; base-uri 'none'; "
-                             "frame-ancestors 'none'; form-action 'self'")
+            self.send_header('Content-Security-Policy', policy or self.parent_policy())
             self.send_header('Connection', 'close')
             self.end_headers()
             self.close_connection = True
@@ -360,6 +551,31 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
 
         def error(self, code, text):
             self.send(code, {'error': text})
+
+        def parent_policy(self):
+            origin = getattr(self, 'trusted_origin', None)
+            if not origin:
+                return "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+            scripts = ('/workroom-bridge.js', '/admin.js', '/agent-admin.js',
+                       '/host-command-admin.js', '/host-access-admin.js',
+                       '/runtime-rollout-admin.js')
+            return ("default-src 'none'; script-src "
+                    + ' '.join(origin + path for path in scripts)
+                    + f"; style-src {origin}/admin.css; connect-src {origin}; "
+                      f"frame-src {origin}/workroom-frame.html; base-uri 'none'; "
+                      "frame-ancestors 'none'; form-action 'none'")
+
+        def frame_policy(self):
+            origin = self.trusted_origin
+            scripts = ('/work-dashboard/model.js', '/work-dashboard/motion.js',
+                       '/work-dashboard/pixels.js', '/work-dashboard/visualizer.js',
+                       '/workroom-frame.js')
+            styles = ('/admin.css', '/work-dashboard/visualizer.css')
+            return ("default-src 'none'; script-src "
+                    + ' '.join(origin + path for path in scripts)
+                    + "; style-src " + ' '.join(origin + path for path in styles)
+                    + f"; connect-src 'none'; base-uri 'none'; frame-ancestors {origin}; "
+                      "form-action 'none'; navigate-to 'none'; sandbox allow-scripts")
 
         def trusted_request(self):
             hosts = self.headers.get_all('Host', [])
@@ -374,6 +590,7 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
                     or (origins and origins[0] != valid_hosts[hosts[0]])):
                 self.error(403, 'Untrusted host or origin')
                 return False
+            self.trusted_origin = valid_hosts[hosts[0]].rstrip('/')
             return True
 
         def cookie_name(self):
@@ -411,6 +628,30 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
             except (CookieError, ValueError, KeyError):
                 return False
 
+        def fresh_approval(self, body, keys):
+            """Shared by every approval POST: only same-origin loopback or this host's
+            registered tailnet-only HTTPS Serve address, on a loopback-bound server, without
+            forwarding headers, with the exact body keys and a freshly re-entered token."""
+            authority = self.headers.get('Host')
+            local_hosts = {f'127.0.0.1:{self.server.server_port}',
+                           f'localhost:{self.server.server_port}'}
+            is_local = authority in local_hosts
+            is_tailnet = (public_origin == TRUSTED_APPROVAL_ORIGIN
+                          and authority == urlsplit(TRUSTED_APPROVAL_ORIGIN).netloc)
+            expected_origin = ((('http://' + authority) if is_local else
+                                TRUSTED_APPROVAL_ORIGIN) if (is_local or is_tailnet) else None)
+            forwarded_bad = ((self.headers.get('Forwarded')
+                              or self.headers.get('X-Forwarded-Host')) if is_local
+                             else (self.headers.get('X-Forwarded-Proto') not in (None, 'https')))
+            return (bind_host == '127.0.0.1'
+                    and (is_local or is_tailnet)
+                    and self.headers.get_all('Origin', []) == [expected_origin]
+                    and self.headers.get('Sec-Fetch-Site', 'same-origin') == 'same-origin'
+                    and not forwarded_bad
+                    and set(body) == keys
+                    and isinstance(body['admin_token'], str)
+                    and hmac.compare_digest(body['admin_token'].encode(), token.encode()))
+
         def json_body(self, limit=MAX_BODY):
             lengths = self.headers.get_all('Content-Length', [])
             if self.headers.get_all('Transfer-Encoding') or len(lengths) != 1 or not lengths[0].isdigit():
@@ -440,7 +681,38 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
                 filename, mime = ASSETS[parsed.path]
                 asset = (dashboard / filename.removeprefix('work-dashboard/')
                          if filename.startswith('work-dashboard/') else ASSET_ROOT / filename)
-                self.send(200, asset.read_bytes(), mime)
+                self.send(200, asset.read_bytes(), mime,
+                          policy=self.frame_policy() if parsed.path == '/workroom-frame.html' else None)
+                return
+            if parsed.path == '/runtime-rollouts' and self.command == 'GET':
+                fields = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=2)
+                if (set(fields) != {'operation_id'} or len(fields['operation_id']) != 1
+                        or not OPERATION_ID.fullmatch(fields['operation_id'][0])):
+                    self.error(400, 'Invalid runtime rollout approval link')
+                    return
+                self.send(200, (ASSET_ROOT / ASSETS['/'][0]).read_bytes(), ASSETS['/'][1])
+                return
+            if parsed.path == '/host-commands' and self.command == 'GET':
+                # The only public link field is a 32-hex operation ID; no token.
+                fields = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=2)
+                if (set(fields) != {'operation_id'} or len(fields['operation_id']) != 1
+                        or not OPERATION_ID.fullmatch(fields['operation_id'][0])):
+                    self.error(400, 'Invalid command approval link')
+                    return
+                self.send(200, (ASSET_ROOT / ASSETS['/'][0]).read_bytes(), ASSETS['/'][1])
+                return
+            if parsed.path == '/host-access' and self.command == 'GET':
+                if not host_access_link_valid(parsed.query, projects):
+                    self.error(400, 'Invalid host access approval link')
+                    return
+                self.send(200, (ASSET_ROOT / ASSETS['/'][0]).read_bytes(), ASSETS['/'][1])
+                return
+            if parsed.path == APPROVAL_LINK and self.command == 'GET':
+                # The page itself: admin.js reads the IDs, and a login is still required.
+                if not approval_link_valid(parsed.query):
+                    self.send(400, APPROVAL_LINK_ERROR, 'text/html; charset=utf-8')
+                    return
+                self.send(200, (ASSET_ROOT / ASSETS['/'][0]).read_bytes(), ASSETS['/'][1])
                 return
             if not parsed.path.startswith('/api/'):
                 self.error(404, 'Not found')
@@ -467,7 +739,7 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
             if self.command not in {'GET', 'PUT', 'POST'}:
                 self.error(405, 'Method not allowed')
                 return
-            if self.command == 'POST' and parsed.path != '/api/work-events':
+            if self.command == 'POST' and parsed.path not in {'/api/work-events', *APPROVAL_BODIES}:
                 self.error(405, 'Method not allowed')
                 return
             query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=5)
@@ -480,9 +752,68 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
                 body = self.json_body()
                 if body is None:
                     return
-                if set(body) != {'events'}:
-                    raise ValueError('Invalid event batch')
-                result = state.record_work_events(project, body['events'], provenance='reported')
+                if parsed.path in APPROVAL_BODIES:
+                    # All approvals require fresh token re-entry plus the exact plan ID.
+                    if ((parsed.path in {'/api/host-approve', '/api/host-scope-enable',
+                                         '/api/host-predecessor-scope-enable',
+                                         '/api/host-target-authorization'}
+                         and project != 'tossApp')
+                            or (parsed.path == '/api/runtime-rollout-approve'
+                                and project != 'personal-ops')
+                            or not self.fresh_approval(body, APPROVAL_BODIES[parsed.path])):
+                        self.error(403, 'Local approval requires fresh administrator authentication')
+                        return
+                    fields = {key: value for key, value in body.items() if key != 'admin_token'}
+                    if parsed.path == '/api/registered-approve':
+                        result = registered(lambda: approve_registered(
+                            registered_manager(), project, registered_target(query), **fields))
+                    elif parsed.path == '/api/registered-reject':
+                        result = registered(lambda: reject_registered(
+                            registered_manager(), project, registered_target(query), **fields))
+                    elif parsed.path == '/api/agent-approve':
+                        result = agent_manager().approve_web(project, **fields)
+                    elif parsed.path == '/api/host-command-approve':
+                        result = registered(lambda: command_manager().approve_web(project, **fields))
+                    elif parsed.path == '/api/runtime-rollout-approve':
+                        if set(query) != {'project'}:
+                            raise ValueError('Exact runtime rollout project required')
+                        result = registered(lambda: runtime_rollout().approve_web(project, **fields))
+                    elif parsed.path == '/api/host-access-approve':
+                        if set(query) != {'project'}:
+                            raise ValueError('Exact host access scope required')
+                        result = registered(lambda: host_access().approve_web(project, **fields))
+                    elif parsed.path == '/api/host-access-revoke':
+                        if set(query) != {'project'}:
+                            raise ValueError('Exact host access scope required')
+                        result = registered(lambda: host_access().revoke_web(project, **fields))
+                    elif parsed.path == '/api/host-execution-cancel':
+                        if (set(query) != {'project'} or fields['confirmation'] != project
+                                or not isinstance(fields['operation_id'], str)
+                                or not OPERATION_ID.fullmatch(fields['operation_id'])):
+                            raise ValueError('Exact execution scope required')
+                        result = registered(lambda: host_execution().cancel(project, fields['operation_id']))
+                    elif parsed.path == '/api/host-scope-enable':
+                        result = enable_extended_scope(host_operations(), body['confirmation'])
+                    elif parsed.path == '/api/host-predecessor-scope-enable':
+                        result = enable_predecessor_scope(host_operations(), body['confirmation'])
+                    elif parsed.path == '/api/host-target-authorization':
+                        if set(query) != {'project', 'target'}:
+                            raise ValueError('Exact target authorization scope required')
+                        if type(body['enabled']) is not bool:
+                            raise ValueError('Boolean enabled required')
+                        result = set_target_authorization(
+                            host_operations(), project, registered_target(query),
+                            enabled=body['enabled'], confirmation=body['confirmation'])
+                    else:
+                        result = approve_web(
+                            host_operations(), operation_id=body['operation_id'],
+                            plan_digest=body['plan_digest'],
+                            source_digest=body['source_digest'],
+                            confirmation=body['confirmation'])
+                else:
+                    if set(body) != {'events'}:
+                        raise ValueError('Invalid event batch')
+                    result = state.record_work_events(project, body['events'], provenance='reported')
             elif self.command == 'PUT':
                 if parsed.path not in {'/api/memory', '/api/progress'}:
                     self.error(405, 'Method not allowed')
@@ -503,6 +834,86 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
             elif parsed.path == '/api/projects':
                 result = {'projects': [{'project': key, 'path': str(path)} for key, path in projects.items()],
                           'recommended_project': recommended_project(projects, state, reader)}
+            elif parsed.path == '/api/host-operations':
+                if project != 'tossApp':
+                    self.error(404, 'Not found')
+                    return
+                result = pending_operations(host_operations())
+            elif parsed.path == '/api/host-operation-review':
+                if project != 'tossApp':
+                    self.error(404, 'Not found')
+                    return
+                if set(query) != {'project', 'operation_id'}:
+                    raise ValueError('Exact legacy review scope required')
+                result = host_operation_review(
+                    host_operations(), project, query['operation_id'][0])
+            elif parsed.path == '/api/host-target-authorization':
+                if set(query) != {'project', 'target'}:
+                    raise ValueError('Exact target authorization scope required')
+                result = target_authorization(
+                    host_operations(), project, registered_target(query))
+            elif parsed.path == '/api/host-access':
+                if set(query) != {'project'}:
+                    raise ValueError('Exact host access scope required')
+                result = registered(lambda: host_access().get(project))
+            elif parsed.path == '/api/host-executions':
+                if set(query) != {'project'}:
+                    raise ValueError('Exact host execution scope required')
+                result = registered(lambda: host_execution().list(project))
+            elif parsed.path in {'/api/host-execution', '/api/host-execution-log'}:
+                allowed = ({'project', 'operation_id'} if parsed.path == '/api/host-execution'
+                           else {'project', 'operation_id', 'stream', 'cursor'})
+                if (not {'project', 'operation_id'} <= set(query) <= allowed
+                        or not OPERATION_ID.fullmatch(query['operation_id'][0])):
+                    raise ValueError('Exact host execution query required')
+                operation_id = query['operation_id'][0]
+                if parsed.path == '/api/host-execution':
+                    result = registered(lambda: host_execution().get(project, operation_id))
+                    if result.get('kind') == 'codex':
+                        from host_agent import HostAgentAdapter
+                        result = registered(lambda: HostAgentAdapter(host_execution()).get(project, operation_id))
+                else:
+                    cursor = query.get('cursor', ['0'])[0]
+                    stream = query.get('stream', ['stdout'])[0]
+                    if not re.fullmatch(r'[0-9]{1,8}', cursor) or stream not in {'stdout', 'stderr'}:
+                        raise ValueError('Invalid log query')
+                    result = registered(lambda: host_execution().read_log(
+                        project, operation_id, stream=stream, cursor=int(cursor)))
+            elif parsed.path == '/api/runtime-rollout-plans':
+                if set(query) != {'project'} or project != 'personal-ops':
+                    raise ValueError('Exact runtime rollout scope required')
+                result = registered(lambda: runtime_rollout().list(project))
+            elif parsed.path == '/api/runtime-rollout':
+                if (set(query) != {'project', 'operation_id'} or project != 'personal-ops'
+                        or not OPERATION_ID.fullmatch(query['operation_id'][0])):
+                    raise ValueError('Exact runtime rollout status scope required')
+                result = registered(lambda: runtime_rollout().get(project, query['operation_id'][0]))
+            elif parsed.path == '/api/host-command-plans':
+                if set(query) != {'project'}:
+                    raise ValueError('Exact command project scope required')
+                result = registered(lambda: command_manager().pending(project))
+            elif parsed.path == '/api/host-command':
+                if set(query) != {'project', 'operation_id'}:
+                    raise ValueError('Exact command status scope required')
+                result = registered(lambda: command_manager().get(project, query['operation_id'][0]))
+            elif parsed.path == '/api/agent-tasks':
+                result = agent_manager().pending(project)
+            elif parsed.path == '/api/agent-task':
+                if set(query) != {'project', 'task_id'}:
+                    raise ValueError('Exact agent task scope required')
+                result = agent_manager().get(project, query['task_id'][0])
+            elif parsed.path == '/api/registered-targets':
+                result = list_targets(registered_manager, project)
+            elif parsed.path == '/api/registered-operations':
+                result = registered(lambda: registered_operations(
+                    registered_manager(), project, registered_target(query)))
+            elif parsed.path == '/api/registered-operation':
+                cursor = query.get('cursor', ['0'])[0]
+                if not re.fullmatch(r'[0-9]{1,12}', cursor):
+                    raise RegisteredRefusal(HostRuntimeError('INVALID_EVENT_QUERY'))
+                result = registered(lambda: registered_operation(
+                    registered_manager(), project, registered_target(query),
+                    query.get('operation_id', [''])[0], int(cursor)))
             elif parsed.path == '/api/jobs':
                 result = reader.list(project)
             elif parsed.path == '/api/log':
@@ -533,7 +944,9 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
                 self.dispatch()
             except MemoryConflict:
                 self.error(409, 'Saved record changed; reload before saving')
-            except (ValueError, OSError, KeyError, TypeError, OverflowError):
+            except RegisteredRefusal as refusal:
+                self.send(400, refusal.payload())
+            except (HostRuntimeError, ValueError, OSError, KeyError, TypeError, OverflowError):
                 self.error(400, 'Invalid request or unavailable state')
 
         do_GET = do_PUT = do_POST = do_DELETE = do_OPTIONS = handle_request

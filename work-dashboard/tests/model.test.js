@@ -114,7 +114,7 @@ test('isolates the selected project and excludes polling and unknown tools', () 
     events: [
       event({call_id: 'kept', tool: 'replace_content', time: '2026-10-09T12:04:00Z'}),
       event({call_id: 'other-project', project: 'personal-ops'}),
-      event({call_id: 'poll', tool: 'get_job'}),
+      event({call_id: 'poll', tool: 'poll_job_queue_internal'}),
       event({call_id: 'unknown-tool', tool: 'delegate_to_hidden_agent'}),
     ],
     jobs: [job({job_id: 'b'.repeat(32), project: 'personal-ops'})],
@@ -123,6 +123,63 @@ test('isolates the selected project and excludes polling and unknown tools', () 
   assert.deepEqual(result.tasks.map(actor => actor.id), ['call:kept']);
   assert.equal(result.tasks[0].room, 'coding');
   assert.equal(result.project, PROJECT);
+});
+
+test('known host schema tools remain one MCP entity and completed calls are returns, not database success', () => {
+  const result = snapshot({
+    project: PROJECT,
+    now: NOW,
+    events: [
+      event({call_id: 'schema-plan', tool: 'prepare_schema014_migration', phase: 'started',
+        time: '2026-10-09T12:03:00Z'}),
+      event({call_id: 'schema-plan', tool: 'prepare_schema014_migration', phase: 'completed',
+        time: '2026-10-09T12:03:05Z'}),
+      event({call_id: 'schema-execute', tool: 'execute_schema014_migration', phase: 'completed',
+        time: '2026-10-09T12:03:06Z'}),
+      event({call_id: 'host-status', tool: 'get_host_operation', phase: 'completed',
+        time: '2026-10-09T12:03:01Z'}),
+      event({call_id: 'runtime-status', tool: 'get_runtime_status', phase: 'completed',
+        time: '2026-10-09T12:03:02Z'}),
+      event({call_id: 'access-status', tool: 'get_host_access', phase: 'completed',
+        time: '2026-10-09T12:03:03Z'}),
+      event({call_id: 'command-profiles', tool: 'list_host_command_profiles', phase: 'completed',
+        time: '2026-10-09T12:03:04Z'}),
+      event({call_id: 'schema-approval', tool: 'confirm_schema014_approval', phase: 'completed',
+        time: '2026-10-09T12:03:07Z'}),
+      event({call_id: 'job-status', tool: 'get_job', phase: 'completed',
+        time: '2026-10-09T12:03:07.100Z'}),
+      event({call_id: 'job-log', tool: 'read_job_log', phase: 'completed',
+        time: '2026-10-09T12:03:07.200Z'}),
+      event({call_id: 'job-cancel', tool: 'cancel_job', phase: 'completed',
+        time: '2026-10-09T12:03:07.300Z'}),
+      event({call_id: 'jobs-list', tool: 'list_jobs', phase: 'completed',
+        time: '2026-10-09T12:03:07.400Z'}),
+      event({call_id: 'unknown', tool: 'approve_any_database_change', phase: 'completed',
+        time: '2026-10-09T12:03:08Z'}),
+      event({call_id: 'unknown-git', tool: 'git_execute_without_plan', phase: 'completed',
+        time: '2026-10-09T12:03:09Z'}),
+    ],
+  });
+
+  assert.equal(result.actors.length, 1);
+  assert.equal(result.actors[0].id, 'entity:personal-ops-tunnel:coding-mcp');
+  assert.deepEqual(result.tasks.map(task => ({tool: task.tool, action: task.action,
+    state: task.state, room: task.room})), [
+    {tool: 'list_jobs', action: 'read', state: 'returned', room: 'done'},
+    {tool: 'cancel_job', action: 'execute', state: 'returned', room: 'done'},
+    {tool: 'read_job_log', action: 'read', state: 'returned', room: 'done'},
+    {tool: 'get_job', action: 'read', state: 'returned', room: 'done'},
+    {tool: 'confirm_schema014_approval', action: 'review', state: 'returned', room: 'done'},
+    {tool: 'execute_schema014_migration', action: 'execute', state: 'returned', room: 'done'},
+    {tool: 'prepare_schema014_migration', action: 'review', state: 'returned', room: 'done'},
+    {tool: 'list_host_command_profiles', action: 'read', state: 'returned', room: 'done'},
+    {tool: 'get_host_access', action: 'read', state: 'returned', room: 'done'},
+    {tool: 'get_runtime_status', action: 'read', state: 'returned', room: 'done'},
+    {tool: 'get_host_operation', action: 'read', state: 'returned', room: 'done'},
+  ]);
+  assert.deepEqual(result.counts, {active: 0, done: 11, attention: 0, unknown: 0, total: 11});
+  assert.ok(result.tasks.every(task => task.actorId === result.actors[0].id));
+  assert.ok(result.tasks.every(task => task.state !== 'succeeded'));
 });
 
 test('ignores non-string call IDs instead of coercing them into actor identities', () => {

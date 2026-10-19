@@ -40,6 +40,10 @@ WORK_EVENT_STATES = {
 }
 ACTIVE_WORK_EVENT_STATES = {"started", "running", "queued", "canceling"}
 WORK_EVENT_PROVENANCE = {"observed", "reported"}
+WORK_EVENT_ACTIVITY_ROLES = {
+    "analysis", "research", "planning", "debugging", "review", "summary",
+}
+WORK_EVENT_SEARCH_SCOPES = {"web", "files"}
 WORK_EVENT_USAGE_SCOPES = {"request", "turn", "session", "task"}
 WORK_EVENT_USAGE_FIELDS = {
     "input_tokens", "output_tokens", "reasoning_tokens", "total_tokens",
@@ -76,6 +80,25 @@ PROJECT_TOOLS = {
     "prepare_git_operation",
     "execute_git_operation",
     "get_git_operation",
+    "get_runtime_status", "compare_deployment", "prepare_test_deploy",
+    "execute_test_deploy", "get_host_operation",
+    "get_db_migration_status", "get_predecessor_migration_status",
+    "get_schema014_migration_status", "get_toss_test_console_status", "prepare_db_migration",
+    "prepare_predecessor_migration", "prepare_schema014_migration",
+    "execute_db_migration", "execute_predecessor_migration",
+    "execute_schema014_migration",
+    "prepare_runtime_rollout", "get_runtime_rollout", "execute_runtime_rollout",
+    "list_host_targets", "inspect_host_target", "prepare_host_operation",
+    "execute_host_operation", "read_host_operation_events",
+    "list_agent_profiles", "prepare_agent_task", "start_agent_task",
+    "get_agent_task", "cancel_agent_task",
+    "list_host_command_profiles", "prepare_host_command",
+    "execute_host_command", "get_host_command", "cancel_host_command",
+    "request_host_access", "get_host_access", "start_host_execution",
+    "get_host_execution", "read_host_execution_log", "cancel_host_execution",
+    "open_host_access_approval", "update_host_access_approval",
+    "confirm_host_access_approval", "cancel_host_access_approval",
+    "open_schema014_approval", "confirm_schema014_approval", "cancel_schema014_approval",
 }
 KNOWN_TOOLS = PROJECTLESS_TOOLS | PROJECT_TOOLS
 CALL_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
@@ -148,7 +171,8 @@ def _sanitize_work_event(project, event, provenance, now, *, preserved_receipt=N
     for field, maximum in (("actor_label", 80), ("task_label", 200)):
         if not _work_event_label(event.get(field), maximum):
             _invalid_work_event()
-    if not _work_event_choice(event.get("action"), WORK_EVENT_ACTIONS):
+    action = event.get("action")
+    if not _work_event_choice(action, WORK_EVENT_ACTIONS):
         _invalid_work_event()
     state = event.get("state")
     if not _work_event_choice(state, WORK_EVENT_STATES):
@@ -185,7 +209,7 @@ def _sanitize_work_event(project, event, provenance, now, *, preserved_receipt=N
         "task_id": event["task_id"],
         "task_kind": task_kind,
         "task_label": event["task_label"],
-        "action": event["action"],
+        "action": action,
         "state": state,
         "time": event_time_text,
     }
@@ -195,12 +219,36 @@ def _sanitize_work_event(project, event, provenance, now, *, preserved_receipt=N
     if "exit_code" in event:
         record["exit_code"] = exit_code
 
+    if "activity_role" in event:
+        if not _work_event_choice(event["activity_role"], WORK_EVENT_ACTIVITY_ROLES):
+            _invalid_work_event()
+        record["activity_role"] = event["activity_role"]
+    if "search_scope" in event:
+        if (action != "search"
+                or not _work_event_choice(event["search_scope"], WORK_EVENT_SEARCH_SCOPES)):
+            _invalid_work_event()
+        record["search_scope"] = event["search_scope"]
+    if "tool_name" in event:
+        if not _work_event_identifier(event["tool_name"], 120):
+            _invalid_work_event()
+        record["tool_name"] = event["tool_name"]
+
     for field, maximum in (("model", 120), ("reasoning_effort", 32)):
         if field in event:
             value = event[field]
             if not _work_event_identifier(value, maximum):
                 _invalid_work_event()
             record[field] = value
+
+    if "model_source" in event:
+        if "model" not in record or event["model_source"] not in ("configuration", "event"):
+            _invalid_work_event()
+        record["model_source"] = event["model_source"]
+    if "reasoning_effort_source" in event:
+        if ("reasoning_effort" not in record
+                or event["reasoning_effort_source"] not in ("configuration", "event")):
+            _invalid_work_event()
+        record["reasoning_effort_source"] = event["reasoning_effort_source"]
 
     if "usage" in event:
         usage = event["usage"]
@@ -222,6 +270,11 @@ def _sanitize_work_event(project, event, provenance, now, *, preserved_receipt=N
         record["usage_scope"] = event["usage_scope"]
     elif "usage_scope" in event:
         _invalid_work_event()
+
+    if "usage_estimated" in event:
+        if "usage" not in record or not isinstance(event["usage_estimated"], bool):
+            _invalid_work_event()
+        record["usage_estimated"] = event["usage_estimated"]
 
     expiry_limit = min(event_time, receipt) + timedelta(seconds=120)
     if "expires_at" in event:

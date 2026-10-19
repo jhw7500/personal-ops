@@ -47,6 +47,9 @@
   const WORK_BEAT_SECONDS = 0.3;
   const RECORDED_WORK_BEAT_SECONDS = 1;
   const REPLAY_ENTRY_DELAY_SECONDS = 0.16;
+  const STAGGER_ENTRY_SECONDS = 0.4;
+  const ROOM_CAPACITY = 6;
+  const DEPARTURE_HOLD_SECONDS = 1;
 
   function slot(roomId, index) {
     const room = ROOM_BY_ID.get(roomId);
@@ -109,6 +112,14 @@
   function entryRoute(roomId, destination) {
     const points = [];
     enterRoom(points, roomId, destination);
+    return points;
+  }
+
+  function departureRoute(state) {
+    const points = [];
+    if (state.displayRoom) leaveRoom(points, state.displayRoom, state.x, state.y);
+    else addPoint(points, state.x, WORLD.hallY, null);
+    addPoint(points, WORLD.entry.x, WORLD.entry.y, null);
     return points;
   }
 
@@ -184,6 +195,30 @@
 
   function create() {
     const states = new Map();
+    const entryQueue = [];
+    let schedulerTime = 0;
+    let nextEntryAt = 0;
+
+    function removeQueuedEntry(id) {
+      const index = entryQueue.indexOf(id);
+      if (index >= 0) entryQueue.splice(index, 1);
+    }
+
+    function roomOccupancy(roomId) {
+      let count = 0;
+      for (const state of states.values()) {
+        if (state.displayRoom === roomId) count += 1;
+      }
+      return count;
+    }
+
+    function reservedEntries(roomId) {
+      let count = 0;
+      for (const state of states.values()) {
+        if (state.entryAdmissionRoom === roomId) count += 1;
+      }
+      return count;
+    }
 
     function updateFlags(state) {
       state.walking = state.wait <= 0 && state.route.length > 0;
@@ -203,10 +238,55 @@
       state.walking = false;
       state.replaying = false;
       state.replayTask = null;
+      state.departing = false;
+      state.entryPending = false;
+      state.entryAdmissionRoom = null;
+      state.deferredReplayTask = null;
+    }
+
+    function queueEntry(state) {
+      if (!state.entryPending) entryQueue.push(state.actor.id);
+      state.entryPending = true;
+      state.entryAdmissionRoom = null;
+      state.x = WORLD.entry.x;
+      state.y = WORLD.entry.y;
+      state.direction = 'e';
+      state.displayRoom = null;
+      state.route = [];
+      state.wait = 0;
+      state.walking = false;
+      state.replaying = false;
+      state.replayTask = null;
+      state.deferredReplayTask = null;
+      state.departing = false;
+    }
+
+    function releaseQueuedEntry() {
+      while (entryQueue.length > 0) {
+        const state = states.get(entryQueue[0]);
+        if (state && state.entryPending) break;
+        entryQueue.shift();
+      }
+      if (entryQueue.length === 0 || schedulerTime + 1e-9 < nextEntryAt) return false;
+      const state = states.get(entryQueue[0]);
+      const deferredReplay = state.deferredReplayTask;
+      const roomId = deferredReplay ? deferredReplay.sourceRoom : state.destination.room;
+      if (roomOccupancy(roomId) + reservedEntries(roomId) >= ROOM_CAPACITY) return false;
+      entryQueue.shift();
+      state.entryPending = false;
+      state.entryAdmissionRoom = roomId;
+      state.deferredReplayTask = null;
+      if (!deferredReplay || !startTaskReplay(state, deferredReplay)) {
+        state.route = entryRoute(roomId, state.destination);
+        state.wait = 0;
+        updateFlags(state);
+      }
+      nextEntryAt = schedulerTime + STAGGER_ENTRY_SECONDS;
+      return true;
     }
 
     function startLegacyReplay(state, index) {
-      if (!TERMINAL_STATES.has(state.actor.state)
+      if (state.departing || state.entryPending || !TERMINAL_STATES.has(state.actor.state)
           || !ROOM_BY_ID.has(state.actor.sourceRoom)
           || !ROOM_BY_ID.has(state.actor.room)) return false;
       const terminalDestination = slot(state.actor.room, index);
@@ -234,15 +314,25 @@
     }
 
     function startTaskReplay(state, task, force = false) {
-      if (state.actor.state !== 'idle' || !PERSISTENT_KINDS.has(state.actor.kind)
+      if (state.departing || state.entryPending || state.actor.state !== 'idle'
+          || !PERSISTENT_KINDS.has(state.actor.kind)
           || task.actorId !== state.actor.id
           || (!force && state.lastReplayTaskId === task.id)) return false;
       state.route = recordedTaskRoute(state, task, state.slotIndex);
       state.wait = 0;
       state.replaying = true;
       state.replayTask = copy(task);
+      state.deferredReplayTask = null;
       state.lastReplayTaskId = task.id;
       updateFlags(state);
+      return true;
+    }
+
+    function deferTaskReplay(state, task, force = false) {
+      if (!state.entryPending || state.departing || state.actor.state !== 'idle'
+          || !PERSISTENT_KINDS.has(state.actor.kind) || task.actorId !== state.actor.id
+          || (!force && state.lastReplayTaskId === task.id)) return false;
+      state.deferredReplayTask = copy(task);
       return true;
     }
 
@@ -256,7 +346,13 @@
     }
 
     function sync(actors, options = {}) {
-      const {initial = false, animate = true, replayIds = [], replayTasks = []} = options || {};
+      const {
+        initial = false,
+        animate = true,
+        replayIds = [],
+        replayTasks = [],
+        staggerEntries = false,
+      } = options || {};
       const replaySet = new Set(Array.isArray(replayIds) ? replayIds : []);
       const incoming = [];
       const present = new Set();
@@ -301,6 +397,11 @@
             walking: false,
             replaying: false,
             replayTask: null,
+            departing: false,
+            entryPending: false,
+            entryAdmissionRoom: null,
+            deferredReplayTask: null,
+            capacityGated: staggerEntries === true,
             lastReplayTaskId: null,
             displayRoom: null,
             destination: {room: candidate.room, x: destination.x, y: destination.y},
@@ -309,7 +410,12 @@
             slotIndex: index,
           };
           states.set(candidate.id, state);
-          if (initial || animate === false) {
+          if (animate === false) {
+            place(state, candidate.room, destination);
+          } else if (staggerEntries === true
+              && (!initial || ACTIVE_STATES.has(candidate.state))) {
+            queueEntry(state);
+          } else if (initial) {
             place(state, candidate.room, destination);
           } else if (candidate.kind === 'call' && TERMINAL_STATES.has(candidate.state)
               && replaySet.has(candidate.id)) {
@@ -325,10 +431,30 @@
 
         const destinationChanged = state.destination.room !== candidate.room
           || state.destination.x !== destination.x || state.destination.y !== destination.y;
+        const wasDeparting = state.departing;
         state.actor = actorCopy;
         state.slotIndex = index;
-        if (initial || animate === false) {
+        state.capacityGated = state.capacityGated || staggerEntries === true;
+        if (animate === false) {
+          removeQueuedEntry(candidate.id);
           place(state, candidate.room, destination);
+        } else if (state.entryPending) {
+          state.destination = {room: candidate.room, x: destination.x, y: destination.y};
+          if (candidate.state !== 'idle') state.deferredReplayTask = null;
+        } else if (initial && staggerEntries === true && ACTIVE_STATES.has(candidate.state)) {
+          queueEntry(state);
+        } else if (initial) {
+          place(state, candidate.room, destination);
+        } else if (wasDeparting) {
+          state.destination = {room: candidate.room, x: destination.x, y: destination.y};
+          state.route = state.displayRoom === candidate.room
+              && state.x === destination.x && state.y === destination.y
+            ? [] : routeBetween(state, candidate.room, destination);
+          state.wait = 0;
+          state.replaying = false;
+          state.replayTask = null;
+          state.departing = false;
+          updateFlags(state);
         } else if (state.replayTask && candidate.state !== 'idle') {
           preemptReplay(state, candidate.room, destination);
         } else if (destinationChanged) {
@@ -344,21 +470,24 @@
       if (!initial && animate !== false) {
         for (const [actorId, task] of latestTasks(replayTasks)) {
           const state = states.get(actorId);
-          if (state) startTaskReplay(state, task);
+          if (state && !deferTaskReplay(state, task)) startTaskReplay(state, task);
         }
       }
 
       for (const id of Array.from(states.keys())) {
-        if (!present.has(id)) states.delete(id);
+        const state = states.get(id);
+        if (!present.has(id) && !state.departing) {
+          removeQueuedEntry(id);
+          states.delete(id);
+        }
       }
+      if (animate === false && entryQueue.length === 0) nextEntryAt = schedulerTime;
+      releaseQueuedEntry();
       return snapshot();
     }
 
-    function advance(seconds) {
-      if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
-        return snapshot();
-      }
-      for (const state of states.values()) {
+    function advanceStates(seconds) {
+      for (const [id, state] of states) {
         let remaining = seconds;
         while (remaining > 0) {
           if (state.wait > 0) {
@@ -370,6 +499,8 @@
           }
           const target = state.route[0];
           if (!target) break;
+          if (state.capacityGated && target.displayRoom && !state.displayRoom
+              && roomOccupancy(target.displayRoom) >= ROOM_CAPACITY) break;
           const dx = target.x - state.x;
           const dy = target.y - state.y;
           const distance = Math.abs(dx) + Math.abs(dy);
@@ -377,6 +508,7 @@
             state.x = target.x;
             state.y = target.y;
             state.displayRoom = target.displayRoom;
+            if (target.displayRoom) state.entryAdmissionRoom = null;
             state.route.shift();
             state.wait = target.wait || 0;
             continue;
@@ -396,11 +528,36 @@
           state.x = target.x;
           state.y = target.y;
           state.displayRoom = target.displayRoom;
+          if (target.displayRoom) state.entryAdmissionRoom = null;
           state.route.shift();
           state.wait = target.wait || 0;
         }
         updateFlags(state);
+        if (state.departing && state.wait <= 0 && state.route.length === 0) {
+          states.delete(id);
+        }
       }
+    }
+
+    function advance(seconds) {
+      if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
+        return snapshot();
+      }
+      let remaining = seconds;
+      while (remaining > 1e-9) {
+        releaseQueuedEntry();
+        let step = remaining;
+        if (entryQueue.length > 0) {
+          const untilScheduled = nextEntryAt - schedulerTime;
+          step = untilScheduled > 1e-9
+            ? Math.min(step, untilScheduled)
+            : Math.min(step, 0.01);
+        }
+        advanceStates(step);
+        schedulerTime += step;
+        remaining -= step;
+      }
+      releaseQueuedEntry();
       return snapshot();
     }
 
@@ -415,11 +572,16 @@
         replaying: state.replaying,
         replayTask: state.replayTask ? copy(state.replayTask) : null,
         displayRoom: state.displayRoom,
+        ...(state.entryPending ? {entryPending: true} : {}),
+        ...(state.departing ? {departing: true} : {}),
       }));
     }
 
     function clear() {
       states.clear();
+      entryQueue.length = 0;
+      schedulerTime = 0;
+      nextEntryAt = 0;
       return snapshot();
     }
 
@@ -430,19 +592,52 @@
       }
       for (const [actorId, task] of latestTasks(tasks, requested)) {
         const state = states.get(actorId);
-        if (state) startTaskReplay(state, task, true);
+        if (state && !deferTaskReplay(state, task, true)) startTaskReplay(state, task, true);
+      }
+      return snapshot();
+    }
+
+    function depart(ids, options = {}) {
+      const {animate = true} = options || {};
+      const requested = new Set(Array.isArray(ids)
+        ? ids.filter(id => typeof id === 'string' && id.length > 0)
+        : []);
+      for (const id of requested) {
+        const state = states.get(id);
+        if (!state) continue;
+        removeQueuedEntry(id);
+        state.entryPending = false;
+        state.entryAdmissionRoom = null;
+        state.deferredReplayTask = null;
+        if (animate === false) {
+          states.delete(id);
+          continue;
+        }
+        if (state.departing) continue;
+        state.route = departureRoute(state);
+        state.wait = DEPARTURE_HOLD_SECONDS;
+        state.replaying = false;
+        state.replayTask = null;
+        state.departing = true;
+        updateFlags(state);
       }
       return snapshot();
     }
 
     function settle() {
-      for (const state of states.values()) {
+      for (const [id, state] of states) {
+        if (state.departing) {
+          states.delete(id);
+          continue;
+        }
         place(state, state.destination.room, state.destination);
       }
+      entryQueue.length = 0;
+      nextEntryAt = schedulerTime;
       return snapshot();
     }
 
-    return {sync, advance, snapshot, clear, replay, settle};
+    return {sync, advance, snapshot, clear, replay, settle, depart};
   }
 
   return {WORLD, ROOMS, slot, create};

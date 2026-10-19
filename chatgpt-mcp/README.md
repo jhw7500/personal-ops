@@ -6,12 +6,13 @@ SSH 호스트에 설치된 Serena를 OpenAI Secure MCP Tunnel에 연결한다.
 
 목적은 **일반 ChatGPT 채팅에서 판단·코드 작성·결과 설명을 하고, 호스트 MCP가
 파일 작업과 명령 실행을 수행**하는 것이다. ChatGPT Work 프로젝트를 사용할 필요는 없다.
-이 서버는 Codex/Claude 에이전트나 별도 추론 API를 호출하지 않는다.
-터널 API 키는 연결에 사용한다. 별도 에이전트의 중복 추론을 피할 수 있지만
+일반 파일·명령 작업은 별도 추론 API를 호출하지 않는다. 명시적으로 위임한 작업은
+등록된 Codex CLI를 호출하며 해당 계정의 모델 사용량을 소비한다. Claude 위임은 제공하지 않는다.
+터널 API 키는 연결에 사용한다. 필요한 작업만 Codex에 위임할 수 있지만
 ChatGPT 자체의 사용량이 없어지거나 전체 토큰 절감량이 보장되는 것은 아니다.
 1.2.0부터 격리된 셸·빌드·테스트 실행, 상태·로그·취소,
-Git 조회와 승인된 commit·push를 제공한다. PR 생성과 merge는 기존 네이티브
-리뷰 워크플로우에 넘기며 이 MCP가 직접 실행하지 않는다.
+Git 전용 도구는 조회와 승인된 commit·push를 제공한다. PR 생성과 merge는 기존 네이티브
+리뷰 워크플로우의 정책을 따른다. 기간제 호스트 실행도 해당 정책과 명시적인 작업 지시를 준수한다.
 1.4.0부터 별도 로컬 관리 화면, MCP 호출 타임라인, 레포별 영속 메모리를 제공한다.
 1.5.0부터 작업 목표·완료 항목·다음 작업, Git 변경 파일과 diff, 빌드·테스트 결과 및 새 채팅용 요약을 함께 제공한다.
 
@@ -22,10 +23,13 @@ ChatGPT <-> OpenAI Tunnel <-> tunnel-client <-> repository router
                                               +-> command -> sandbox -> job/log
                                               +-> Git -> approval/native workflow
                                               +-> project memory / activity
+                                              +-> host grant -> command / log
+                                              +-> Codex task -> isolated / host grant
 
 Browser <-> SSH local forwarding <-> admin HTTP (127.0.0.1:8765)
                                      |-> job/log/activity (read only)
                                      +-> project memory (read/write)
+                                     +-> host grant / revoke / task stop
 ```
 
 ## 로컬 MCP
@@ -60,6 +64,149 @@ python3 chatgpt-mcp/server.py --project /absolute/project/path
   `.git`과 `.env` 계열 경로도 제외한다.
   심볼릭 링크가 포함된 하위 트리의 재귀 검색은 거부되므로 더 좁은 경로를 지정한다.
   이는 OS 샌드박스가 아니며 외부 프로세스의 동시 파일 교체까지 차단하지는 않는다.
+
+## 등록형 호스트 명령
+
+호스트에서 수행하는 Toss TEST 빌드·업로드 등을 위해 등록형 Host Command Runner를 제공하는 소스가 추가되어 있다. 기존 start_command는 네트워크/호스트 HOME을 차단하는 격리 실행기이며, 별도 호스트 실행 권한으로 자동 승격되지 않는다.
+
+등록형 Host Command Runner는 관리자가 저장소 **밖**의 소유자 전용(0600) JSON 정책 파일에 고정한 실행 파일·SHA-256·인자·작업 폴더·입력 파일 SHA-256으로만 동작한다. 이 등록형 경로에서는 자유로운 셸 문자열·환경변수·Docker/DB 작업을 전송할 수 없다. 아래 기간제 호스트 권한 경로는 별도 기능이다.
+
+사용 흐름: list_host_command_profiles → prepare_host_command의 채팅 카드에서 일회용 승인 → execute_host_command → get_host_command / cancel_host_command. 기존 계획은 open_host_command_approval로 다시 열며, 이미 승인된 계획은 기존 영수증과 다음 실행을 반환한다. 관리자 페이지나 관리자 토큰 입력은 필요하지 않다. 승인 버튼만으로 명령이 시작되지 않는다. 외부 TEST 업로드 취소는 업로드를 되돌리지 않으며 불확실한 결과를 성공으로 판단하지 않는다.
+
+2026-10-16에 업로드 카드 보완본 `8c7a5aff0c75198c6c5d`를 운영에 반영했다. 전체 892개 검사, 설치본 도구 76개 등록·프로토콜 검사 3개, 실제 터널 프로필 조회와 관리 웹 HTTP 검증을 통과했다. ChatGPT 연결을 새로고침한 뒤 실제 업로드 카드 표시를 확인해야 한다. CLI 보존 검사에서는 전환 직전 살아 있던 Claude 프로세스 1개의 사후 종료가 관측됐으며 원인은 미확인이다. [업로드 채팅 승인 인계](../docs/handoffs/2026-10-16-host-command-inline-approval.md)를 참조한다.
+
+2026-10-15 기준 운영 런타임 `ce88340086af9f5e1bf2`에 다섯 도구가 등록되어 있고, `tossApp`에는 다음 두 프로필이 활성화되어 있다.
+
+| Profile | Command | Scope |
+| --- | --- | --- |
+| `tossapp-deploy-test` | `tossApp-deploy test` | Build + TEST upload + SELF invitation |
+| `tossapp-upload-test` | Pinned upload wrapper | Existing .ait upload only |
+
+`tossapp-deploy-test`는 기존 호스트 스크립트 `~/.local/bin/tossApp-deploy`와 고정 인자 `test`를 그대로 실행한다. 승인 후 타입 검사·프런트 빌드·새 `.ait` 생성·업로드·본인 초대장 발송을 한 작업으로 진행한다. 호스트의 기존 토스 OAuth 연결을 사용하므로 웹 대화에 토스 콘솔 플러그인을 추가할 필요는 없다. 실행 파일 해시와 빌드 설정 입력 10개의 해시를 검증하며, 해당 설정을 바꾸면 관리자가 프로필 해시를 갱신해야 한다. 설정 입력은 그룹·다른 사용자의 쓰기 권한이 없어야 한다.
+
+이전 고정 번들 프로필은 `tossapp-upload-test`로 보존했다. 이 프로필은 이미 만들어진 특정 `.ait`만 업로드하며 빌드·발송을 수행하지 않는다. 전체 실행 프로필은 사용자 실행 승인 후 실제 터널 MCP로 빌드·TEST 업로드·본인 초대장 발송까지 완료했다. 새 버전 `20261015-23`의 콘솔 컴파일 성공(`CREATED`)과 `isTested=true`, 종료 코드 0·프로세스 종료 확인을 검증했다. 상세 결과는 [전체 TEST 배포 결과](../docs/handoffs/2026-10-15-tossapp-full-test-deployment.md), [프로필 정정 인계](../docs/handoffs/2026-10-15-tossapp-deploy-profile-correction.md)와 [Host Command Runner 인계](../docs/handoffs/2026-10-14-host-command-runner.md)를 참조한다.
+
+## 기간제 호스트 권한과 기존 Codex 호출
+
+호스트 명령 기능은 운영 런타임에 반영했다. 런타임 설치와 사용자 권한 부여는 별도이며,
+실제 허용 상태는 `get_host_access`로 확인한다.
+
+`request_host_access(project)`는 권한 요청만 만든다. 기존 관리 화면에서 호스트·사용자·UID·그룹,
+파일·네트워크·그룹 접근 범위, 유효 기간과 Codex 사용 동의를 확인하고 소유자가 승인한다.
+기본 기간은 4시간, 최대 기간은 8시간이며 자동 갱신하지 않는다. 관리 화면의 승인은 loopback 또는
+등록된 Tailscale HTTPS 주소에서 새 관리 토큰으로 인증한다. LAN HTTP 화면은 조회에 사용한다.
+`get_host_access`에서 실제 활성 상태를 확인한다.
+
+호스트 권한용 채팅 승인 카드는 운영 반영했으며 실제 ChatGPT에서 표시·승인을 확인했다.
+`open_host_access_approval(project, duration_seconds?, allow_codex?)`가 카드를 열면
+호스트·사용자·작업 시작 위치·접근 범위·기간·Codex 동의를 확인하고 **승인**을 누른다.
+카드를 여는 요청이나 프롬프트의 “승인” 문장만으로 권한이 발급되지는 않는다.
+기본 기간은 4시간, 최대 8시간까지 선택할 수 있다. Codex 동의는 기본 꺼짐이며 카드에서 변경할 수 있다.
+카드에는 관리 토큰을 넣지 않는다. 기존 관리 웹은 복구 경로로 유지한다.
+
+확인값은 결과 `_meta`로 신뢰한 MCP 호스트/컴포넌트에만 전달하며 모델용 응답·위젯 상태·
+로그에는 저장하지 않는다. 앱 전용 확인 도구는 이 일회용 값과 프로젝트·런타임·재부팅·
+사용자·작업 경로가 일치해야 동작한다. 카드 유효 기간은 10분이며 옵션 변경은 확인값을
+교체하지만 유효 기간을 늘리지 않는다. 같은 프로젝트의 새 카드를 열면 이전 카드가
+무효화된다. 취소는 해당 요청을 없애며 이미 활성화된 권한을 철회하지 않는다.
+응답이 유실되면 자동 재승인하지 말고 `get_host_access`로 결과를 확인한다.
+
+앱 전용 도구 표시 설정 자체는 인증이 아니다. 이 흐름은 인증된 터널의 MCP 호스트와
+카드 컴포넌트를 신뢰하며, 이를 제어하는 호출자는 같은 신뢰 경계 안에 있다.
+카드 클릭을 별도의 호스트 소유자 계정 인증으로 해석하지 않는다. 기존 관리 웹의
+새 토큰 인증 정책은 그대로 유지한다.
+
+권한은 선택 프로젝트를 사용하는 **이 MCP 설치의 모든 호출자**에 적용된다. 대화별 권한이 아니다.
+`project`와 `cwd`는 시작 위치를 선택하며 파일시스템 격리가 아니다. 실제 호스트 계정의
+파일·네트워크·그룹 접근 권한을 사용한다. Docker/sudo 그룹은 화면에 실제 값으로 표시하며,
+sudo 그룹 가입이 비밀번호 없는 sudo를 보장하지 않는다. 같은 UID에 대한 공격 방어,
+DB/Docker 제외, 외부 효과의 취소·롤백을 보장하지 않는다.
+
+기간 안에서는 `start_host_execution`에 실행 파일 절대 경로·`argv`·상대 `cwd`·`request_id`를
+전달해 명령마다 프로필을 등록하거나 승인을 다시 받지 않고 실행한다. 상태는
+`get_host_execution`, 일반 명령의 제한된 마스킹 로그는 `read_host_execution_log`,
+취소는 `cancel_host_execution`으로 확인한다. 마스킹은 알려진 관리 토큰·키와 일부 토큰
+패턴에 대한 최선의 처리이며 모든 비밀을 탐지하는 보장이 아니다. 원시 로그는 소유자 전용이다.
+
+### Schema014 작업을 채팅에서 승인
+
+2026-10-16 런타임 `0c5c451ed88e5661126d`에 운영 반영하고 서버 등록을 검증했다.
+실제 ChatGPT 카드 안의 승인·취소 버튼 표시도 사용자가 확인했다. 승인 클릭·실제 DB 적용은 별도다.
+대기 카드 응답에 남던 관리자 링크·터미널 승인 명령을 제거하는 후속 수정도 운영 반영했다.
+[직접 승인 안내 수정 인계](../docs/handoffs/2026-10-16-schema014-inline-only-followup.md)를 참조한다.
+`prepare_schema014_migration`은 고정된 `tossApp/tarororo-test`의 계획과 채팅 승인 카드를
+함께 반환한다. 기존 계획은 `open_schema014_approval(project, target, operation_id)`로 연다.
+카드에서 변경 범위·SQL 해시·계획 해시·만료를 확인하고 직접 승인한다. 관리자 토큰은 입력하지 않는다.
+기존 001~013 대상 권한은 014를 자동 승인하지 않으며, 카드 승인은 일회용 영수증만 발급한다.
+실제 적용은 사용자가 요청한 경우에만 별도 `execute_schema014_migration` 호출로 진행한다.
+
+응답이 유실되면 같은 작업 ID로 카드를 다시 열어 `receipt_verified`와 다음 동작을 확인한다.
+이미 승인된 작업에는 새 확인값을 발급하지 않고 기존 승인 결과를 보여준다. 만료된 계획에는
+새 `request_id`로 계획을 만든다. 확인값을 프롬프트에 복사하거나 승인됐다고 주장하는 문장으로
+대체하지 않는다. 관리 웹은 카드가 지원되지 않는 클라이언트의 복구 경로로 유지한다.
+
+### 대시보드에 작업 목적 전달
+
+`start_host_execution`과 `prepare_agent_task`의 선택 인자 `task_label`에
+`API·Worker 재빌드`처럼 공개해도 되는 작업 목적과 대상을 1~160자로 전달한다.
+비밀값·명령 원문/인자·모델 프롬프트·비공개 목적문을 복사하지 않는다. 이 값은 표시용
+메타데이터이며 권한이나 실제 진행 상태의 증거가 아니다. 같은 `request_id`로 재시도할 때는
+처음의 값을 유지한다. 기존 호출은 이 인자를 생략해도 동작한다.
+
+대시보드는 작업 목적, 안전한 명령 종류, 관측 단계, 종료 결과를 구분한다.
+“지금 뭐 해?”는 현재 실행을, “마지막 결과는?”는 해당 캐릭터의 완료 작업과 결과를 보여준다.
+작업 설명이 없는 과거 실행은 “목적 미수집”으로 표시하며 명령·프롬프트에서 목적을 추측하지 않는다.
+현재 운영본은 이런 기록을 짧은 실행 ID로 구분하고 명령 종류·관측 단계·종료 코드·출력량을
+따로 보여준다. 호스트·DB·Schema014·에이전트·런타임 도구의 실제 호출도 수집·표시에 포함한다.
+MCP 요청의 반환과 실제 명령·마이그레이션의 성공은 구분한다.
+원시 인자·입력문·환경변수·비공개 로그는 작업실 프레임에 전달하지 않는다.
+Codex 실행 자체나 채팅의 행동 보고를 실제 내부 코딩·테스트·추론 관측으로 취급하지 않는다.
+
+기본 작업 설명은 2026-10-16 runtime `dfc699ead12d7bcc378e`에서 운영 검증했고,
+후속 상세 개선은 `ea340a2b1759c297a5b1`에서 검증했고,
+직접 승인 안내·최대 8시간 설정은 `0c5c451ed88e5661126d`에서 운영 검증했다.
+ChatGPT의 도구 정의 새로고침과 변경된 호스트 권한의 사용자 재승인은 별도 단계다.
+최신 구현·검증·배포 상태는 [채팅 승인·작업 상세 인계](../docs/handoffs/2026-10-16-chat-schema014-dashboard-details.md)를 참조한다.
+
+Codex는 기존 호출 순서를 유지한다:
+
+```text
+request_host_access -> owner grants access + Codex usage
+prepare_agent_task -> start_agent_task -> get_agent_task
+                                      -> cancel_agent_task
+```
+
+`prepare_agent_task.execution_mode`는 `auto`(기본), `host`, `isolated` 중 하나다.
+`auto`는 유효한 Codex 위임 동의가 포함된 권한이 있을 때 호스트 실행을 선택하고,
+없으면 기존 격리 검토 및 일회용 승인 흐름을 따른다. `host`는 실제 체크아웃을
+편집·실행할 수 있으며 만료·철회된 권한으로 시작하지 않는다. `isolated`는
+기존 격리 증명 검사에 실패해도 호스트 실행으로 전환하지 않는다.
+
+모델과 추론 수준은 기존 호스트 소유 프로필에서 고정한다. 현재 등록값은
+`codex-tossapp-review`의 `gpt-6.1-sol` / `high`이다. 프로필의 `ready`/`reason`은
+격리 실행 상태이고, 권한이 활성화되면 추가되는 `host_ready`/`host_reason`은
+별도의 호스트 실행 상태이다. 호스트 실행은 오래된 격리 증명이나 CAS를 정상으로 바꾸지 않는다.
+전용 임시 CLI를 실행하고 기존 사용자 세션을 resume하거나 종료하지 않는다.
+
+권한 부여만으로 모델을 호출하지 않는다. Codex 동의는 전용 위임 도구를 허용하는 설정이며
+범용 호스트 셸의 모델 호출이나 사용량을 기술적으로 제한하는 장치는 아니다.
+작업별 시간 제한은 사용량 상한이 아니다. 응답의 사용량은 공급자가 실제 보낸 값이고,
+모델의 완료 보고·테스트 주장은 독립적인 기능 검증과 구분한다. Codex 원시 JSON 로그의
+추론·프롬프트 내용은 공개 로그 도구로 반환하지 않는다.
+
+권한 만료·철회는 새 시작을 차단하고 기록된 실행 범위의 중단을 요청한다. 재부팅이나
+호스트 실행·승인·로그인·메시지 경계 코드의 변경 후에는 권한이 무효화된다. 전체 설치
+manifest의 파일 무결성은 계속 검사하되, 격리된 작업실의 표시 자산 다섯 개만 변경한
+배포에서는 기존 승인 ID·만료 시각·Codex 동의를 유지한다. 관리자 페이지는 해당 코드나
+CSS를 직접 로드하지 않으며, 토큰 없는 opaque-origin sandbox iframe에 공개 작업 상태만
+전달한다. 새 파일은 기본적으로 권한 식별에 포함한다. 이 정책의 최초 전환에는 한 번
+재승인이 필요하며 기존 권한을 자동 이전하거나 연장하지 않는다.
+
+이 정책은 소스 구현을 설명한다. 실제 적용 여부는
+[대시보드 운영 인계](../docs/handoffs/2026-10-15-dashboard-operations-stage1.md)의 5차 기록을
+확인한다. 이미 적용한 파일·DB 변경, 업로드 또는 별도로 시작한 서비스는 자동 복구되지
+않는다. 기존 등록형 명령과 Docker/DB 도구는 각자의 승인 정책을 유지하므로 같은 작업을
+두 경로에서 중복 실행하지 않는다.
 
 ## 셸·빌드·테스트 실행
 
@@ -354,6 +501,59 @@ UI는 단일 HTML MCP 리소스이며 외부 스크립트·서버·새 패키지
 
 [OpenAI 도구 상태 메타데이터](https://developers.openai.com/plugins/reference#_meta-fields-on-tool-descriptor)
 
+## tossApp DB 006~012 전용 마이그레이션
+
+2026-10-13: 기존 013 전용 HostRuntime과 별도로 006~012 전용 읽기·계획·실행
+경로를 구현했다. 아래 범위 활성화·Git HEAD 조건은 고정 legacy 설정의 계약이다.
+등록형 v3의 `reviewed_snapshot` 흐름은 하단의 단순화 설명을 따른다.
+현재 ChatGPT 플러그인의 실행 중 도구 목록에는 소스 변경이 자동 반영되지 않는다.
+런타임 설치 이력은 `docs/handoffs/2026-10-13-chat-host-operations-stage1.md`에서 확인한다.
+
+- `get_predecessor_migration_status`: 001~013 이름/파일 SHA-256의
+  `missing | checksum_match | checksum_mismatch`, 14개 선행 테이블과
+  충돌 후보 객체의 존재 여부만 `BEGIN READ ONLY`로 진단한다.
+  사용자·주문/기타 업무 행은 조회하지 않는다.
+- `prepare_predecessor_migration`: 001~005 정확한 체크섬, 006~013 모두
+  미적용, 기존 006~012 객체 충돌 없음, 추가 이력 없음, DB 세대와 소스 고정,
+  검토된 high-risk 입력이라는 조건을 충족할 때만 10분 유효 계획을 만든다.
+  백업·DDL·재시작·서비스 배포를 수행하지 않는다.
+- `execute_predecessor_migration`: 기본 작업별 승인 정책에서는 **별도 로컬 관리자 인증 후 작업 ID
+  입력으로 발급받은 1회 승인 영수증**이 있어야 실행할 수 있다.
+  고정 테스트 DB에서 백업 → 일회용 DB 복원 검증(기존 이력 5개)
+  → 잠금 및 이력/객체/DB 세대 재검증 → 006~012 단일 트랜잭션
+  → 결과 검증을 수행한다. 실패 시 자동 복원·재시도하지 않으며 백업을 보존한다.
+- `execute_db_migration`: 기본 정책에서는 **013 전용 별도 계획·별도 승인**을 요구한다.
+  아래의 대상별 사전 허용 정책에서는 006~013 통합 계획도 실행한다.
+  `execute_test_deploy`는 API/Worker로 제한한다. 도구 간 작업 ID 혼용을
+  `WRONG_OPERATION_TYPE`으로 거부한다.
+
+tossApp의 `server/src/db/migrate-predecessors.ts`는 전용 Node 진입점이다.
+일반 `npm run db:migrate`는 013까지 시도할 수 있으므로 선행 적용에 사용하면 안 된다.
+호스트는 변경 가능한 Node/Compose 스크립트를 실행하지 않고, 검토된 SQL 파일의
+SHA를 고정한 불변 호스트 실행기를 사용한다. **006~012 SQL 7개는 전용
+고위험 검증 대상**이다. 고정 legacy/`git_head` 정책에서는 Git HEAD에 실제로
+추적되고 내용이 일치해야 한다. 등록형 `reviewed_snapshot`에서는 미추적 SQL도
+개인 스냅샷에 고정하고 관리 웹에서 그 바이트와 변경 자료를 검토·승인한다.
+다른 세션의 미커밋 소스를 강제로 stage/commit/reset하는 행위는 금지한다.
+고정 legacy의 기본 v2 권한(Worker·013)으로 006~012를 활성화하지 않는다. 고정 v3 권한은 관리 화면의
+별도 `ENABLE DB 006-012`과 관리자 재인증 후에만 활성화되며,
+v3 활성화 자체로 DB를 변경하지 않는다. 실제 적용은 또 다른 단일 작업 승인이다.
+백업을 임시 DB에 복원할 때는 001~005 이력의 개수뿐 아니라 이름·SHA-256까지
+일치해야 한다. 승인 화면은 각 006~012 SQL 체크섬과 DB 세대를 표시한다.
+고정 legacy/`git_head`에서는 소스가 미커밋이거나 고위험 입력이 변경 중이면
+계획 생성이 거부된다. 등록형 `reviewed_snapshot`에서는 계획을 만들 수 있지만,
+실제 실행은 기본적으로 관리 웹 또는 호스트 TTY의 별도 단일 작업 승인이 필요하다.
+대상별 사전 허용을 켠 경우에는 아래의 정책을 따른다.
+커밋/설치/터널 갱신은 별도 승인과 검증이 필요하다.
+
+검증: tossApp 일회용 PostgreSQL 전체 통합 **113/113**(종료 0),
+서버 단위 **204/204**(종료 0) 및 타입 검사 통과.
+HostRuntime·승인·백업 모의 테스트 **55/55**(종료 0) 통과.
+JS 정적 검사는 격리 시스템의 오래된 Node가 기존 `??` 문법을 파싱하지 못해 미검증이다.
+MCP 라우터 실제 stdio 통합 검증은 격리 Python에 `mcp` 패키지가 없어 미실행이다.
+실호스트 DB의 001~005/006~012 실제 적용·동작 검증과 불변 런타임
+도구 목록/웹 승인 UI 확인은 미실행이다.
+
 ## 터널 연결
 
 1. [Platform Tunnels](https://platform.openai.com/settings/organization/tunnels)에서
@@ -590,6 +790,301 @@ Host/Origin 검사를 받는다. 본문은 `{"events":[...]}`이며 원격 입�
 명시적인 `reason` 이벤트에만 추론 동작을 표시한다. ChatGPT 모델·추론을 자동으로 읽는 기능은 없으며
 Codex·Claude의 후크 수집기는 아직 활성화하지 않았다. 형식과 확장 경계는
 [업무 작업실 수집 계약](../work-dashboard/README.md#다른-mcp와-에이전트-수집)을 따른다.
+
+## Host Runtime Management — Toss 테스트 API 전용 (P0, 코드 구현)
+
+설계 원본: [2026-10-12 Host Runtime Management 명세](../docs/superpowers/specs/2026-10-12-host-runtime-management.md).
+
+**현재 저장소 코드만으로 실제 Docker가 변경되지는 않는다.** 새 MCP 도구 5개는
+기존 격리 `start_command`와 독립된 호스트 관리 경로다.
+
+| 도구 | 주요 동작 |
+|---|---|
+| `get_runtime_status` | tarororo-test의 API·Worker·DB 및 안전하게 분류된 설정·스키마 조회 |
+| `compare_deployment` | 빌드 입력 digest·Git 상태·이미지 ID 비교; 증빙 없으면 `UNKNOWN` |
+| `prepare_test_deploy` | 소스와 실제 Docker 대상 고정, 만료 10분의 승인 계획 생성 |
+| `execute_test_deploy` | 호스트 **실제 TTY**에서 생성한 1회 영수증을 확인한 후 API만 빌드/재생성 |
+| `get_host_operation` | 작업 단계·상태 조회; 중단/결과 불명은 `outcome_unknown` |
+
+기본값은 **OFF**. 별도의 사용자 소유 일반 파일
+`~/.config/chatgpt-coding-mcp/host-runtime.json`(0600)에 정확한 구성을 작성하고
+`enabled=true`로 바꾼 뒤에만 도구가 호스트를 조회·관리한다. 실제 설정은
+[명세 2.1](../docs/superpowers/specs/2026-10-12-host-runtime-management.md#21-구성-파일-제안)의
+타깃을 그대로 사용한다. `project=tossApp`, `target=tarororo-test`만 지원한다.
+`enabled=false`, 파일 부재/불일치, 심볼릭 링크, 다른 프로젝트 요청은 거절된다.
+이 구성 파일은 저장소에 추가하지 않는다.
+
+`prepare_test_deploy`는 **실제 소스 바이트·파일 모드·untracked 파일·Compose 정의와
+현재 API/Worker/DB의 ID**를 고정하고, 쓰기 가능한 레포가 아닌 전용 0700
+개인 작업 디렉터리에 Docker context를 복제한다. 일반 Git HEAD가 같다는 이유로
+배포를 생략하거나 수정되지 않았다고 판정하지 않는다. 승인 후에는 원본과 복제본
+두 벌의 fingerprint, Compose, 대상 컨테이너 ID·시작 시각을 다시 검사한다.
+소스 변경은 `STALE_PLAN`으로 종료한다. Dockerfile·Compose·배포 관리 스크립트·
+패키지/잠금 파일·결제 정책 JSON 등 고위험 빌드 입력은 `git status`만 믿지 않고
+고정 legacy/`git_head`에서는 Git HEAD의 실제 blob 및 index flag와 비교한다. 미커밋·`assume-unchanged`·
+`skip-worktree`로 은폐한 변경이 있으면 `REVIEW_REQUIRED`로 배포 계획을 거부한다.
+
+계획 ID와 소스 해시를 **관리 웹에서 사람이 검토·승인**하거나, 계획 결과의
+`approval_command`를 실제 호스트 TTY에서 직접 실행하고 계획 ID를 입력해야 한다.
+채팅의 승인 문구, `approved=true`, Git 승인 영수증은
+배포 권한이 아니다. 별도 `approve-host-operation.py`는 설치된 불변 런타임에서만
+실행하며 단일 nonce와 plan digest를 소모한다. API 외 재생성, 실결제 활성화,
+DB migration/seed, Docker 정리, Tailscale 제어, 비밀키/사용자 데이터 반환은
+허용하지 않는다. 불확정 결과는 자동 재시도하지 않는다.
+
+테스트 코드는 `chatgpt-mcp/tests/test_host_runtime.py`에 있으며 fake Docker
+runner/임시 private context를 사용한다. 실제 Docker, 토스 콘솔, Gemini API를
+호출하지 않는다. 실행은 `python3 -m unittest -v tests.test_host_runtime`
+(`chatgpt-mcp/`에서)로 검증한다. 기존 MCP 전체 회귀 및 불변 runtime 파일
+목록 검증을 별도로 수행해야 한다.
+
+**소스 편집과 운영 반영은 별개의 승인을 요구한다.** 실제 터널은
+`install-runtime.py`가 생성한 불변 스냅샷을 사용하므로 소스 수정만으로
+신규 도구가 나타나지 않는다. 승인 후에만 스냅샷 설치·터널 재연결과
+`host-runtime.json` opt-in을 진행한다. 이 P0 코드는 **실호스트 배포 결과가
+검증되었다는 근거가 아니며**, 토스 앱의 광고 5/5/30초 재생은 별도 실기기
+확인을 거쳐야 한다.
+
+
+### Host Runtime 최초 활성화 (호스트에서 1회)
+
+설정 파일이 없어 `get_runtime_status`가 `availability: disabled`를 반환한다면,
+저장소 루트에서 다음 명령을 **호스트의 대화형 터미널에서만** 실행한다.
+
+```sh
+python3 chatgpt-mcp/configure-host-runtime.py --enable
+```
+
+대상 `tossApp/tarororo-test`를 확인한 뒤 `ENABLE`을 직접 입력한다.
+설정은 `~/.config/chatgpt-coding-mcp/host-runtime.json`에 소유자 전용(0600)으로
+생성하며 다른 Docker 타깃, 일반 명령 실행, DB 쓰기를 허용하지 않는다.
+MCP 격리 명령, 파이프나 비대화형 호출에서 활성화할 수 없다.
+기존 설정이 잘못되었거나 권한이 안전하지 않으면 변경하지 않고 거부한다.
+설정은 호출할 때 읽으므로 도구가 이미 등록된 경우 별도 코드 재설치는 필요 없다.
+단, 기존 설치 스냅샷에 해당 도구가 없는 경우에는 검토와 재설치·터널 재연결이 필요하다.
+API 배포는 이후에도 각 작업에 별도 실제 호스트 TTY 승인이 필요하다.
+로컬 승인 UI/원격 승인 프로토콜은 아직 구현되지 않았으며 채팅 메시지를 호스트 승인으로 간주하지 않는다.
+
+### Host Runtime 확장 — DB 013, Worker 및 로컬 웹 승인 (추가 구현)
+
+현재 저장소에는 다음 기능을 추가했다. **소스 구현/모의 테스트 결과와 실제
+호스트 설치·Docker 변경은 구분한다.** 설치된 런타임 snapshot과 독립
+admin HTTP 프로세스는 소스 파일 저장만으로 바뀌지 않는다.
+
+- `get_db_migration_status(project=tossApp,target=tarororo-test)`는 001~012
+  선행 체크섬 일치 개수, 013 이력/원본 해시, 필수 테이블 네 개의 존재 및
+  대상 DB 컨테이너 정체성만 반환한다. 읽기 전용 SQL이며 행 데이터/비밀번호는 반환하지 않는다.
+- `prepare_db_migration(request_id=...)`는 **013 하나만** 대상으로 하며
+  선행 12개 마이그레이션 체크섬 완전 일치, 013 미적용 및 필수 테이블 부재를 요구한다.
+  소스/도커 정체성과 10분 승인 계획을 고정한다. 승인된 `execute_test_deploy`
+  실행에서 별도 private 디렉터리에 `pg_dump -Fc`를 스트리밍 백업(최대 512MiB),
+  `pg_restore --list` 검사에 이어 기존 `tarororo-test` PostgreSQL 인스턴스 안에
+  작업 ID 전용 임시 DB(`tarororo_restore_<id>`)를 생성해 백업을 실제 복원한다.
+  `--exit-on-error --single-transaction` 복원과 12개 이전 마이그레이션 이력을 확인한 후
+  임시 DB 삭제까지 성공해야 동일 DB 컨테이너 재검증 및 013 트랜잭션을 진행한다.
+  임시 DB에는 실제 데이터가 잠시 복원되므로 해당 테스트 DB 호스트의 디스크·CPU 여유를
+  검토해야 한다. 생성한 임시 DB의 제거가 실패하면 013 적용을 중지하고 조사한다.
+  **기존 테스트 DB 자동 복원/재실행은 없다.** 모의 단위 테스트만으로 실호스트의
+  `pg_dump`/`pg_restore` 동작을 검증한 것은 아니다.
+- `prepare_test_deploy(component=worker,mode=disabled,...)`는 승인 이후
+  전용 Worker 이미지와 컨테이너만 교체한다. API/DB 정체성이 바뀌면 실패한다.
+  Worker 계획은 현재 API가 disabled 모드일 때만 지원한다.
+- 기존 v1 `host-runtime.json`은 **API 전용**으로 남는다.
+  관리 UI에서 별도 `ENABLE WORKER AND DB 013` 문구와 관리자 토큰
+  재인증으로 정확한 v2 설정으로 승격해야 Worker/013 계획을 만들 수 있다.
+  실제 개별 작업은 각자 별도 승인 영수증을 요구한다.
+- 로컬 관리 화면 `http://127.0.0.1:8765/`의 “테스트 배포 승인” 영역은
+  계획 ID/모드/소스 fingerprint/영향 서비스/만료시각을 표시한다.
+  개별 승인 요청은 localhost 또는 현재 호스트에 고정 등록된
+  `https://cantopsbuildserver.tail661d29.ts.net:8443` (Tailscale Serve)
+  Origin만 허용한다. 같은 Origin의 브라우저 POST, 관리자 토큰 재인증,
+  정확한 작업 ID 재입력을 모두 요구하고 단일-use 영수증만 저장한다.
+  임의 도메인/HTTP/다른 LAN 리스너 및 기타 공개 프록시에서는 승인 불가하다.
+  **배포 실행은 별도 `execute_test_deploy` 호출이 필요하다.**
+  Tailnet에서만 접근 가능한 HTTPS 관리 화면을 대상으로 한다.
+
+실제 적용 전 `python3 -m unittest -v tests.test_host_runtime
+tests.test_admin_host_approval` 및 전체 MCP 회귀, 코드 보안 리뷰,
+백업 복원 테스트, Compose/DB 대상 확인을 실행한다.
+`install-runtime.py`로 불변 snapshot을 새로 설치하고 터널 실행 경로·관리 HTTP
+프로세스를 **새 설치 경로로 전환·재시작**해야 신규 도구·UI가 사용 가능하다.
+원본 레포 변경만으로 실행 중 서버가 재시작되지 않는다.
+
+### 터널 런타임 단계적 전환 — 호스트 1회 명령
+
+저장소에서 소스 검토 후, 로컬 호스트의 대화형 터미널에서 다음 명령 하나로
+테스트→스냅샷 검증→터널 연결 갱신을 수행한다.
+
+```sh
+python3 chatgpt-mcp/rollout-host-runtime.py --apply
+```
+
+프로그램은 `personal-ops-coding` alias의 `tunnel-client runtimes status --json`에서
+기존 터널 ID를 읽고, `~/.config/chatgpt-coding-mcp/runtime-key`의 존재·권한만
+확인한다. 키 본문·터널 ID를 출력하지 않는다. 소스 파일 digest를 검증하고
+관련/전체 unittest가 모두 통과해야 불변 릴리스를 설치한다.
+호스트에서 `ROLLOUT` 확인 후 현재 터널 alias를 새 `server.py`로 전환한다.
+아무런 Docker 재시작, DB 적용 또는 배포 승인은 수행하지 않는다.
+
+`--apply`가 없으면 진단·테스트만 한다. 안전 검사 실패 시 설치/연결을
+진행하지 않는다. 구 CLI가 ID를 출력하지 않는 경우에는 자동 전환을
+중단한다. 필요할 때만 `--tunnel-id`로 기존 ID를 전달할 수 있으며
+`status`에서 발견한 ID와 다르면 거부한다. 전환 뒤 `status`가
+`ready`가 아니면 성공으로 보고하지 않는다.
+
+**관리 대시보드는 별도 HTTP 프로세스다.** 원스텝 rollout은 이미 설치된
+`personal-ops-admin.service`의 `ExecStart`가 인지된 Python
+`admin_server.py` 명령인 경우에만 원래 port/config/origin/LAN 인자를
+보존하는 systemd 사용자 drop-in을 적용한다. `daemon-reload`→restart→
+`is-active`→루프백 HTML의 신규 승인 UI 확인까지 성공해야
+`admin_ready`로 보고한다. 재시작·검증 실패 시 기존 drop-in을 복원하고
+이전 서비스를 재시작하며, 식별 불가능한 서비스는 변경하지 않는다.
+따라서 rollout 결과 `verification_required` 또는
+`admin_status=manual_review_required`는 관리 화면이 새 UI로
+교체됐다는 뜻이 아니다. 새로운 MCP 도구 목록도 플러그인 새로고침 후
+재조회해야 한다.
+
+### 관리 웹에서 승인하는 런타임 업데이트
+
+`prepare_runtime_rollout(project="personal-ops", request_id=...)`로 소스·검사 파일과
+대상 런타임을 고정한다. 반환된 HTTPS 승인 링크를 열고 관리 웹에 로그인하면
+해당 계획을 조회한다. 계획 ID와 관리 토큰을 다시 입력해 승인한 뒤,
+채팅에서 `execute_runtime_rollout(project="personal-ops", operation_id=...)`을
+호출한다. 승인을 누르는 것만으로 설치나 재시작이 시작되지는 않는다.
+진행과 결과는 `get_runtime_rollout`으로 확인한다.
+
+승인은 10분 동안 한 번만 사용할 수 있다. 소스가 달라지면 기존 승인은 사용할 수 없다.
+실행기는 별도 사용자 systemd unit에서 동작하며, 터널과 관리 웹만 전환한다.
+DB·Docker·API·Worker·Toss 업로드는 이 승인의 대상이 아니다.
+중단 후 결과를 확정할 수 없는 작업은 `outcome_unknown`으로 남고 자동 재실행하지 않는다.
+
+새 웹 도구가 없는 설치본은 기존 SSH/TTY `ROLLOUT` 절차로 먼저 설치해야 한다.
+2026-10-16 별도 승인 후 통합 보완본 `5c725c7a6d4ef86b9759`/80파일을 활성화했고,
+실제 관리 웹과 플러그인 읽기 연결을 검증했다. ChatGPT 도구 목록 갱신은 별도 확인 대상이다.
+기존 권한 기록은 보존하며, `RUNTIME_CHANGED`인 호스트 권한은 승인 카드에서 갱신한다.
+승인 링크·로그인·중단 복구 보완본의 검증과 적용 기록은
+[통합 배포 인계](../docs/handoffs/2026-10-16-runtime-rollout-integration.md)를 따른다.
+보완본은 승인 화면의 실제 HTTP/Chromium 검사도 공식 배포 사전검사에 포함한다.
+`tests/test_runtime_rollout_ui.py`는 브라우저가 설치된 `/usr/bin/python3`로 직접 실행하며,
+MCP Python의 테스트 탐색에서는 Playwright를 불러오지 않는다.
+
+### 등록 대상 호스트 작업 (version 3) — MCP 도구와 관리 웹 승인
+
+설계: [채팅 기반 호스트 작업 확장](../docs/superpowers/specs/2026-10-13-chat-host-operations-design.md) §5·§9·§10.
+**소스 구현과 모의 검증일 뿐 실제 대상 설정이나 Docker 상태를 바꾸지 않는다.**
+
+기존 006–012 전용 설정도 version 3이지만 `version/enabled/targets`의 고정 형식이다.
+등록 대상 설정은 여기에 `legacy/agent_profiles`를 포함하는 별도 형식이며,
+기존 고정 설정만으로 등록 대상 권한이 생기지 않는다. 웹의 고정 범위 활성화
+버튼은 등록 대상 설정을 고정 형식으로 덮어쓰지 않는다.
+
+#### 등록형 reviewed_snapshot의 단순화된 승인
+
+활성 등록형 v3에 정확한 고정 legacy 대상이 보존돼 있고, 해당 대상의
+`source_review`가 `reviewed_snapshot`이면 기존 API·Worker 배포와
+006–012·013 전용 계획은 기능별 범위 활성화나 사전 커밋 없이 만들 수 있다.
+미커밋·미추적 입력을 개인 스냅샷에 고정하며 고위험 파일의 HEAD/현재 바이트
+해시·모드·변경 자료를 인증된 관리 웹에 표시한다. 소스·등록 설정·검토 자료의
+해시를 작업 계획과 함께 승인하고 실행 직전에 다시 확인한다.
+
+기본 흐름은 `계획 생성 -> 관리 웹 검토/승인 -> MCP 실행`이다. 웹에서 승인할 때
+실행은 시작하지 않는다. 소스나 설정이 바뀌면 새 계획을 만들고 다시 승인한다.
+`prepare_predecessor_migration`의 006–012 전용 계획은 013을 실행하지 않으며,
+기본 정책에서 013은 별도 계획·별도 승인이다.
+고정 legacy와 등록형 `git_head`의 기존 범위·HEAD 검증 조건은 유지한다.
+`GET /api/host-operation-review?project=tossApp&operation_id=`는 인증된 관리자만
+고정 대상 계획의 검토 자료를 읽는 경로다. MCP 응답에는 원문 diff나 개인 경로를 담지 않는다.
+
+이 변경은 기존 전용 배포·마이그레이션 작업의 승인 조건을 통합한다.
+임의 SQL·일반 PostgreSQL backup/restore·에이전트 위임(B·C)은 후속 구현이며,
+등록된 Compose capability와 일반 파일/명령 도구의 범위를 추가로 넓히지 않는다.
+
+#### 테스트 대상의 사전 허용
+
+등록형 `reviewed_snapshot`의 `tossApp / tarororo-test`에서는 관리 웹의
+“채팅에서 자동 실행 허용”으로 기존 API·Worker 배포와 고정 스키마 적용을
+한 번 허용할 수 있다. 기본값은 꺼짐이다. 관리 웹에서 대상 문구
+`tossApp/tarororo-test`와 관리자 토큰을 다시 입력해 허용하거나 철회한다.
+허용 버튼은 권한만 저장하고 Docker·SQL 작업을 시작하지 않는다.
+
+허용 뒤에도 채팅은 계획을 만들고 명시적으로 실행 도구를 호출해야 한다.
+새 계획에는 `authorization.mode=target`과 허용 ID가 고정되므로 작업별 승인
+영수증을 다시 요구하지 않는다. 허용 전에 만든 계획은 기존 승인 방식을 유지한다.
+유효한 새 계획의 MCP 응답은 `state=ready_to_execute`, `approval_required=false`와
+호출할 실행 도구·인자를 담은 `next_action`을 반환한다. 사용자가 실행을 요청했다면
+채팅에서 그 도구를 바로 호출하며 관리 웹의 추가 승인을 요구하지 않는다. 계획
+조회만 요청한 경우에는 실행하지 않는다. 10분이 지나 `PLAN_EXPIRED`가 된 계획은
+관리 웹의 대기 목록에서 빠진다. 새 `request_id`로 계획을 다시 만들면 되며,
+만료된 계획을 승인하거나 재사용하지 않는다.
+허용은 재부팅 뒤에도 보존되며 철회·대상 설정 변경·허용된 SQL 바이트 변경 시
+자동 실행이 차단된다. SQL 변경 후에는 관리 웹에서 다시 허용한다. API·Worker의
+일반 소스 변경은 계속 새로운 실행 스냅샷에 고정한다.
+
+`prepare_db_migration`은 유효한 대상 권한이 있고 001~005만 정상 적용된 상태라면
+고정 006~013 통합 계획(`component=schema_update`, `migration_range=[006,013]`)을
+만든다. `execute_db_migration`은 백업 및 일회용 복원 검증을 한 번 수행하고
+006~013을 한 트랜잭션으로 순차 적용한 뒤 전체 이력·체크섬·테이블을 검증한다.
+001~012가 이미 정상 적용됐다면 기존 013 전용 계획을 사용한다. 이력 불일치나
+일부만 적용된 상태는 자동으로 덮어쓰지 않는다.
+
+소스·Compose·컨테이너·DB 상태·만료·잠금 검사는 계속 실행한다. 권한은 허용 레포
+밖의 개인 상태 디렉터리에 `0600`으로 저장하며 MCP에 권한 변경 도구를 노출하지
+않는다. `GET /api/host-target-authorization?project=tossApp&target=tarororo-test`는
+인증된 상태 조회이며, 같은 주소의 POST는 정확한 `enabled`, `confirmation`,
+`admin_token` 필드와 기존 loopback/Tailscale HTTPS 관리자 재인증 경계를 요구한다.
+LAN에서는 상태 조회만 가능하다. 등록형 Compose 작업의 개별 승인 정책은 유지한다.
+
+실행 중인 불변 런타임에는 새 소스가 자동 반영되지 않는다. 변경을 사용하려면
+검증된 snapshot 설치와 MCP·관리 웹 서비스 전환이 필요하다.
+
+| 도구 | 동작 |
+|---|---|
+| `list_host_targets(project)` | 이 프로젝트에 등록된 대상, 허용 동작·실행 프로필, 제한 사유(`enabled`/`reason`) 조회 |
+| `inspect_host_target(project, target, area=docker)` | 등록 서비스의 컨테이너·이미지 ID·상태·health만 조회 (로그·env·mount 없음) |
+| `prepare_host_operation(project, target, action, parameters, request_id)` | 입력·대상 정체성을 고정한 10분 계획과 `approval_url` 반환. Docker·SQL 실행 없음 |
+| `execute_host_operation(project, target, operation_id)` | 웹 승인 영수증을 1회 소비하고 비동기 실행. 재호출은 기존 상태만 조회 |
+| `read_host_operation_events(project, target, operation_id, cursor, limit)` | 상태·단계와 안전한 이벤트를 cursor로 조회 (기본 50, 최대 200, 64 KiB) |
+
+- 입력 schema는 모든 단계에서 `additionalProperties: false`이며 서버가 registry·`validate_action`으로
+  다시 검사한다. 미등록 필드·대상·동작은 효과 없이 거절된다. 오류는 정제된 코드뿐이다.
+- 기존 7개 도구의 schema는 그대로다. `get_host_operation(tossApp, tarororo-test, operation_id)`는
+  ID가 저장된 backend(legacy 또는 registered)를 확인해 조회하고, 두 곳에 모두 있으면
+  `AMBIGUOUS_OPERATION_ID`로 거절한다.
+- 실제 실행은 **설치된 불변 runtime**에서만 가능하다. 저장소 checkout에서는 `UNSAFE_RUNTIME`으로 거절된다.
+
+**웹 승인 흐름.** `approval_url`은 신뢰된 관리 웹 HTTPS origin에
+`/host-operations?project=..&target=..&operation_id=..`를 붙인 절대 URL이며
+토큰·nonce를 담지 않는다(다른 파라미터가 있으면 400). 관리 화면에 로그인하면 해당 작업이 선택된
+“등록 대상 호스트 작업” 영역이 열리고 계획·영향(재생성/중단/중지/보존, DB 연결, 볼륨 보존)·검증 항목·
+변경 경로·고위험 변경 검토 자료(`reviewed_snapshot`)·만료 카운트다운·단계와 최근 이벤트를 보여 준다.
+작업 ID를 직접 입력하고 관리자 토큰을 다시 입력해 **승인** 또는 **거절**한다. 승인은 1회 영수증만
+발급하며 실행하지 않는다. 실행은 채팅의 `execute_host_operation` 호출로만 시작한다.
+
+| Endpoint | 내용 |
+|---|---|
+| `GET /api/registered-targets?project=` | `list_host_targets`와 같은 공개 대상 목록·제한 사유 |
+| `GET /api/registered-operations?project=&target=` | 대상의 최근 작업 20개(모든 상태) |
+| `GET /api/registered-operation?project=&target=&operation_id=&cursor=` | 계획·검토 자료·이벤트 한 페이지 |
+| `POST /api/registered-approve?project=&target=` | `{operation_id, plan_digest, source_digest, confirmation, admin_token}` |
+| `POST /api/registered-reject?project=&target=` | `{operation_id, confirmation, admin_token}` |
+
+두 POST는 기존 `/api/host-approve`와 **같은 검사 함수**를 쓴다: loopback에 바인딩된 서버, 같은 Origin의
+loopback 또는 등록된 Tailscale HTTPS Origin, `Sec-Fetch-Site: same-origin`, forwarding header 없음,
+정확한 body key, 새로 입력한 관리자 토큰. LAN HTTP 리스너·다른 Origin·토큰 누락은 403이며 영수증이 생기지 않는다.
+프로젝트·대상 범위는 매 요청 새로 읽은 registry로 검사한다. 거절 코드는 `{"code", "diagnostic_id"}`로만 보여 준다.
+기존 `GET /api/host-operations`·`POST /api/host-approve`의 형식은 바뀌지 않았다.
+
+**활성화는 별도 호스트 단계다.** 이 화면과 MCP 도구에는 대상 설정(version 3 `host-runtime.json`)을 바꾸는
+endpoint가 없다. 후보 설정은 `python3 chatgpt-mcp/configure-host-runtime.py --validate-v3 CANDIDATE`로
+검증만 하며 파일을 쓰지 않는다. 실제 설정 적용, 불변 runtime 설치(`install-runtime.py` /
+`rollout-host-runtime.py --apply`), 서비스 재시작은 구체적인 차이와 영향에 대한 별도 승인 후 호스트에서 진행한다.
+설치 manifest와 신뢰 검사 목록에는 `host_registry.py`, `host_actions.py`, `host_process.py`,
+`host_source_review.py`, `host_registered_operations.py`, `host_compose_actions.py`,
+`host_registered_tools.py`와 관리 웹·대시보드 asset이 포함되며, 한 byte라도 바뀌면 runtime을 신뢰하지 않는다.
+
+관련 회귀: `tests/test_host_registered_router.py`(실제 MCP SDK stdio, 모의 runner 종단 흐름),
+`tests/test_admin_registered_approval.py`(HTTP 승인 경계), `tests/test_runtime_install.py`(패키징·변조),
+`node --test chatgpt-mcp/tests/test_host_operations_ui.mjs`(textContent·빈/만료/오류 상태·링크).
 
 ## 검증
 

@@ -102,6 +102,30 @@ class WorkEventTest(unittest.TestCase):
         self.assertTrue({"prompt", "args", "results", "reasoning", "env", "tokens"}.isdisjoint(saved))
         self.assertNotIn("secret", json.dumps(saved))
 
+    def test_optional_activity_metadata_round_trips_without_changing_provenance(self):
+        roles = ["analysis", "research", "planning", "debugging", "review", "summary"]
+        events = [{
+            **BASE_EVENT,
+            "task_id": f"role-{role}",
+            "action": "search" if role == "research" else "execute",
+            "activity_role": role,
+            **({"search_scope": "web"} if role == "research" else {}),
+            "tool_name": "web_search" if role == "research" else "functions.exec",
+        } for role in roles]
+
+        result = self.store.record_work_events("alpha", events, provenance="observed")
+        records = self.store.list_work_events("alpha")["records"]
+
+        self.assertEqual(result["provenance"], "observed")
+        self.assertEqual({record["activity_role"] for record in records}, set(roles))
+        self.assertEqual({record["provenance"] for record in records}, {"observed"})
+        research = next(record for record in records if record["activity_role"] == "research")
+        self.assertEqual(research["search_scope"], "web")
+        self.assertEqual(research["tool_name"], "web_search")
+        planning = next(record for record in records if record["activity_role"] == "planning")
+        self.assertEqual(planning["action"], "execute")
+        self.assertEqual(planning["tool_name"], "functions.exec")
+
     def test_labels_require_utf8_and_batch_rejects_before_persistence(self):
         unicode_event = {
             **BASE_EVENT,
@@ -193,6 +217,15 @@ class WorkEventTest(unittest.TestCase):
             ({**BASE_EVENT, "usage": {"input_tokens": 1}, "usage_scope": "response"}, {}),
             ({**BASE_EVENT, "model": "model name"}, {}),
             ({**BASE_EVENT, "reasoning_effort": "x" * 33}, {}),
+            ({**BASE_EVENT, "activity_role": "implementation"}, {}),
+            ({**BASE_EVENT, "activity_role": ["analysis"]}, {}),
+            ({**BASE_EVENT, "search_scope": "web"}, {}),
+            ({**BASE_EVENT, "action": "search", "search_scope": "workspace"}, {}),
+            ({**BASE_EVENT, "action": "search", "search_scope": 1}, {}),
+            ({**BASE_EVENT, "tool_name": ""}, {}),
+            ({**BASE_EVENT, "tool_name": "bad tool"}, {}),
+            ({**BASE_EVENT, "tool_name": "x" * 121}, {}),
+            ({**BASE_EVENT, "tool_name": 1}, {}),
             (BASE_EVENT, {"provenance": "inferred"}),
         ]
         for event, arguments in invalid:

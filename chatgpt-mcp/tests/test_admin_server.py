@@ -77,6 +77,65 @@ class AdminTest(unittest.TestCase):
             self.assertEqual(self.request('/work-dashboard/' + suffix)[0], 404)
         self.assertEqual(self.request('/work-dashboard/model.js?token=hidden')[0], 404)
 
+    def test_host_access_mobile_deep_link_selects_only_valid_public_identifiers(self):
+        request_id = 'a' * 32
+        valid = f'/host-access?project=alpha&request_id={request_id}'
+        status, headers, body = self.request(valid, auth=False)
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="host-access"', body)
+        self.assertIn('text/html', headers['Content-Type'])
+        self.assertIn("frame-ancestors 'none'", headers['Content-Security-Policy'])
+        for path in ('/host-access?project=beta&request_id=bad',
+                     f'/host-access?project=missing&request_id={request_id}',
+                     f'/host-access?project=alpha&request_id={request_id}&token=secret',
+                     f'/host-access?project=alpha&request_id={request_id}&request_id={request_id}',
+                     '/host-access', '/host-access?project=alpha&request_id=',
+                     f'/host-access?project=alpha%26fake%3D1&request_id={request_id}'):
+            self.assertEqual(self.request(path, auth=False)[0], 400, path)
+
+    def test_workroom_frame_is_an_opaque_script_only_document(self):
+        status, headers, body = self.request('/workroom-frame.html', auth=False)
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="work-map"', body)
+        self.assertNotIn(b'admin.js', body)
+        self.assertNotIn(b'host-access-admin.js', body)
+        policy = headers['Content-Security-Policy']
+        origin = f'http://127.0.0.1:{self.port}'
+        for directive in ("default-src 'none'",
+                          f"script-src {origin}/work-dashboard/model.js",
+                          f"{origin}/workroom-frame.js",
+                          f"style-src {origin}/admin.css {origin}/work-dashboard/visualizer.css",
+                          "connect-src 'none'", "form-action 'none'",
+                          f"frame-ancestors {origin}", "sandbox allow-scripts"):
+            self.assertIn(directive, policy)
+        self.assertNotIn("'self'", policy)
+        self.assertNotIn('allow-same-origin', policy)
+
+        status, headers, script = self.request('/workroom-frame.js', auth=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(headers['Content-Type'].startswith('text/javascript'))
+        self.assertNotIn(self.token.encode(), script)
+
+    def test_admin_document_can_embed_only_the_authority_bound_workroom_frame(self):
+        status, headers, body = self.request('/', auth=False)
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="workroom-frame"', body)
+        self.assertIn(b'src="/workroom-frame.html"', body)
+        self.assertIn(b'sandbox="allow-scripts"', body)
+        self.assertIn(b'/workroom-bridge.js', body)
+        for asset in (b'/work-dashboard/model.js', b'/work-dashboard/motion.js',
+                      b'/work-dashboard/pixels.js', b'/work-dashboard/visualizer.js',
+                      b'/work-dashboard/visualizer.css'):
+            self.assertNotIn(asset, body)
+        policy = headers['Content-Security-Policy']
+        origin = f'http://127.0.0.1:{self.port}'
+        self.assertIn(f"script-src {origin}/workroom-bridge.js {origin}/admin.js", policy)
+        self.assertIn(f"style-src {origin}/admin.css", policy)
+        self.assertIn(f"connect-src {origin}", policy)
+        self.assertIn(f"frame-src {origin}/workroom-frame.html", policy)
+        self.assertIn("frame-ancestors 'none'", policy)
+        self.assertNotIn("'self'", policy)
+
     def test_missing_installed_dashboard_cannot_fall_back_to_sibling_assets(self):
         release = self.root / 'releases' / '1234567890abcdef1234'
         release.mkdir(mode=0o700, parents=True)

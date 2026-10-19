@@ -249,6 +249,26 @@ class ProjectStateTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.store.list_activity("alpha", limit)
 
+    def test_schema_and_rollout_activity_is_recorded_without_execution_inputs(self):
+        tools = ['get_db_migration_status', 'get_predecessor_migration_status',
+                 'get_schema014_migration_status', 'prepare_db_migration',
+                 'prepare_predecessor_migration', 'prepare_schema014_migration',
+                 'execute_db_migration', 'execute_predecessor_migration',
+                 'execute_schema014_migration', 'prepare_runtime_rollout',
+                 'get_runtime_rollout', 'execute_runtime_rollout',
+                 'open_schema014_approval', 'confirm_schema014_approval',
+                 'cancel_schema014_approval']
+        for index, name in enumerate(tools):
+            call_id = 'scope-' + str(index)
+            self.store.record_activity('alpha', name, 'started', call_id)
+            self.store.record_activity('alpha', name, 'completed', call_id)
+        rows = self.store.list_activity('alpha')['events']
+        self.assertEqual({row['tool'] for row in rows}, set(tools))
+        self.assertEqual(len(rows), len(tools) * 2)
+        self.assertTrue(all(set(row) == {'project', 'tool', 'phase', 'call_id', 'time'}
+                            for row in rows))
+        self.assertEqual(self.store.list_activity('beta')['events'], [])
+
     def test_activity_rotates_once_and_rejects_unsafe_files(self):
         self.store.activity_path.write_bytes(b" " * MAX_ACTIVITY_BYTES)
         self.store.activity_path.chmod(0o600)

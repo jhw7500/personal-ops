@@ -27,9 +27,23 @@ EXECUTION_TOOLS = {"list_execution_profiles", "start_command", "get_job", "read_
 GIT_TOOLS = {"git_status", "git_diff", "prepare_git_operation", "execute_git_operation", "get_git_operation"}
 MEMORY_TOOLS = {"read_project_memory", "update_project_memory"}
 PROGRESS_TOOLS = {"read_project_progress", "update_project_progress"}
+# Registered (version 3) host tools are listed for every project; access is checked server-side.
+REGISTERED_HOST_TOOLS = {"list_host_targets", "inspect_host_target", "prepare_host_operation",
+                         "execute_host_operation", "read_host_operation_events"}
+AGENT_TOOLS = {"list_agent_profiles", "prepare_agent_task", "start_agent_task",
+               "get_agent_task", "cancel_agent_task"}
+HOST_COMMAND_TOOLS = {"list_host_command_profiles", "prepare_host_command",
+                      "execute_host_command", "get_host_command", "cancel_host_command"}
+HOST_EXECUTION_TOOLS = {"request_host_access", "get_host_access", "start_host_execution",
+                        "get_host_execution", "read_host_execution_log", "cancel_host_execution"}
+HOST_ACCESS_APPROVAL_TOOLS = {"open_host_access_approval", "update_host_access_approval",
+                              "confirm_host_access_approval", "cancel_host_access_approval"}
+HOST_COMMAND_APPROVAL_TOOLS = {"open_host_command_approval", "confirm_host_command_approval",
+                               "cancel_host_command_approval"}
 TOOLS = (PROJECT_TOOLS | {"list_projects", "open_project_picker", "select_project"}
          | SETTINGS_TOOLS | EXECUTION_TOOLS | GIT_TOOLS | MEMORY_TOOLS | PROGRESS_TOOLS
-         | {"report_work_events"})
+         | {"report_work_events"} | REGISTERED_HOST_TOOLS | AGENT_TOOLS | HOST_COMMAND_TOOLS
+         | HOST_EXECUTION_TOOLS | HOST_ACCESS_APPROVAL_TOOLS | HOST_COMMAND_APPROVAL_TOOLS)
 TOOL_PROPERTIES = {
     "read_file": {"relative_path", "start_line", "end_line", "max_answer_chars"},
     "list_dir": {"relative_path", "recursive", "skip_ignored_files", "max_answer_chars"},
@@ -118,10 +132,28 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                 self.assertFalse(observer.annotations.destructiveHint)
                                 self.assertEqual(observer.inputSchema['properties']['project']['enum'], ['alpha', 'beta'])
                                 self.assertEqual(observer.inputSchema['properties']['events']['maxItems'], 20)
+                                event_properties = observer.inputSchema['properties']['events']['items']['properties']
+                                self.assertFalse(
+                                    observer.inputSchema['properties']['events']['items']['additionalProperties']
+                                )
+                                self.assertEqual(event_properties['activity_role']['enum'], [
+                                    'analysis', 'research', 'planning', 'debugging', 'review', 'summary',
+                                ])
+                                self.assertEqual(event_properties['search_scope']['enum'], ['web', 'files'])
+                                self.assertEqual(event_properties['tool_name'], {
+                                    'type': 'string', 'pattern': '^[A-Za-z0-9_.:+/-]+$',
+                                    'minLength': 1, 'maxLength': 120,
+                                })
+                                self.assertIn('explicit activity_role', observer.description)
+                                self.assertIn('search_scope', observer.description)
+                                self.assertIn('trusted local hooks are observed', observer.description)
+                                self.assertIn('internal reasoning content', observer.description)
                                 event = {'schema_version': 1, 'source_id': 'figma-cloud', 'source_kind': 'mcp',
                                          'actor_id': 'figma', 'actor_kind': 'mcp', 'actor_label': 'Figma',
                                          'task_id': 'fetch-1', 'task_kind': 'call', 'task_label': '프레임 조회',
-                                         'action': 'read', 'state': 'started'}
+                                         'action': 'search', 'state': 'started',
+                                         'activity_role': 'research', 'search_scope': 'files',
+                                         'tool_name': 'search_for_pattern'}
                                 reported = await client.call_tool('report_work_events', {'project': 'alpha', 'events': [event]})
                                 self.assertFalse(reported.isError, result_text(reported))
                                 self.assertEqual(reported.structuredContent,
@@ -129,12 +161,22 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                 invalid = await client.call_tool('report_work_events', {'project': 'alpha',
                                                                                        'events': [{**event, 'actor_id': '../bad'}]})
                                 self.assertTrue(invalid.isError)
+                                invalid_scope = await client.call_tool(
+                                    'report_work_events',
+                                    {'project': 'alpha', 'events': [{
+                                        **event, 'action': 'read', 'search_scope': 'web',
+                                    }]},
+                                )
+                                self.assertTrue(invalid_scope.isError)
                                 records = root / 'state/chatgpt-coding-mcp/work-events.jsonl'
                                 saved = [json.loads(line) for line in records.read_text().splitlines()]
                                 self.assertEqual(len(saved), 1)
                                 self.assertEqual(saved[0]['provenance'], 'reported')
+                                self.assertEqual(saved[0]['activity_role'], 'research')
+                                self.assertEqual(saved[0]['search_scope'], 'files')
+                                self.assertEqual(saved[0]['tool_name'], 'search_for_pattern')
                                 self.assertIn('expires_at', saved[0])
-                                for name in EXECUTION_TOOLS | GIT_TOOLS:
+                                for name in EXECUTION_TOOLS | GIT_TOOLS | HOST_EXECUTION_TOOLS:
                                     descriptor = tools_by_name[name]
                                     self.assertEqual(descriptor.meta["ui"]["visibility"], ["model"])
                                     self.assertFalse(descriptor.meta["openai/widgetAccessible"])
@@ -395,8 +437,11 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                     )
 
                                 resources = await client.list_resources()
-                                self.assertEqual(len(resources.resources), 1)
-                                resource = resources.resources[0]
+                                self.assertEqual({str(item.uri) for item in resources.resources}, {
+                                    UI_URI, "ui://host-access/approval-v2.html",
+                                    "ui://host-commands/approval-v1.html"})
+                                resource = next(item for item in resources.resources
+                                                if str(item.uri) == UI_URI)
                                 self.assertEqual(str(resource.uri), UI_URI)
                                 self.assertEqual(resource.mimeType, UI_MIME)
 
