@@ -21,7 +21,7 @@
 
 ## 실제 UX019 조회
 
-2026-10-19 09:44:26 UTC에 고정 후보의 공식 어댑터로 기존 소유자 설정을 사용해 실제 읽기 전용 조회에 성공했다. 운영 MCP의 신규 도구 호출은 아직 아니다. 모델 turn·로그인·업로드를 요청하지 않았다.
+2026-10-19 09:44:26 UTC에 고정 후보의 공식 어댑터로 기존 소유자 설정을 사용해 실제 읽기 전용 조회에 성공했다. 당시 조회는 운영 MCP의 신규 도구 호출이 아니었다. 모델 turn·로그인·업로드를 요청하지 않았다.
 
 - Deployment ID: `01a151bd-4015-75cf-8275-fa6b6aef9a47`.
 - `provider_verified=true`, `found=true`, 버전 `20261019-27`.
@@ -73,7 +73,18 @@
 
 ## 웹 채팅에서 이어갈 일
 
-1. personal-ops-tunnel의 플러그인 연결을 한 번 새로고침해 신규 도구 목록을 갱신한다. 설치본 등록 검증과 ChatGPT 화면에서의 카드 표시 검증은 구분한다. 현재 대화의 도구 목록에는 아직 신규 도구가 없어 실제 ChatGPT 카드 표시·클릭 검증은 남아 있다.
-2. 기존 운영 도구 `get_host_access(tossApp)`로 active=false / RUNTIME_CHANGED를 확인했다. 백엔드 권한 코드 변경으로 이번에는 호스트 권한 카드에서 한 번 재승인해야 한다. 저장된 승인 파일을 수정하거나 권한을 임의로 되살리지 않았다. 단순 채팅·플러그인 새로고침은 자체적으로 유효한 권한을 만료시키거나 연장하지 않는다.
+1. 새로고침 후 신규 도구의 현재 대화 노출과 실제 플러그인 조회를 확인했다. 추가 새로고침이나 서비스 전환은 필요하지 않다. 설치본 등록·실제 조회 검증과 ChatGPT 화면에서의 카드 표시·클릭 검증은 구분하며, 후자는 사용자 확인이 남아 있다.
+2. 전환 직후 `get_host_access(tossApp)`로 active=false / RUNTIME_CHANGED를 확인했고, 이후 `get_host_access(personal-ops)`에서는 active=false / EXPIRED를 확인했다. 승인 후 8시간 유효한 호스트 권한 카드를 생성했으나 승인된 상태는 관측하지 못했다. 해당 카드의 확인 기한은 10:38:04 UTC였고, 10:38:15 UTC 조회에서 요청 목록이 비어 있어 만료를 확인했다. Codex 위임은 기본값 false이며 승인 파일을 수정하거나 권한을 임의로 되살리지 않았다. 승인 요청을 반복 생성하지 않으며, 호스트 실행이 필요할 때 새 카드를 연다. 단순 채팅·플러그인 새로고침은 자체적으로 유효한 권한을 만료시키거나 연장하지 않는다.
 3. 이후 UX019는 `get_toss_ux019_test_console_status`로 조회한다. 기존 UX014 조회는 기존 도구를 사용한다. 현재 결과는 번들 준비 완료·실기기 QA·심사 승인·원격 해시 일치를 뜻하지 않는다.
 4. 실제 런타임 전환이 필요할 때만 유효한 정확한 계획을 만들고 `open_runtime_rollout_approval`로 채팅 승인 카드를 연다. 이번 검증에서는 추가 계획 승인·실행, Docker/DB/스키마/AIT/업로드 변경을 수행하지 않았다.
+
+## 새로고침 후 실제 플러그인 검증
+
+2026-10-19 10:35~10:36 UTC에 다음을 확인했다. 증거는 `actual-connector-discovery.json`이다.
+
+- 현재 대화 도구 목록에서 `open_runtime_rollout_approval`과 `get_toss_ux019_test_console_status`가 모두 노출됐다. 이를 확인하기 위해 추가 서비스 재시작을 하지 않았다.
+- 신규 UX019 도구를 실제 personal-ops-tunnel 플러그인으로 호출해 성공했다. provider_verified=true, 고정 deployment ID, 버전 20261019-27을 확인했다. TEST 준비·테스트 완료·배포·원격 해시 검증은 여전히 false다.
+- 실제 플러그인의 prepare_runtime_rollout 안내도 반환된 approval_card를 채팅에서 열도록 명시하며, 관리자 웹은 fallback으로 안내한다. execute 설명도 owner-approved로 반영됐다.
+- 기존 get_runtime_status 호출에서 API healthy/readiness ready, Worker/DB running, Schema013 ready, toss-demo와 기존 이미지 ID 유지도 재확인했다.
+- 터널 health의 tools_list는 여전히 ok=false / 빈 목록 / awaiting_discovery다. 따라서 이 불완전한 관측값만으로 신규 도구가 없다고 판단하지 않는다. 실제 현재 대화의 도구 노출과 성공한 신규 도구 호출을 별도 근거로 기록한다. 전체 목록의 관측이나 모든 카드 콜백의 ChatGPT 화면 표시를 검증한 것으로 확대하지 않는다.
+- 실제 승인할 전환이 없는 상태에서 검증만을 위해 운영 롤아웃 계획·승인을 추가 생성하지 않았다. 실제 호스트 실행을 위해서는 새 호스트 권한 카드를 통한 승인이 필요하며 카드 표시·승인 확인은 별도로 남아 있다.
