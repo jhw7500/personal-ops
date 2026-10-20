@@ -44,6 +44,12 @@ def text(result):
 
 class HostCommandChatRouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_prepare_card_and_one_use_callback_then_explicit_execution(self):
+        await self.exercise_command(direct=False)
+
+    async def test_explicit_app_callback_starts_without_a_model_execution_call(self):
+        await self.exercise_command(direct=True)
+
+    async def exercise_command(self, *, direct):
         with tempfile.TemporaryDirectory(prefix="host-command-card-router-") as folder:
             root = Path(folder)
             (root / "repo").mkdir()
@@ -79,9 +85,12 @@ class HostCommandChatRouterTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(tools["prepare_host_command"].meta["ui"], {
                                 "resourceUri": CARD_URI, "visibility": ["model"]})
                             self.assertIn("open_host_command_approval", tools)
-                            for name in ("confirm_host_command_approval", "cancel_host_command_approval"):
+                            for name in ("confirm_host_command_approval", "cancel_host_command_approval",
+                                         "confirm_and_execute_host_command"):
                                 self.assertEqual(tools[name].meta["ui"]["visibility"], ["app"])
                                 self.assertTrue(tools[name].meta["openai/widgetAccessible"])
+                            self.assertTrue(tools["confirm_and_execute_host_command"].annotations.destructiveHint)
+                            self.assertTrue(tools["confirm_and_execute_host_command"].annotations.openWorldHint)
                             resource = (await client.read_resource(CARD_URI)).contents[0]
                             self.assertEqual(resource.mimeType, "text/html;profile=mcp-app")
                             self.assertEqual(resource.meta["ui"]["csp"], {
@@ -92,32 +101,43 @@ class HostCommandChatRouterTests(unittest.IsolatedAsyncioTestCase):
                             public = prepared.structuredContent
                             self.assertEqual(public["component"], "host_command")
                             self.assertFalse(public["executes_on_approval"])
+                            self.assertTrue(public["supports_direct_execution"])
                             self.assertNotIn("approval_url", public["plan"])
                             self.assertNotIn(str(root), text(prepared))
                             token = prepared.meta["host_command_confirmation"]
                             self.assertNotIn(token, text(prepared))
                             self.assertFalse((root / "executions").exists())
                             operation = {"project": "example", "operation_id": public["operation_id"]}
-                            malformed = await client.call_tool("confirm_host_command_approval", {
+                            callback = "confirm_and_execute_host_command" if direct else "confirm_host_command_approval"
+                            malformed = await client.call_tool(callback, {
                                 **operation, "card_id": public["card_id"],
                                 "confirmation_token": token, "leak_probe": token})
                             self.assertTrue(malformed.isError)
                             self.assertEqual(text(malformed), "INVALID_HOST_COMMAND_CARD_ARGUMENTS")
                             self.assertNotIn(token, text(malformed))
-                            confirmed = await client.call_tool("confirm_host_command_approval", {
+                            confirmed = await client.call_tool(callback, {
                                 **operation, "card_id": public["card_id"], "confirmation_token": token})
                             self.assertFalse(confirmed.isError, text(confirmed))
                             self.assertTrue(confirmed.structuredContent["receipt_verified"])
                             self.assertEqual(confirmed.structuredContent["next_action"], {
-                                "tool": "execute_host_command", "arguments": operation})
-                            self.assertFalse((root / "executions").exists())
-                            reopened = await client.call_tool("open_host_command_approval", operation)
-                            self.assertFalse(reopened.isError, text(reopened))
-                            self.assertTrue(reopened.structuredContent["receipt_verified"])
-                            self.assertNotIn("host_command_confirmation", reopened.meta or {})
-                            self.assertNotIn("approval_url", reopened.structuredContent["plan"])
-                            executed = await client.call_tool("execute_host_command", operation)
-                            self.assertFalse(executed.isError, text(executed))
+                                "tool": "get_host_command" if direct else "execute_host_command",
+                                "arguments": operation})
+                            if direct:
+                                self.assertTrue(confirmed.structuredContent["execution_requested"])
+                                self.assertTrue(confirmed.structuredContent["execution_started"])
+                                self.assertNotIn("approval_url", confirmed.structuredContent["plan"])
+                                replay = await client.call_tool(callback, {
+                                    **operation, "card_id": public["card_id"], "confirmation_token": token})
+                                self.assertTrue(replay.isError)
+                            else:
+                                self.assertFalse((root / "executions").exists())
+                                reopened = await client.call_tool("open_host_command_approval", operation)
+                                self.assertFalse(reopened.isError, text(reopened))
+                                self.assertTrue(reopened.structuredContent["receipt_verified"])
+                                self.assertNotIn("host_command_confirmation", reopened.meta or {})
+                                self.assertNotIn("approval_url", reopened.structuredContent["plan"])
+                                executed = await client.call_tool("execute_host_command", operation)
+                                self.assertFalse(executed.isError, text(executed))
                             for _ in range(100):
                                 current = await client.call_tool("get_host_command", operation)
                                 if current.structuredContent["state"] == "succeeded":

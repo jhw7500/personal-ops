@@ -53,6 +53,17 @@ class HostCommandChatApprovalTests(unittest.TestCase):
         self.plan = self.ops.prepare("example", "test-upload", "card")
         self.operation_id = self.plan["operation_id"]
         self.cards = HostCommandApprovals(self.ops, trusted_runtime=lambda: "a" * 64)
+        self.addCleanup(self.finish_workers)
+
+    def finish_workers(self):
+        for worker, _ in list(self.ops._workers.values()):
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+
+    def approve_and_execute(self, args):
+        callback = getattr(self.cards, "confirm_and_execute", None)
+        self.assertTrue(callable(callback), "Missing explicit approve-and-execute callback")
+        return callback(**args)
 
     def open(self):
         return self.cards.open("example", self.operation_id)
@@ -97,6 +108,83 @@ class HostCommandChatApprovalTests(unittest.TestCase):
         self.assertEqual(public["plan"]["state"], "approved")
         self.ops._receipt(self.ops._load(self.operation_id, "example"))
         self.assertNotIn("_meta", got)
+        self.assertEqual(self.executions, [])
+
+    def test_explicit_combined_callback_queues_exact_command_without_model_execute(self):
+        opened = self.open()
+        self.assertTrue(opened["structuredContent"].get("supports_direct_execution"))
+        self.assertEqual(self.executions, [])
+        result = self.approve_and_execute(self.args(opened))
+        public = result["structuredContent"]
+        self.assertTrue(public["execution_requested"])
+        self.assertTrue(public["execution_started"])
+        self.assertTrue(public["plan"]["started_at"])
+        self.assertNotIn("approval_url", public["plan"])
+        self.assertEqual(public["next_action"], {"tool": "get_host_command", "arguments": {
+            "project": "example", "operation_id": self.operation_id}})
+        self.assertNotIn("_meta", result)
+        self.assertFalse(self.ops._receipt_path(self.operation_id).exists())
+        self.finish_workers()
+        self.assertEqual(self.ops.get("example", self.operation_id)["state"], "succeeded")
+        self.assertEqual(len(self.executions), 1)
+        self.assertEqual(self.executions[0]["profile_id"], "test-upload")
+        self.assertEqual(self.executions[0]["inputs"], {"bundle.ait": hashlib.sha256(b"SYNTHETIC-BUNDLE").hexdigest()})
+
+    def test_simultaneous_combined_callbacks_start_one_command(self):
+        args = self.args(self.open())
+        def start():
+            try:
+                return self.approve_and_execute(args)["structuredContent"]["execution_started"]
+            except HostRuntimeError:
+                return False
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: start(), range(2)))
+        self.assertEqual(sorted(results), [False, True])
+        self.finish_workers()
+        self.assertEqual(len(self.executions), 1)
+        with self.assertRaises(HostRuntimeError):
+            self.approve_and_execute(args)
+
+    def test_combined_callback_rejects_wrong_capability_without_approval_or_execution(self):
+        args = self.args(self.open())
+        with self.assertRaises(HostRuntimeError):
+            self.approve_and_execute({**args, "confirmation_token": "0" * 64})
+        self.assertFalse(self.ops._receipt_path(self.operation_id).exists())
+        self.assertIsNone(self.ops.get("example", self.operation_id)["started_at"])
+        self.assertEqual(self.executions, [])
+
+    def test_combined_callback_rejects_changed_input_before_approval_or_execution(self):
+        args = self.args(self.open())
+        self.artifact.write_bytes(b"CHANGED")
+        with self.assertRaises(HostRuntimeError):
+            self.approve_and_execute(args)
+        self.assertFalse(self.ops._receipt_path(self.operation_id).exists())
+        self.assertEqual(self.executions, [])
+
+    def test_combined_callback_expiring_before_enqueue_never_claims_it_started(self):
+        import host_command_operations
+        args = self.args(self.open())
+        begin = self.ops._begin
+        later = host_access._utcnow() + timedelta(minutes=11)
+        def enqueue_after_deadline(*pos, **kw):
+            with mock.patch.object(host_command_operations, "_now", return_value=later):
+                return begin(*pos, **kw)
+        with mock.patch.object(self.ops, "_begin", side_effect=enqueue_after_deadline):
+            public = self.approve_and_execute(args)["structuredContent"]
+        self.assertTrue(public["execution_requested"])
+        self.assertFalse(public["execution_started"])
+        self.assertEqual(public["plan"]["state"], "expired")
+        self.assertNotIn("approval_url", public["plan"])
+        self.assertEqual(public["next_action"]["tool"], "get_host_command")
+        self.assertEqual(self.executions, [])
+
+    def test_combined_callback_rejects_expired_card_without_execution(self):
+        args = self.args(self.open())
+        later = host_access._utcnow() + timedelta(minutes=11)
+        with mock.patch.object(host_access, "_utcnow", return_value=later):
+            with self.assertRaises(HostRuntimeError):
+                self.approve_and_execute(args)
+        self.assertFalse(self.ops._receipt_path(self.operation_id).exists())
         self.assertEqual(self.executions, [])
 
     def test_approved_reopen_recovers_receipt_without_another_capability(self):

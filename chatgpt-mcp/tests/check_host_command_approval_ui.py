@@ -15,6 +15,7 @@ HOST = """<!doctype html><html><head><style>
 body { margin: 0; } iframe { display: block; width: 100%; height: 42px; border: 0; }
 </style></head><body><script>
 const token = window.token = 'a'.repeat(64);
+const direct = new URLSearchParams(location.search).get('legacy') !== '1';
 const base = window.card = {
   project: 'example', component: 'host_command', profile_id: 'test-upload',
   label: 'Upload exact TEST bundle', effect: 'external_publish',
@@ -22,7 +23,7 @@ const base = window.card = {
   plan_digest: '3'.repeat(64), source_digest: '4'.repeat(64),
   executable_sha256: '5'.repeat(64), input_count: 1, timeout_seconds: 60,
   expires_at: '2099-01-01T00:00:00Z', executes_on_approval: false,
-  receipt_verified: false,
+  receipt_verified: false, ...(direct ? {supports_direct_execution: true} : {}),
   plan: {project: 'example', profile_id: 'test-upload', label: 'Upload exact TEST bundle',
     effect: 'external_publish', input_count: 1, timeout_seconds: 60,
     executable_sha256: '5'.repeat(64)}
@@ -31,9 +32,16 @@ window.calls = []; window.contexts = []; window.states = []; window.sizes = [];
 window.failNext = false; window.mismatchNext = false; window.approvalWon = false;
 window.result = value => ({content: [{type: 'text', text: 'bounded'}],
   structuredContent: JSON.parse(JSON.stringify(value))});
-window.approved = () => ({...card, state: 'approved', receipt_verified: true, approved: true,
-  next_action: {tool: 'execute_host_command', arguments: {
-    project: card.project, operation_id: card.operation_id}}});
+window.approved = () => card.supports_direct_execution === true ?
+  ({...card, state: 'approved', receipt_verified: true, approved: true,
+    supports_direct_execution: false,
+    execution_requested: true, execution_started: true,
+    plan: {state: 'running', phase: 'execute', code: null, started_at: '2026-10-20T01:02:03Z'},
+    next_action: {tool: 'get_host_command', arguments: {
+      project: card.project, operation_id: card.operation_id}}}) :
+  ({...card, state: 'approved', receipt_verified: true, approved: true,
+    next_action: {tool: 'execute_host_command', arguments: {
+      project: card.project, operation_id: card.operation_id}}});
 window.invoke = async (name, args) => {
   calls.push({name, args: JSON.parse(JSON.stringify(args))});
   if (failNext) { failNext = false; throw new Error('ambiguous transport failure'); }
@@ -118,7 +126,8 @@ class HostCommandApprovalBrowserTest(unittest.TestCase):
         self.page.goto("https://approval.test/")
         frame = self.page.frame_locator("iframe")
         expect(frame.get_by_role("heading", name="호스트 명령 승인")).to_be_visible()
-        expect(frame.get_by_role("button", name="이 계획 승인")).to_be_enabled()
+        button_name = "승인하고 실행" if self.page.evaluate("card.supports_direct_execution === true") else "이 계획 승인"
+        expect(frame.get_by_role("button", name=button_name)).to_be_enabled()
         self.page.wait_for_function("""() => {
           const frame = document.querySelector('iframe');
           return sizes.length > 0 && frame.clientHeight > 400 &&
@@ -137,19 +146,33 @@ class HostCommandApprovalBrowserTest(unittest.TestCase):
                 self.assertNotIn("a" * 64, frame.locator("body").inner_text())
                 self.page.reload()
 
-    def test_confirm_issues_receipt_only_and_keeps_capability_out_of_context(self):
+    def test_one_click_approves_and_starts_execution_without_model_followup(self):
         frame = self.open()
-        frame.get_by_role("button", name="이 계획 승인").click()
-        expect(frame.get_by_role("status")).to_contain_text("승인 영수증")
-        expect(frame.get_by_role("status")).to_contain_text("실행은 별도")
+        expect(frame.get_by_text("승인하면 고정된 명령 실행을 시작합니다.", exact=True)).to_be_visible()
+        frame.get_by_role("button", name="승인하고 실행").click()
+        expect(frame.get_by_role("status")).to_contain_text("실행을 시작했습니다")
         calls = self.page.evaluate("calls")
-        self.assertEqual([item["name"] for item in calls], ["confirm_host_command_approval"])
+        self.assertEqual([item["name"] for item in calls], ["confirm_and_execute_host_command"])
         self.assertEqual(calls[0]["args"]["confirmation_token"], "a" * 64)
-        self.assertFalse(any("execute" in item["name"] for item in calls))
+        self.assertFalse(any(item["name"] == "execute_host_command" for item in calls))
         self.assertNotIn("a" * 64, str(self.page.evaluate("contexts")))
         self.assertNotIn("a" * 64, str(self.page.evaluate("states")))
-        self.assertNotIn("next_action", str(self.page.evaluate("contexts")))
-        expect(frame.get_by_role("button", name="이 계획 승인")).to_be_disabled()
+        self.assertNotIn("supports_direct_execution", str(self.page.evaluate("contexts")))
+        summary = self.page.evaluate("contexts[0].structuredContent.hostCommandApproval")
+        self.assertTrue(summary["execution_requested"])
+        self.assertTrue(summary["execution_started"])
+        self.assertEqual(summary["plan"]["state"], "running")
+        self.assertNotIn("next_action", summary)
+        expect(frame.get_by_role("button", name="승인하고 실행")).to_be_disabled()
+
+    def test_missing_capability_preserves_approval_only_fallback(self):
+        self.page.goto("https://approval.test/?legacy=1")
+        frame = self.page.frame_locator("iframe")
+        expect(frame.get_by_role("button", name="이 계획 승인")).to_be_enabled()
+        expect(frame.get_by_text("승인만으로 명령을 실행하지 않습니다.", exact=True)).to_be_visible()
+        frame.get_by_role("button", name="이 계획 승인").click()
+        expect(frame.get_by_role("status")).to_contain_text("실행은 별도")
+        self.assertEqual(self.page.evaluate("calls[0].name"), "confirm_host_command_approval")
 
     def test_cancel_reports_an_approval_that_won_the_race(self):
         frame = self.open()
@@ -164,9 +187,9 @@ class HostCommandApprovalBrowserTest(unittest.TestCase):
             with self.subTest(flag=flag):
                 frame = self.open()
                 self.page.evaluate(f"{flag} = true")
-                frame.get_by_role("button", name="이 계획 승인").click()
+                frame.get_by_role("button", name="승인하고 실행").click()
                 expect(frame.get_by_role("status")).to_contain_text("결과를 확정할 수 없습니다")
-                expect(frame.get_by_role("button", name="이 계획 승인")).to_be_disabled()
+                expect(frame.get_by_role("button", name="승인하고 실행")).to_be_disabled()
                 expect(frame.get_by_role("button", name="취소")).to_be_disabled()
                 self.assertEqual(len(self.page.evaluate("calls")), 1)
                 self.page.reload()

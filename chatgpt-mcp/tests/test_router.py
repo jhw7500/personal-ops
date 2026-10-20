@@ -40,6 +40,7 @@ HOST_EXECUTION_TOOLS = {"request_host_access", "get_host_access", "start_host_ex
 HOST_ACCESS_APPROVAL_TOOLS = {"open_host_access_approval", "update_host_access_approval",
                               "confirm_host_access_approval", "cancel_host_access_approval"}
 HOST_COMMAND_APPROVAL_TOOLS = {"open_host_command_approval", "confirm_host_command_approval",
+                               "confirm_and_execute_host_command",
                                "cancel_host_command_approval"}
 TOOLS = (PROJECT_TOOLS | {"list_projects", "open_project_picker", "select_project"}
          | SETTINGS_TOOLS | EXECUTION_TOOLS | GIT_TOOLS | MEMORY_TOOLS | PROGRESS_TOOLS

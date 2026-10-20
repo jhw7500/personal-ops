@@ -71,7 +71,9 @@ python3 chatgpt-mcp/server.py --project /absolute/project/path
 
 등록형 Host Command Runner는 관리자가 저장소 **밖**의 소유자 전용(0600) JSON 정책 파일에 고정한 실행 파일·SHA-256·인자·작업 폴더·입력 파일 SHA-256으로만 동작한다. 이 등록형 경로에서는 자유로운 셸 문자열·환경변수·Docker/DB 작업을 전송할 수 없다. 아래 기간제 호스트 권한 경로는 별도 기능이다.
 
-사용 흐름: list_host_command_profiles → prepare_host_command의 채팅 카드에서 일회용 승인 → execute_host_command → get_host_command / cancel_host_command. 기존 계획은 open_host_command_approval로 다시 열며, 이미 승인된 계획은 기존 영수증과 다음 실행을 반환한다. 관리자 페이지나 관리자 토큰 입력은 필요하지 않다. 승인 버튼만으로 명령이 시작되지 않는다. 외부 TEST 업로드 취소는 업로드를 되돌리지 않으며 불확실한 결과를 성공으로 판단하지 않는다.
+새 소스의 사용 흐름은 list_host_command_profiles → prepare_host_command의 채팅 카드에서 **승인하고 실행** → get_host_command / cancel_host_command다. 앱 전용 confirm_and_execute_host_command가 기존 일회용 승인을 발급하고 같은 콜백에서 고정된 명령 실행을 접수하므로, 웹 모델의 두 번째 execute_host_command 호출이 필요 없다. 관리자 페이지나 관리자 토큰 입력도 필요하지 않다.
+
+기존 계획은 open_host_command_approval로 다시 연다. 이미 승인된 계획을 열기만 해서는 실행하지 않는다. 예전 카드의 ‘이 계획 승인’은 승인만 하며, 사용자 실행 요청이 있을 때 기존 execute_host_command 경로로 이어간다. 계획은 생성부터 10분이며 카드 승인이 유효시간을 늘리지 않는다. 통신 오류로 결과가 불확실하면 get_host_command로 확인하고 자동 재실행하지 않는다. 외부 TEST 업로드 취소는 업로드를 되돌리지 않는다. 2026-10-20의 이 보완은 별도 서비스 전환 전까지 소스에만 적용된다.
 
 2026-10-16에 업로드 카드 보완본 `8c7a5aff0c75198c6c5d`를 운영에 반영했다. 전체 892개 검사, 설치본 도구 76개 등록·프로토콜 검사 3개, 실제 터널 프로필 조회와 관리 웹 HTTP 검증을 통과했다. ChatGPT 연결을 새로고침한 뒤 실제 업로드 카드 표시를 확인해야 한다. CLI 보존 검사에서는 전환 직전 살아 있던 Claude 프로세스 1개의 사후 종료가 관측됐으며 원인은 미확인이다. [업로드 채팅 승인 인계](../docs/handoffs/2026-10-16-host-command-inline-approval.md)를 참조한다.
 

@@ -75,6 +75,7 @@ class RolloutTest(unittest.TestCase):
             "open_schema014_approval", "confirm_schema014_approval",
             "cancel_schema014_approval",
             "open_host_command_approval", "confirm_host_command_approval",
+            "confirm_and_execute_host_command",
             "cancel_host_command_approval",
         }
         self.assertEqual(module.TOOL_NAMES, expected)

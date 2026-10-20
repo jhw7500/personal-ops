@@ -95,6 +95,7 @@ TOOL_NAMES = {
     "confirm_host_access_approval", "cancel_host_access_approval",
     "open_schema014_approval", "confirm_schema014_approval", "cancel_schema014_approval",
     "open_host_command_approval", "confirm_host_command_approval", "cancel_host_command_approval",
+    "confirm_and_execute_host_command",
 }
 
 

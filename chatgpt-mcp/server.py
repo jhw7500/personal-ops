@@ -376,8 +376,10 @@ async def serve(projects):
             "Registered command profiles and TEST uploads also use a per-plan inline card: "
             "prepare_host_command returns it, and open_host_command_approval reopens an existing "
             "plan. Use its own approve/cancel buttons without an admin page or token. Only the "
-            "app callback issues the one-use receipt; approval never executes the command. "
-            "After receipt_verified=true, call execute_host_command only when the user requested "
+            "explicit approve-and-execute app callback issues the receipt and submits that command. "
+            "When execution_requested=true, inspect the returned plan/get_host_command and never "
+            "call execute_host_command again. Legacy approval-only callbacks never execute. "
+            "After approval-only receipt_verified=true, call execute_host_command only when the user requested "
             "execution. Do not ask for another approval for that plan. Expired upload plans need "
             "a new request_id and plan. Use the authenticated admin fallback only if the card "
             "cannot be displayed and the user explicitly requests that fallback. "
@@ -436,8 +438,8 @@ async def serve(projects):
                        "카드를 열기만 해서는 승인되지 않습니다." if access_approval else
                        "고정된 Schema 014 계획과 digest를 확인하고 1회 승인하는 카드. "
                        "승인만으로 DB 변경은 실행되지 않습니다." if schema014_approval else
-                       "등록된 명령 프로필과 정확한 계획을 확인하고 1회 승인하는 카드. "
-                       "승인만으로 빌드·업로드·발송은 실행되지 않습니다." if command_approval else
+                       "등록된 명령 프로필과 정확한 계획을 확인하는 카드. "
+                       "'승인하고 실행'은 해당 명령을 바로 접수하며, 기존 승인 전용 버튼은 실행하지 않습니다." if command_approval else
                        "일반 ChatGPT 대화에서 호스트의 허용된 로컬 레포를 선택하는 카드. "
                        "선택 후 같은 대화에서 파일 작업을 요청할 수 있습니다."),
                    "openai/widgetPrefersBorder": True,

@@ -53,6 +53,19 @@ const approved = () => fixture({
   }},
 });
 
+const directPending = () => fixture({supports_direct_execution: true});
+
+const executing = (overrides = {}) => fixture({
+  supports_direct_execution: false, state: "approved", receipt_verified: true, approved: true,
+  execution_requested: true, execution_started: true,
+  plan: {state: "running", phase: "execute", code: null,
+    started_at: "2026-10-20T01:02:03Z"},
+  next_action: {tool: "get_host_command", arguments: {
+    project: "example", operation_id: OPERATION,
+  }},
+  ...overrides,
+});
+
 function result(value, token = undefined) {
   return {content: [{type: "text", text: "bounded"}], structuredContent: value,
     ...(token ? {_meta: {host_command_confirmation: token}} : {})};
@@ -133,6 +146,39 @@ test("one click sends only the hidden approval callback and never executes the c
   assert.notEqual(JSON.stringify(app.states).includes("next_action"), true);
 });
 
+test("direct execution card clearly starts publish work with one combined callback", async () => {
+  const app = await load({output: directPending(), callTool: async () => result(executing())});
+  assert.equal(app.elements.get("approve").textContent, "승인하고 실행");
+  assert.match(app.elements.get("warning-title").textContent, /승인하면.*실행/);
+  assert.match(app.elements.get("warning-detail").textContent, /TEST 업로드.*외부 게시/);
+  assert.doesNotMatch(app.elements.get("warning-title").textContent, /실행하지 않습니다/);
+  await app.elements.get("approve").dispatch("click");
+  assert.deepEqual(app.calls, [{name: "confirm_and_execute_host_command", args: {
+    project: "example", operation_id: OPERATION, card_id: CARD,
+    confirmation_token: TOKEN,
+  }}]);
+  assert.match(app.elements.get("status").textContent, /실행을 시작/);
+  assert.doesNotMatch(app.elements.get("status").textContent, /별도.*요청/);
+  assert.equal(app.calls.some(call => call.name === "execute_host_command"), false);
+  assert.notEqual(JSON.stringify(app.states).includes(TOKEN), true);
+  assert.notEqual(JSON.stringify(app.states).includes("supports_direct_execution"), true);
+  assert.deepEqual(app.states[0].modelContent.hostCommandApproval.execution_requested, true);
+  assert.deepEqual(app.states[0].modelContent.hostCommandApproval.execution_started, true);
+  assert.equal(app.states[0].modelContent.hostCommandApproval.plan.state, "running");
+  assert.notEqual(JSON.stringify(app.states).includes("next_action"), true);
+});
+
+test("direct execution expiration is terminal and never retries", async () => {
+  const stopped = executing({execution_started: false,
+    plan: {state: "expired", phase: "stopped", code: "plan_expired", started_at: null}});
+  const app = await load({output: directPending(), callTool: async () => result(stopped)});
+  await app.elements.get("approve").dispatch("click");
+  assert.equal(app.calls.length, 1);
+  assert.match(app.elements.get("status").textContent, /만료.*실행.*시작하지/);
+  assert.equal(app.elements.get("approve").disabled, true);
+  assert.equal(app.elements.get("cancel").disabled, true);
+});
+
 test("a fast double click cannot issue two approval callbacks", async () => {
   let release;
   const delayed = new Promise(resolve => { release = resolve; });
@@ -141,6 +187,19 @@ test("a fast double click cannot issue two approval callbacks", async () => {
   const second = app.elements.get("approve").dispatch("click");
   assert.equal(app.calls.length, 1);
   release(result(approved()));
+  await Promise.all([first, second]);
+  assert.equal(app.calls.length, 1);
+});
+
+test("a fast double click on direct execution issues one combined callback", async () => {
+  let release;
+  const delayed = new Promise(resolve => { release = resolve; });
+  const app = await load({output: directPending(), callTool: async () => delayed});
+  const first = app.elements.get("approve").dispatch("click");
+  const second = app.elements.get("approve").dispatch("click");
+  assert.equal(app.calls.length, 1);
+  assert.equal(app.calls[0].name, "confirm_and_execute_host_command");
+  release(result(executing()));
   await Promise.all([first, second]);
   assert.equal(app.calls.length, 1);
 });
@@ -170,6 +229,7 @@ test("ambiguous callback and cross-plan response lock both actions without retry
   for (const callTool of [
     async () => { throw new Error("synthetic response loss"); },
     async () => result({...approved(), operation_id: "9".repeat(32)}),
+    async () => result({...approved(), plan_digest: "9".repeat(64)}),
   ]) {
     const app = await load({callTool});
     await app.elements.get("approve").dispatch("click");
@@ -189,6 +249,14 @@ test("approved reopen is terminal and cannot approve again", async () => {
   assert.equal(app.calls.length, 0);
 });
 
+test("direct approved reopen is read-only and does not need a token", async () => {
+  const app = await load({output: executing(), token: null});
+  assert.equal(app.elements.get("approve").disabled, true);
+  assert.equal(app.elements.get("cancel").disabled, true);
+  assert.match(app.elements.get("status").textContent, /실행.*시작/);
+  assert.equal(app.calls.length, 0);
+});
+
 test("expired, missing-token, malformed, and pending next-action cards fail closed", async () => {
   const cases = [
     {output: fixture({expires_at: "2000-01-01T00:00:00Z"}), token: TOKEN},
@@ -199,12 +267,18 @@ test("expired, missing-token, malformed, and pending next-action cards fail clos
     }}}), token: TOKEN},
     {output: fixture({plan: {project: "example", argv: ["secret"]}}), token: TOKEN},
     {output: fixture({plan: {project: "example", cwd: "/private/host/path"}}), token: TOKEN},
+    {output: directPending(), token: TOKEN, callTool: async () => result(executing({
+      next_action: {tool: "execute_host_command", arguments: {
+        project: "example", operation_id: OPERATION,
+      }},
+    }))},
   ];
   for (const item of cases) {
     const app = await load(item);
+    if (item.callTool) await app.elements.get("approve").dispatch("click");
     assert.equal(app.elements.get("approve").disabled, true);
     assert.equal(app.elements.get("cancel").disabled, true);
-    assert.equal(app.calls.length, 0);
+    assert.equal(app.calls.length, item.callTool ? 1 : 0);
   }
 });
 

@@ -1,4 +1,4 @@
-"""App-only one-use confirmation of registered command plans, without execution.
+"""App-only confirmation and explicit execution of registered command plans.
 
 The authenticated MCP host keeps the capability in component-only metadata.
 The existing command receipt issuer and execution checks remain authoritative.
@@ -28,10 +28,11 @@ _FIELDS = {"version", "project", "operation_id", "card_id", "plan_digest", "sour
            "created_at", "expires_at", "runtime_identity", "boot_id", "uid",
            "token_digest", "state"}
 NAMES = frozenset({"open_host_command_approval", "confirm_host_command_approval",
-                   "cancel_host_command_approval"})
+                   "confirm_and_execute_host_command", "cancel_host_command_approval"})
 _REQUIRED = {
     "open_host_command_approval": {"project", "operation_id"},
     "confirm_host_command_approval": {"project", "operation_id", "card_id", "confirmation_token"},
+    "confirm_and_execute_host_command": {"project", "operation_id", "card_id", "confirmation_token"},
     "cancel_host_command_approval": {"project", "operation_id", "card_id", "confirmation_token"},
 }
 
@@ -114,14 +115,16 @@ class HostCommandApprovals:
             "executable_sha256": frozen["executable_sha256"],
             "input_count": len(frozen["inputs"]), "timeout_seconds": frozen["timeout_seconds"],
             "expires_at": card["expires_at"], "executes_on_approval": False,
+            "supports_direct_execution": card["state"] == "pending",
             "receipt_verified": receipt_verified,
             "approval_required": card["state"] == "pending" and approved is None,
             "plan": plan,
             "guidance": (
-                "Show this inline card's '이 계획 승인' and '취소' buttons. Do not substitute an "
+                "Show this inline card's '승인하고 실행' and '취소' buttons. Do not substitute an "
                 "external approval link or ask for an admin token. Only the user's app callback "
-                "can confirm. Approval issues one exact-plan receipt and never executes the "
-                "command. If the client cannot show the card, report that limitation; use the "
+                "can confirm. The explicit approve-and-execute action issues one exact-plan "
+                "receipt and immediately submits that command. Legacy approval-only callbacks "
+                "do not execute. If the client cannot show the card, report that limitation; use the "
                 "authenticated admin fallback only if the user explicitly requests it."),
         }
         if approved is not None:
@@ -213,6 +216,26 @@ class HostCommandApprovals:
                 _save_private_json(self._path(operation_id), card)
                 return self._result(card, state, approved=True)
 
+    def confirm_and_execute(self, project, operation_id, *, card_id, confirmation_token):
+        confirmed = self.confirm(project, operation_id, card_id=card_id,
+                                 confirmation_token=confirmation_token)
+        # Reuse the receipt-consuming, locked enqueue path. Never issue a second
+        # model tool call, extend a deadline, or launch outside that engine.
+        plan = self.operations._begin(project, operation_id)
+        plan.pop("approval_url", None)
+        public = confirmed["structuredContent"]
+        public.update(plan=plan, supports_direct_execution=False,
+                      execution_requested=True,
+                      execution_started=plan.get("started_at") is not None,
+                      next_action={"tool": "get_host_command", "arguments": {
+                          "project": project, "operation_id": operation_id}},
+                      guidance=("The user explicitly approved and requested execution. "
+                                "Read the returned plan state and get_host_command; "
+                                "do not call execute_host_command again. An expired plan "
+                                "was not started and needs a new plan."))
+        confirmed["content"] = [{"type": "text", "text": json.dumps(public, ensure_ascii=False)}]
+        return confirmed
+
     def cancel(self, project, operation_id, *, card_id, confirmation_token):
         self._scope(project, operation_id)
         with _lock(self.locks_dir / (operation_id + ".lock")):
@@ -241,7 +264,9 @@ def tool_specs(projects):
     }
     for name in sorted(NAMES):
         opener = name.startswith("open_")
+        execute = name == "confirm_and_execute_host_command"
         title = ("호스트 명령 승인 카드" if opener else
+                 "호스트 명령 승인하고 실행" if execute else
                  "호스트 명령 계획 승인" if name.startswith("confirm_") else "호스트 명령 승인 취소")
         metadata = {"ui": {"visibility": ["model"] if opener else ["app"]},
                     "openai/widgetAccessible": not opener}
@@ -252,13 +277,18 @@ def tool_specs(projects):
                "description": ("Open the exact registered command plan in a user confirmation card. "
                    "Opening never approves or executes. An already approved plan returns its "
                    "verified receipt and next action without another approval."
-                   if opener else "App-only callback using the hidden one-use exact-plan capability. "
+                   if opener else
+                   "App-only explicit approve-and-execute action using the hidden exact-plan "
+                   "capability. Approve and submit this one pinned command in the same callback; "
+                   "read the returned state instead of calling execute_host_command again. "
+                   "Never request the capability in chat."
+                   if execute else "App-only callback using the hidden one-use exact-plan capability. "
                    "Never execute a command. Never request the capability in chat."),
                "inputSchema": {"type": "object", "properties": {
                    key: properties[key] for key in sorted(_REQUIRED[name])},
                    "required": sorted(_REQUIRED[name]), "additionalProperties": False},
-               "annotations": {"readOnlyHint": False, "destructiveHint": False,
-                               "idempotentHint": False, "openWorldHint": False},
+               "annotations": {"readOnlyHint": False, "destructiveHint": execute,
+                               "idempotentHint": False, "openWorldHint": execute},
                "_meta": metadata}
 
 
@@ -287,7 +317,9 @@ class HostCommandApprovalTools:
             self.validate_arguments(name, arguments)
             if self.manager is None:
                 self.manager = HostCommandApprovals(self.commands.manager())
-            return await asyncio.to_thread(getattr(self.manager, name.split("_", 1)[0]), **arguments)
+            action = ("confirm_and_execute" if name == "confirm_and_execute_host_command"
+                      else name.split("_", 1)[0])
+            return await asyncio.to_thread(getattr(self.manager, action), **arguments)
         except HostRuntimeError as exc:
             raise ValueError(exc.code) from None
         except Exception as exc:
