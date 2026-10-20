@@ -1,6 +1,6 @@
 # Dashboard RPG Stage 2 — 스킬 발동 표시
 
-> 최신 운영: a6a788b75b5b900a6ac1 반영·운영 UI 검증 완료. 현재 채팅의 connector 스키마 새로고침이 남아 있다. 아래 최신 운영 반영 절을 참조한다.
+> 2026-10-20 후속 검증: 현재 MCP의 skill_id/skill_name 실제 보고가 accepted=1 / provenance=reported로 성공했고, 운영 대시보드에서 항목을 클릭해 스킬 식별자와 출처 표시까지 확인했다. 아래의 connector 캐시 차단 기록은 당시 이력이다. 최신 상태와 남은 범위는 [종료 점검](2026-10-20-personal-ops-closeout.md)을 참조한다.
 
 작성: 2026-10-19. 기준 HEAD: `bcab942717c72c8a3108488570ae3f6ad8a5efbf`.
 
