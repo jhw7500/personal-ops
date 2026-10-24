@@ -2,6 +2,7 @@
 import importlib
 import importlib.util
 import json
+import os
 import shutil
 from pathlib import Path
 import sys
@@ -62,6 +63,112 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertNotIn("never-return-this-value", json.dumps(result))
         self.assertEqual(self.project.joinpath(".gitignore").read_text(), "build/\n.env\n")
         self.assertEqual(len(payload["file_sha256"]), 64)
+
+    def test_version_two_reads_owner_selected_text_directory_without_reregistering(self):
+        reports = self.project / "qa/reports"
+        self.policy = {
+            "version": 2,
+            "base_root": str(self.base),
+            "artifacts": [
+                {
+                    "project": "alpha", "path": "qa/json", "kind": "directory",
+                    "operations": ["list", "read"], "fields": ["status"],
+                    "content_mode": "json_fields", "recursive": True,
+                    "max_file_bytes": 1048576,
+                },
+                {
+                    "project": "alpha", "path": "qa/reports", "kind": "directory",
+                    "operations": ["list", "read"], "fields": [],
+                    "content_mode": "text", "recursive": True,
+                    "max_file_bytes": 1048576,
+                },
+            ],
+        }
+        self.config.write_text(json.dumps(self.policy))
+        self.project.joinpath(".gitignore").write_text("qa/\n")
+        tools = self.tools()
+        reports.mkdir(parents=True)
+        self.project.joinpath("qa/json").mkdir()
+        self.project.joinpath("qa/json/result.json").write_text(json.dumps({
+            "status": "ok", "new_key": "json-hidden",
+        }))
+        report = reports / "run.txt"
+        report.write_text("상태: 통과\nnew_key: text-visible\n")
+
+        json_result, json_payload = self.call(
+            tools, "read_registered_artifact", relative_path="qa/json/result.json",
+        )
+        text_result, text_payload = self.call(
+            tools, "read_registered_artifact", relative_path="qa/reports/run.txt",
+        )
+
+        self.assertFalse(json_result["isError"], json_result)
+        self.assertEqual(json.loads(json_payload["content"]), {"status": "ok"})
+        self.assertNotIn("json-hidden", json.dumps(json_result))
+        self.assertFalse(text_result["isError"], text_result)
+        self.assertEqual(text_payload["content"], report.read_text())
+        self.assertEqual(text_payload["policy_version"], 2)
+
+    def test_text_artifact_utf8_pages_bind_cursor_to_file_and_path(self):
+        self.policy["version"] = 2
+        self.policy["artifacts"][0].update(content_mode="text", fields=[])
+        self.config.write_text(json.dumps(self.policy))
+        self.result.write_text("가나다라마바사아자차카타파하")
+        tools = self.tools()
+
+        first_result, first = self.call(
+            tools, "read_registered_artifact",
+            relative_path="build/results/result.json", max_bytes=5,
+        )
+        self.assertFalse(first_result["isError"], first_result)
+        self.assertEqual(first["content"], "가")
+        self.assertTrue(first["has_more"])
+        second_result, second = self.call(
+            tools, "read_registered_artifact",
+            relative_path="build/results/result.json", max_bytes=5,
+            cursor=first["next_cursor"],
+        )
+        self.assertFalse(second_result["isError"], second_result)
+        self.assertEqual(second["content"], "나")
+        self.result.write_text("changed")
+        stale, _ = self.call(
+            tools, "read_registered_artifact",
+            relative_path="build/results/result.json", max_bytes=5,
+            cursor=first["next_cursor"],
+        )
+        self.assertTrue(stale["isError"])
+
+    def test_text_artifacts_reject_oversize_binary_link_special_and_secret_files(self):
+        self.policy["version"] = 2
+        self.policy["artifacts"][0].update(
+            content_mode="text", fields=[], max_file_bytes=64,
+        )
+        self.config.write_text(json.dumps(self.policy))
+        tools = self.tools()
+        directory = self.result.parent
+        self.result.write_bytes(b"x" * 65)
+        binary = directory / "binary.txt"
+        binary.write_bytes(b"ok\xffbad")
+        secret = directory / "secret.txt"
+        secret.write_text("Bearer synthetic-secret-token-value")
+        linked = directory / "linked.txt"
+        linked.symlink_to(secret)
+        fifo = directory / "pipe.txt"
+        os.mkfifo(fifo, 0o600)
+
+        for relative in (
+            "build/results/result.json",
+            "build/results/binary.txt",
+            "build/results/secret.txt",
+            "build/results/linked.txt",
+            "build/results/pipe.txt",
+        ):
+            with self.subTest(relative=relative):
+                denied, payload = self.call(
+                    tools, "read_registered_artifact", relative_path=relative,
+                )
+                self.assertTrue(denied["isError"])
+                self.assertNotIn("content", payload)
 
     def test_unregistered_artifact_is_a_protocol_error_without_payload(self):
         tools = self.tools()

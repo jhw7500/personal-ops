@@ -56,11 +56,13 @@
 - Consumes: Task 1 lifetime/version/revision contract and explicit owner enable boundary.
 - Produces: existing approval tools/admin API accept optional `lifetime`; active suitable grant returns existing authorization without a pending card. Existing execution APIs preserve request-ID dedupe and job timeout/cancel behavior with nullable v2 expiry.
 
-- [ ] **Step 1: Write tests before implementation.** Assert active grant causes zero extra requests/cards, stronger capability request still requires approval, stale option/card callbacks fail after revoke, until_revoked has no date parsing/clamp, timed grants still clamp, ten jobs reuse one grant with distinct request IDs, same ID never executes twice, UI accurately displays installation/OS account scope and lifetime.
-- [ ] **Step 2: Run focused RED tests.** Host-access approval/router/admin, host-execution and Node UI tests; expected new assertions fail for missing behavior.
-- [ ] **Step 3: Implement existing-tool integration.** Preserve spent-before-issue semantics and hidden confirmation tokens. Keep finite TTL for cards and isolated agent plans. Do not convert unrelated `agent_tasks.expires_at` into nullable grant expiry. Correct server instructions to use generic host execution when authorized and fixed profiles only for their dedicated workflow. Do not mislabel write tools as read-only.
-- [ ] **Step 4: Run focused GREEN, Node UI tests and the MCP suite.** Record browser bridge mock coverage separately from actual ChatGPT end-to-end observations.
-- [ ] **Step 5: Commit this task using jhw-commit v1.** No runtime deployment or existing-user grant change.
+- [x] **Step 1: Write tests before implementation.** Assert active grant causes zero extra requests/cards, stronger capability request still requires approval, stale option/card callbacks fail after revoke, until_revoked has no date parsing/clamp, timed grants still clamp, ten jobs reuse one grant with distinct request IDs, same ID never executes twice, UI accurately displays installation/OS account scope and lifetime.
+- [x] **Step 2: Run focused RED tests.** Host-access approval/router/admin, host-execution and Node UI tests; expected new assertions fail for missing behavior.
+- [x] **Step 3: Implement existing-tool integration.** Preserve spent-before-issue semantics and hidden confirmation tokens. Keep finite TTL for cards and isolated agent plans. Do not convert unrelated `agent_tasks.expires_at` into nullable grant expiry. Correct server instructions to use generic host execution when authorized and fixed profiles only for their dedicated workflow. Do not mislabel write tools as read-only.
+- [x] **Step 4: Run focused GREEN, Node UI tests and the MCP suite.** Record browser bridge mock coverage separately from actual ChatGPT end-to-end observations.
+- [x] **Step 5: Commit this task using jhw-commit v1.** No runtime deployment or existing-user grant change.
+
+Task 2 evidence note: initial Node/browser RED output was not retained; Python RED and final GREEN were recorded. Fix round 1 separately captured failing Python and Node regressions before correction.
 
 ### Task 3: QA 산출물 디렉터리 단위 읽기
 

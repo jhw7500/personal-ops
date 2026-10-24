@@ -284,6 +284,65 @@ class WorkspacePolicyTest(unittest.TestCase):
         self.assertIn(self.owner, snapshot.protected_paths)
         self.assertIn(self.project / "protected", snapshot.protected_paths)
 
+    def test_version_two_registers_not_yet_created_text_directory(self):
+        document = self.policy_document(version=2)
+        document["artifacts"] = [{
+            "project": "repo",
+            "path": "qa/reports",
+            "kind": "directory",
+            "operations": ["list", "read"],
+            "fields": [],
+            "content_mode": "text",
+            "recursive": True,
+            "max_file_bytes": 1048576,
+        }]
+        self.assertFalse(self.project.joinpath("qa/reports").exists())
+        self.write_policy(document)
+
+        snapshot = WorkspacePolicy(
+            {"repo": self.project}, config_path=self.config,
+        ).load(required=True)
+
+        self.assertEqual(snapshot.version, 2)
+        self.assertEqual(snapshot.artifacts[0]["content_mode"], "text")
+        self.assertEqual(snapshot.artifacts[0]["fields"], ())
+
+    def test_policy_versions_keep_exact_content_mode_schemas(self):
+        legacy_with_mode = self.policy_document()
+        legacy_with_mode["artifacts"][0]["content_mode"] = "json_fields"
+        version_two_without_mode = self.policy_document(version=2)
+        version_two_text_fields = self.policy_document(version=2)
+        for rule in version_two_text_fields["artifacts"]:
+            rule["content_mode"] = "json_fields"
+        version_two_text_fields["artifacts"][0].update(
+            content_mode="text", fields=["status"]
+        )
+        invalid_documents = [
+            legacy_with_mode,
+            version_two_without_mode,
+            version_two_text_fields,
+        ]
+
+        for document in invalid_documents:
+            with self.subTest(document=document):
+                self.write_policy(document)
+                self.assert_code(
+                    "INVALID_POLICY",
+                    WorkspacePolicy({"repo": self.project}, config_path=self.config).load,
+                    required=True,
+                )
+
+        version_two_json = self.policy_document(version=2)
+        for rule in version_two_json["artifacts"]:
+            rule["content_mode"] = "json_fields"
+        self.write_policy(version_two_json)
+        snapshot = WorkspacePolicy(
+            {"repo": self.project}, config_path=self.config,
+        ).load(required=True)
+        self.assertTrue(all(
+            rule["content_mode"] == "json_fields" for rule in snapshot.artifacts
+        ))
+
     def test_load_allows_omitted_optional_protected_paths(self):
         document = self.policy_document()
         del document["protected_paths"]
