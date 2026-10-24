@@ -148,7 +148,7 @@ class InstallationGrantState:
             if grant["grant_state_revision"] != state["grant_state_revision"]:
                 _invalid()
         elif (grant["grant_state_revision"] + 1
-              != state["grant_state_revision"] or state["requests"]):
+              != state["grant_state_revision"]):
             _invalid()
 
     @staticmethod

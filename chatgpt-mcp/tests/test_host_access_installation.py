@@ -224,6 +224,28 @@ class HostAccessInstallationTests(unittest.TestCase):
             ),
         )
 
+    def test_revoked_grant_can_be_replaced_through_public_request_and_approval(self):
+        self.enable()
+        revoked = self.approve("alpha")
+        self.access.revoke_web(
+            "beta", grant_id=revoked["grant_id"], confirmation="beta",
+        )
+
+        request = self.access.request("beta")
+        replacement = self.access.approve_web(
+            "beta", request_id=request["request_id"], lifetime="timed",
+            duration_seconds=120, allow_codex=True, confirmation="beta",
+        )
+
+        self.assertNotEqual(replacement["grant_id"], revoked["grant_id"])
+        self.assertEqual(replacement["grant_state_revision"], 4)
+        self.assertEqual(
+            self.access.require(
+                "alpha", grant_id=replacement["grant_id"], codex=True,
+            )["grant_id"],
+            replacement["grant_id"],
+        )
+
     def test_marker_blocks_v1_fallback_when_v2_state_is_missing_or_corrupt(self):
         legacy = self.approve(duration_seconds=60)
         self.enable()
@@ -328,7 +350,7 @@ class HostAccessInstallationTests(unittest.TestCase):
 
         self.assert_error("HOST_ACCESS_STATE_INVALID", lambda: self.access.get("alpha"))
 
-    def test_revoked_grant_requires_previous_revision_and_no_pending_requests(self):
+    def test_revoked_grant_requires_previous_revision_while_pending_stays_current(self):
         self.enable()
         grant = self.approve()
         pending = self.access.request("alpha")
@@ -347,6 +369,14 @@ class HostAccessInstallationTests(unittest.TestCase):
         state_path.write_text(json.dumps(revoked), encoding="utf-8")
         state_path.chmod(0o600)
 
+        status = self.access.get("alpha")
+        self.assertFalse(status["active"])
+        self.assertEqual(status["reason"], "REVOKED")
+        self.assertEqual(status["requests"][0]["request_id"], pending["request_id"])
+
+        revoked["requests"][pending["request_id"]]["grant_state_revision"] -= 1
+        state_path.write_text(json.dumps(revoked), encoding="utf-8")
+        state_path.chmod(0o600)
         self.assert_error("HOST_ACCESS_STATE_INVALID", lambda: self.access.get("alpha"))
 
         revoked["requests"] = {}
