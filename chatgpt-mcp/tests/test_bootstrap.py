@@ -124,6 +124,22 @@ class BootstrapTest(unittest.TestCase):
         self.assertFalse((self.config_home / "chatgpt-coding-mcp/runtime-key").exists())
         self.assertFalse((self.state_home / "chatgpt-coding-mcp/tunnel").exists())
 
+    def test_apply_creates_private_xdg_ancestors_independent_of_umask(self):
+        previous = os.umask(0o002)
+        try:
+            result = self.run_bootstrap(apply=True)
+        finally:
+            os.umask(previous)
+
+        self.assertEqual(result["status"], "configured")
+        for directory in (
+            self.config_home,
+            self.state_home,
+            self.home / ".local",
+            self.home / ".local/lib",
+        ):
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+
     def test_repeated_apply_preserves_matching_setup(self):
         first = self.run_bootstrap(apply=True)
         authority_state = (

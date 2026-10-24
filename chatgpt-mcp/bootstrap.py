@@ -41,12 +41,33 @@ def _json_bytes(value) -> bytes:
 
 
 def _private_directory(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = path.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.getuid()):
-        raise BootstrapError("UNSAFE_EXISTING_SETUP")
-    os.chmod(path, 0o700, follow_symlinks=False)
+    path = path.absolute()
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        created = False
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+                os.chmod(current, 0o700, follow_symlinks=False)
+                info = current.lstat()
+                created = True
+            except OSError as exc:
+                raise BootstrapError("UNSAFE_EXISTING_SETUP") from exc
+        except OSError as exc:
+            raise BootstrapError("UNSAFE_EXISTING_SETUP") from exc
+        mode = stat.S_IMODE(info.st_mode)
+        unsafe_writable = mode & (stat.S_IWGRP | stat.S_IWOTH) and not (
+            info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+        )
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or info.st_uid not in (0, os.getuid()) or unsafe_writable):
+            raise BootstrapError("UNSAFE_EXISTING_SETUP")
+        if current == path and (info.st_uid != os.getuid() or mode != 0o700):
+            if not created:
+                raise BootstrapError("UNSAFE_EXISTING_SETUP")
 
 
 def _write_new_private(path: Path, payload: bytes) -> None:
