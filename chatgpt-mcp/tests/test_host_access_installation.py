@@ -303,6 +303,69 @@ class HostAccessInstallationTests(unittest.TestCase):
         self.assert_error("HOST_ACCESS_STATE_INVALID", self.enable)
         self.assertFalse(state_path.exists())
 
+    def test_active_grant_revision_must_equal_current_state_revision(self):
+        self.enable()
+        grant = self.approve()
+        state_path = self.state / "host-access" / "installation-scope-v2.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["grant"]["grant_state_revision"] = 102
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        state_path.chmod(0o600)
+
+        self.assert_error(
+            "HOST_ACCESS_STATE_INVALID",
+            lambda: self.access.require("alpha", grant_id=grant["grant_id"]),
+        )
+
+    def test_pending_request_revision_must_equal_current_state_revision(self):
+        self.enable()
+        request = self.access.request("alpha")
+        state_path = self.state / "host-access" / "installation-scope-v2.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["requests"][request["request_id"]]["grant_state_revision"] = 99
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        state_path.chmod(0o600)
+
+        self.assert_error("HOST_ACCESS_STATE_INVALID", lambda: self.access.get("alpha"))
+
+    def test_revoked_grant_requires_previous_revision_and_no_pending_requests(self):
+        self.enable()
+        grant = self.approve()
+        pending = self.access.request("alpha")
+        state_path = self.state / "host-access" / "installation-scope-v2.json"
+        before_revoke = json.loads(state_path.read_text(encoding="utf-8"))
+        self.access.revoke_web(
+            "alpha", grant_id=grant["grant_id"], confirmation="alpha",
+        )
+        revoked = json.loads(state_path.read_text(encoding="utf-8"))
+        revoked["requests"][pending["request_id"]] = before_revoke["requests"][
+            pending["request_id"]
+        ]
+        revoked["requests"][pending["request_id"]]["grant_state_revision"] = revoked[
+            "grant_state_revision"
+        ]
+        state_path.write_text(json.dumps(revoked), encoding="utf-8")
+        state_path.chmod(0o600)
+
+        self.assert_error("HOST_ACCESS_STATE_INVALID", lambda: self.access.get("alpha"))
+
+        revoked["requests"] = {}
+        revoked["grant"]["grant_state_revision"] = revoked["grant_state_revision"]
+        state_path.write_text(json.dumps(revoked), encoding="utf-8")
+        state_path.chmod(0o600)
+        self.assert_error("HOST_ACCESS_STATE_INVALID", lambda: self.access.get("alpha"))
+
+    def test_non_object_persisted_request_is_a_bounded_state_error(self):
+        self.enable()
+        request = self.access.request("alpha")
+        state_path = self.state / "host-access" / "installation-scope-v2.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["requests"][request["request_id"]] = None
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        state_path.chmod(0o600)
+
+        self.assert_error("HOST_ACCESS_STATE_INVALID", lambda: self.access.get("alpha"))
+
 
 if __name__ == "__main__":
     unittest.main()

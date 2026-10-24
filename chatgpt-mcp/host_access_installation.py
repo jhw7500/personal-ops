@@ -132,11 +132,24 @@ class InstallationGrantState:
             _invalid()
         _timestamp(state["updated_at"])
         for identifier, request in state["requests"].items():
-            if identifier != request.get("request_id"):
+            if (not isinstance(request, dict)
+                    or identifier != request.get("request_id")):
                 _invalid()
             cls._validate_request(request, state)
-        if state["grant"] is not None:
-            cls._validate_grant(state["grant"], state)
+            if request["grant_state_revision"] != state["grant_state_revision"]:
+                _invalid()
+        grant = state["grant"]
+        if grant is None:
+            if state["grant_state_revision"] != 1:
+                _invalid()
+            return
+        cls._validate_grant(grant, state)
+        if grant["revoked_at"] is None:
+            if grant["grant_state_revision"] != state["grant_state_revision"]:
+                _invalid()
+        elif (grant["grant_state_revision"] + 1
+              != state["grant_state_revision"] or state["requests"]):
+            _invalid()
 
     @staticmethod
     def _validate_common(value, state, *, request):

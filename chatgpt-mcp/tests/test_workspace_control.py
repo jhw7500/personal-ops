@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from workspace_authority import WorkspaceAuthority  # noqa: E402
-from workspace_control import (MANDATORY_RELEASE_FILES, WorkspaceControlError,  # noqa: E402
+from workspace_control import (ABI3_MANDATORY_RELEASE_FILES, MANDATORY_RELEASE_FILES,  # noqa: E402
+                               WorkspaceControlError,
                                install_controller, main, transition_release,
                                verify_launch)
 
@@ -57,7 +58,10 @@ class WorkspaceControlTest(unittest.TestCase):
     def make_release(self, marker, *, omit=(), enforcement_abi=None,
                      capability_generation=None):
         manifest = {}
-        for name in MANDATORY_RELEASE_FILES:
+        files = set(MANDATORY_RELEASE_FILES)
+        if enforcement_abi is not None and enforcement_abi >= 3:
+            files.update(ABI3_MANDATORY_RELEASE_FILES)
+        for name in files:
             if name in omit:
                 continue
             content = ((f"# {marker}:{name}\n" if name == "workspace_control.py"
@@ -109,7 +113,9 @@ class WorkspaceControlTest(unittest.TestCase):
         self.assertFalse(self.authority_dir.exists())
 
     def test_active_authority_accepts_only_reviewed_full_manifest_digest_and_abi(self):
-        release, digest = self.make_release("compatible")
+        release, digest = self.make_release(
+            "compatible", enforcement_abi=3, capability_generation=1,
+        )
         binding = self.authority({digest: 3}).binding(POLICY_A)
 
         result = verify_launch(release, self.authority_dir)
@@ -129,6 +135,37 @@ class WorkspaceControlTest(unittest.TestCase):
 
         self.assert_code(
             "WORKSPACE_RELEASE_ABI_MISMATCH",
+            lambda: verify_launch(release, self.authority_dir),
+        )
+
+    def test_historical_abi_two_release_does_not_require_v3_host_access_helper(self):
+        release, digest = self.make_release(
+            "historical-two", enforcement_abi=2,
+            omit={"host_access.py", "host_access_installation.py"},
+        )
+        authority = WorkspaceAuthority(
+            {"demo": self.project}, state_dir=self.authority_dir,
+        )
+        authority.initialize(POLICY_A, {digest: 2}, minimum_abi=2)
+
+        admitted = verify_launch(release, self.authority_dir)
+
+        self.assertEqual(admitted["release_abi"], 2)
+        self.assertIsNone(admitted["host_access_capability_generation"])
+
+    def test_abi_three_release_requires_v3_host_access_helper(self):
+        release, digest = self.make_release(
+            "abi-three-missing-helper", enforcement_abi=3,
+            capability_generation=1,
+            omit={"host_access_installation.py"},
+        )
+        authority = WorkspaceAuthority(
+            {"demo": self.project}, state_dir=self.authority_dir,
+        )
+        authority.initialize(POLICY_A, {digest: 3}, minimum_abi=3)
+
+        self.assert_code(
+            "WORKSPACE_RELEASE_INCOMPATIBLE",
             lambda: verify_launch(release, self.authority_dir),
         )
 

@@ -20,6 +20,7 @@ from workspace_authority import WorkspaceAuthority  # noqa: E402
 from workspace_paths import WorkspaceError  # noqa: E402
 from host_runtime_config import HostRuntimeError  # noqa: E402
 from workspace_control import (  # noqa: E402
+    ABI3_MANDATORY_RELEASE_FILES,
     ENFORCEMENT_ABI,
     HOST_ACCESS_CAPABILITY_GENERATION,
     MANDATORY_RELEASE_FILES,
@@ -69,7 +70,10 @@ class WorkspaceActivationGateTest(unittest.TestCase):
     def release(self, marker="release", *, enforcement_abi=ENFORCEMENT_ABI):
         manifest = {}
         contents = {}
-        for name in MANDATORY_RELEASE_FILES:
+        files = set(MANDATORY_RELEASE_FILES)
+        if enforcement_abi >= 3:
+            files.update(ABI3_MANDATORY_RELEASE_FILES)
+        for name in files:
             payload = ((f"ENFORCEMENT_ABI = {enforcement_abi}\n"
                         + (f"HOST_ACCESS_CAPABILITY_GENERATION = "
                            f"{HOST_ACCESS_CAPABILITY_GENERATION}\n"

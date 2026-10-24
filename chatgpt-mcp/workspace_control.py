@@ -53,9 +53,11 @@ MANDATORY_RELEASE_FILES = frozenset({
     "workspace_paths.py", "workspace_policy.py", "workspace_authority.py",
     "workspace_jobs.py", "workspace_tools.py", "workspace_control.py",
     "workspace_files.py", "workspace_host.py", "workspace-launcher.py",
-    "host_access.py", "host_access_installation.py",
     "workspace-access-approval.html", "runtime_rollout_web.py",
     "runtime_rollout_worker.py",
+})
+ABI3_MANDATORY_RELEASE_FILES = frozenset({
+    "host_access.py", "host_access_installation.py",
 })
 ENFORCEMENT_ABI = 3
 HOST_ACCESS_CAPABILITY_GENERATION = 1
@@ -1084,11 +1086,13 @@ def verify_launch(release_dir, authority_dir=None, *, enforcement_required=False
         if not enforced:
             _fail("WORKSPACE_ENFORCEMENT_REQUIRED")
         release_path = Path(release_dir).absolute()
-        _, release_digest = _release_manifest(release_path)
+        manifest, release_digest = _release_manifest(release_path)
         abi = state["allowed_releases"].get(release_digest)
         if abi is None:
             _fail("WORKSPACE_RELEASE_UNLISTED")
         if abi > ENFORCEMENT_ABI:
+            _fail("WORKSPACE_RELEASE_INCOMPATIBLE")
+        if abi >= 3 and not ABI3_MANDATORY_RELEASE_FILES.issubset(manifest):
             _fail("WORKSPACE_RELEASE_INCOMPATIBLE")
         minimum_abi = _minimum_enforcement_abi(authority_path)
         if abi < minimum_abi:
