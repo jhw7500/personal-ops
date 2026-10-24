@@ -145,7 +145,8 @@ const calls = (app, method, endpoint) => app.requests.filter(
 
 test('markup describes the real trust boundary and exposes independent hooks', () => {
   for (const hook of ['host-access', 'host-access-state', 'host-access-identity', 'host-access-request',
-    'host-access-duration', 'host-access-codex', 'host-access-confirmation', 'host-access-token',
+    'host-access-lifetime', 'host-access-duration', 'host-access-codex',
+    'host-access-confirmation', 'host-access-token',
     'host-access-approve', 'host-access-revoke', 'host-execution', 'host-execution-state',
     'host-execution-stream', 'host-execution-log', 'host-execution-cancel']) {
     assert.match(ADMIN_HTML, new RegExp(`id="${hook}"`), hook);
@@ -314,7 +315,7 @@ test('approval uses selected request, thirty-day default, Codex consent, project
   const approve = calls(app, 'POST', '/api/host-access-approve');
   assert.equal(approve.length, 1);
   assert.deepEqual(approve[0].body, {
-    request_id: REQUEST, duration_seconds: 2592000, allow_codex: true,
+    request_id: REQUEST, lifetime: 'timed', duration_seconds: 2592000, allow_codex: true,
     confirmation: 'alpha', admin_token: 'fresh-token',
   });
   assert.equal(app.byId.get('host-access-token').value, '');
@@ -333,6 +334,37 @@ test('approval submits a thirty-day duration', async () => {
   await app.byId.get('host-access-approve').dispatch('click');
   await settle();
   assert.equal(calls(app, 'POST', '/api/host-access-approve')[0].body.duration_seconds, 2592000);
+});
+
+test('until-revoked request submits a null duration and remains locally active', async () => {
+  const app = await loadUi({routes: {
+    'GET /api/host-access': () => [200, access({version: 2, requests: [{
+      request_id: REQUEST, expires_at: '2026-10-15T05:00:00+00:00',
+      lifetime: 'until_revoked', grant_state_revision: 1,
+    }]})],
+  }});
+  assert.equal(app.byId.get('host-access-lifetime').value, 'until_revoked');
+  assert.equal(app.byId.get('host-access-duration').disabled, true);
+  app.byId.get('host-access-confirmation').value = 'alpha';
+  app.byId.get('host-access-token').value = 'fresh-token';
+  await app.byId.get('host-access-confirmation').dispatch('input');
+  await app.byId.get('host-access-token').dispatch('input');
+  assert.equal(app.byId.get('host-access-approve').disabled, false);
+  await app.byId.get('host-access-approve').dispatch('click');
+  await settle();
+  assert.deepEqual(calls(app, 'POST', '/api/host-access-approve')[0].body, {
+    request_id: REQUEST, lifetime: 'until_revoked', duration_seconds: null,
+    allow_codex: false, confirmation: 'alpha', admin_token: 'fresh-token',
+  });
+
+  const durable = await loadUi({routes: {
+    'GET /api/host-access': () => [200, access({
+      version: 2, active: true, reason: null, requests: [], grant_id: GRANT,
+      lifetime: 'until_revoked', expires_at: null, allow_codex: false,
+    })],
+  }});
+  assert.equal(text(durable, 'overview-access-state'), '활성 · 소유자가 취소할 때까지');
+  assert.match(text(durable, 'host-access-state'), /소유자가 취소할 때까지/);
 });
 
 test('approval rejects durations above thirty days', async () => {

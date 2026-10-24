@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import host_access  # noqa: E402
 from host_access import HostAccess  # noqa: E402
+from host_access_ui import HostAccessApprovals  # noqa: E402
 from host_runtime_config import HostRuntimeError  # noqa: E402
 from workspace_host import host_operation_lane  # noqa: E402
 from workspace_tools import WorkspaceTools  # noqa: E402
@@ -395,6 +396,113 @@ class HostAccessInstallationTests(unittest.TestCase):
         state_path.chmod(0o600)
 
         self.assert_error("HOST_ACCESS_STATE_INVALID", lambda: self.access.get("alpha"))
+
+    def test_approval_card_reuses_suitable_grant_without_request_or_card(self):
+        self.enable()
+        grant = self.approve(duration_seconds=3600, allow_codex=True)
+        approvals = HostAccessApprovals(self.access)
+
+        result = approvals.open(
+            "beta", lifetime="timed", duration_seconds=60, allow_codex=False,
+        )
+
+        receipt = result["structuredContent"]
+        self.assertEqual(receipt["state"], "approved")
+        self.assertEqual(receipt["grant"], {
+            **grant, "project": "beta",
+        })
+        self.assertEqual(receipt["lifetime"], "timed")
+        self.assertNotIn("_meta", result)
+        self.assertEqual(self.access.get("alpha")["requests"], [])
+        self.assertFalse(approvals._path("beta").exists())
+
+    def test_approval_card_requires_owner_decision_for_stronger_capability(self):
+        self.enable()
+        self.approve(duration_seconds=3600, allow_codex=False)
+        approvals = HostAccessApprovals(self.access)
+
+        codex = approvals.open(
+            "alpha", lifetime="timed", duration_seconds=60, allow_codex=True,
+        )
+        codex_card = codex["structuredContent"]
+        self.assertEqual(codex_card["state"], "pending")
+        self.assertEqual(codex_card["lifetime"], "timed")
+        approvals.cancel(
+            "alpha", card_id=codex_card["card_id"],
+            confirmation_token=codex["_meta"]["host_access_confirmation"],
+        )
+
+        durable = approvals.open(
+            "beta", lifetime="until_revoked", duration_seconds=None,
+            allow_codex=False,
+        )
+        durable_card = durable["structuredContent"]
+        self.assertEqual(durable_card["state"], "pending")
+        self.assertEqual(durable_card["lifetime"], "until_revoked")
+        self.assertIsNone(durable_card["duration_seconds"])
+        self.assertEqual(len(self.access.get("alpha")["requests"]), 1)
+
+    def test_revoke_invalidates_pending_card_update_and_confirmation(self):
+        self.enable()
+        grant = self.approve(duration_seconds=3600)
+        approvals = HostAccessApprovals(self.access)
+        opened = approvals.open(
+            "alpha", lifetime="timed", duration_seconds=60, allow_codex=True,
+        )
+        card = opened["structuredContent"]
+        token = opened["_meta"]["host_access_confirmation"]
+
+        self.access.revoke_web(
+            "beta", grant_id=grant["grant_id"], confirmation="beta",
+        )
+
+        for callback in (
+            lambda: approvals.update(
+                "alpha", card_id=card["card_id"], confirmation_token=token,
+                lifetime="timed", duration_seconds=120, allow_codex=True,
+            ),
+            lambda: approvals.confirm(
+                "alpha", card_id=card["card_id"], confirmation_token=token,
+            ),
+        ):
+            self.assert_error("HOST_ACCESS_CARD_STALE", callback)
+
+    def test_until_revoked_card_never_parses_or_clamps_duration(self):
+        self.enable()
+        approvals = HostAccessApprovals(self.access)
+
+        opened = approvals.open(
+            "alpha", lifetime="until_revoked", duration_seconds=None,
+            allow_codex=False,
+        )
+        card = opened["structuredContent"]
+        approved = approvals.confirm(
+            "alpha", card_id=card["card_id"],
+            confirmation_token=opened["_meta"]["host_access_confirmation"],
+        )["structuredContent"]["grant"]
+
+        self.assertEqual(approved["lifetime"], "until_revoked")
+        self.assertIsNone(approved["expires_at"])
+
+    def test_card_lifetime_change_replaces_backing_request(self):
+        self.enable()
+        approvals = HostAccessApprovals(self.access)
+        opened = approvals.open("alpha", duration_seconds=60)
+        first = opened["structuredContent"]
+
+        updated = approvals.update(
+            "alpha", card_id=first["card_id"],
+            confirmation_token=opened["_meta"]["host_access_confirmation"],
+            lifetime="until_revoked", duration_seconds=None, allow_codex=False,
+        )
+
+        second = updated["structuredContent"]
+        self.assertNotEqual(second["request_id"], first["request_id"])
+        self.assertEqual(second["lifetime"], "until_revoked")
+        self.assertEqual(
+            [request["request_id"] for request in self.access.get("alpha")["requests"]],
+            [second["request_id"]],
+        )
 
 
 if __name__ == "__main__":

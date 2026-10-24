@@ -232,7 +232,8 @@ class HostExecution:
             "result": state.get("result"),
             "termination_verified": state.get("termination_verified"),
             "authorization": {"kind": "host_access", "grant_id": frozen["grant_id"],
-                              "expires_at": frozen["grant_expires_at"]},
+                              "expires_at": frozen["grant_expires_at"],
+                              "lifetime": frozen.get("grant_lifetime", "timed")},
             "work_context": _command_work_context(frozen),
         }
         if frozen["kind"] == "codex":
@@ -350,8 +351,14 @@ class HostExecution:
         executable, executable_sha256 = self._freeze_executable(executable, codex=codex)
         task_label = _safe_task_label(task_label)
         grant = self.access.require(project, codex=codex)
+        lifetime = grant.get("lifetime", "timed") if isinstance(grant, dict) else None
+        expires_at = grant.get("expires_at") if isinstance(grant, dict) else None
+        version = grant.get("version", 1) if isinstance(grant, dict) else None
         if (not isinstance(grant, dict) or not isinstance(grant.get("grant_id"), str)
-                or not isinstance(grant.get("expires_at"), str)):
+                or version not in {1, 2}
+                or lifetime not in {"timed", "until_revoked"}
+                or lifetime == "timed" and not isinstance(expires_at, str)
+                or lifetime == "until_revoked" and (version != 2 or expires_at is not None)):
             raise HostRuntimeError("INVALID_HOST_ACCESS_GRANT")
         frozen = {
             "project": project, "project_root": str(root), "kind": "codex" if codex else "command",
@@ -359,6 +366,7 @@ class HostExecution:
             "argv": list(argv), "cwd_relative": cwd, "timeout_seconds": timeout_seconds,
             "input_text": input_text, "agent_metadata": metadata,
             "grant_id": grant["grant_id"], "grant_expires_at": grant["expires_at"],
+            "grant_lifetime": lifetime,
         }
         if task_label is not None:
             frozen["task_label"] = task_label
@@ -609,10 +617,17 @@ class HostExecution:
                 cancel, state["project"], frozen["grant_id"], codex, operation_id)
             grant = self.access.require(
                 state["project"], grant_id=frozen["grant_id"], codex=codex)
-            remaining = (_timestamp(grant["expires_at"]) - _now()).total_seconds()
-            if remaining < 1:
-                raise HostRuntimeError("HOST_ACCESS_DENIED")
-            frozen = dict(frozen, timeout_seconds=min(frozen["timeout_seconds"], int(remaining)))
+            lifetime = grant.get("lifetime", "timed")
+            if lifetime == "timed":
+                remaining = (_timestamp(grant["expires_at"]) - _now()).total_seconds()
+                if remaining < 1:
+                    raise HostRuntimeError("HOST_ACCESS_DENIED")
+                frozen = dict(
+                    frozen,
+                    timeout_seconds=min(frozen["timeout_seconds"], int(remaining)),
+                )
+            elif lifetime != "until_revoked" or grant.get("expires_at") is not None:
+                raise HostRuntimeError("INVALID_HOST_ACCESS_GRANT")
             with _lock(self.lock_path):
                 current = self._load(operation_id)
                 current.update(phase="EXECUTE")

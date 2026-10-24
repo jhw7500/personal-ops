@@ -117,6 +117,18 @@ class AdminHostAccessTest(unittest.TestCase):
         self.assertTrue(self.access.get("demo")["active"])
         self.assertEqual(self.execution.cancelled, [])
 
+    def test_owner_api_accepts_optional_lifetime_but_legacy_rejects_durable_grant(self):
+        endpoint = "/api/host-access-approve?project=demo"
+        body = self.body(lifetime="timed")
+        self.assertEqual(self.request("POST", endpoint, body)[0], 200)
+
+        replacement = self.access.request("demo")
+        durable = self.body(
+            request_id=replacement["request_id"], lifetime="until_revoked",
+            duration_seconds=None,
+        )
+        self.assertEqual(self.request("POST", endpoint, durable)[0], 400)
+
     def test_cancel_requires_fresh_owner_authentication(self):
         body = {"operation_id": "a" * 32, "confirmation": "demo", "admin_token": self.token}
         route = "/api/host-execution-cancel?project=demo"

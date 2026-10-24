@@ -231,14 +231,13 @@ class ChatHostAccessApprovalTests(unittest.TestCase):
         self.assertEqual(self.access.require("alpha"), grant)
 
     def test_cancel_storage_failure_keeps_pending_card_retryable(self):
-        import host_access_ui
         opened = self.open()
-        save = host_access_ui._save_private_json
+        save = host_access._save_private_json
         def fail_request_save(path, value):
             if path == self.access._record_path("alpha"):
                 raise OSError("temporary fixture storage failure")
             return save(path, value)
-        with mock.patch.object(host_access_ui, "_save_private_json", side_effect=fail_request_save):
+        with mock.patch.object(host_access, "_save_private_json", side_effect=fail_request_save):
             with self.assertRaises(OSError):
                 self.cards.cancel("alpha", **self.args(opened))
         result = self.cards.cancel("alpha", **self.args(opened))

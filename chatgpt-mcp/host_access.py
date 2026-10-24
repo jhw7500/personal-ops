@@ -618,6 +618,184 @@ class HostAccess:
             self.installation.save(state)
             return self._v2_request_public(project, request)
 
+    @staticmethod
+    def _grant_satisfies(grant, *, lifetime, duration_seconds, allow_codex, now):
+        if grant is None or grant.get("revoked_at") is not None:
+            return False
+        if allow_codex and grant.get("allow_codex") is not True:
+            return False
+        grant_lifetime = grant.get("lifetime", "timed")
+        if lifetime == "until_revoked" and grant_lifetime != "until_revoked":
+            return False
+        if grant_lifetime == "until_revoked":
+            return True
+        expires_at = _timestamp(grant.get("expires_at"))
+        return (lifetime == "timed" and expires_at > now
+                and (expires_at - now).total_seconds() >= duration_seconds)
+
+    @staticmethod
+    def _validate_card_options(*, lifetime, duration_seconds, allow_codex):
+        if lifetime not in {"timed", "until_revoked"}:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_LIFETIME")
+        if lifetime == "timed":
+            if (type(duration_seconds) is not int or duration_seconds <= 0
+                    or duration_seconds > MAX_DURATION_SECONDS):
+                raise HostRuntimeError("INVALID_HOST_ACCESS_DURATION")
+        elif duration_seconds is not None:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_DURATION")
+        if type(allow_codex) is not bool:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_REQUEST")
+
+    def _begin_card_request_v1(self, project, *, lifetime, duration_seconds, allow_codex):
+        root = self._project_root(project)
+        if lifetime != "timed":
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED")
+        binding = self._binding(root)
+        now = _utcnow()
+        with _lock(self._lock_path(project)):
+            record = self._load(project, root)
+            record["requests"] = [item for item in record["requests"]
+                                  if _timestamp(item["expires_at"]) > now]
+            grant = record["grant"]
+            if (grant is not None
+                    and self._binding_error(grant, binding) is None
+                    and self._grant_satisfies(
+                        grant, lifetime=lifetime, duration_seconds=duration_seconds,
+                        allow_codex=allow_codex, now=now)):
+                return {"grant": self._grant_public(project, grant), "request": None}
+            request = {
+                "request_id": secrets.token_hex(16),
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(seconds=REQUEST_TTL_SECONDS)).isoformat(),
+                **binding,
+            }
+            record["requests"].append(request)
+            _save_private_json(self._record_path(project), record)
+            return {"grant": None, "request": self._request_public(project, request)}
+
+    def _begin_card_request_v2(self, project, *, lifetime, duration_seconds, allow_codex):
+        self._project_root(project)
+        with self._v2_locked() as state:
+            now = _utcnow()
+            state["requests"] = {
+                key: item for key, item in state["requests"].items()
+                if _timestamp(item["expires_at"]) > now
+            }
+            grant = state["grant"]
+            if self._grant_satisfies(
+                    grant, lifetime=lifetime, duration_seconds=duration_seconds,
+                    allow_codex=allow_codex, now=now):
+                return {
+                    "grant": self._v2_grant_public(
+                        project, grant, state["grant_state_revision"]),
+                    "request": None,
+                }
+            request = {
+                "request_id": secrets.token_hex(16),
+                "project": project,
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(seconds=REQUEST_TTL_SECONDS)).isoformat(),
+                "lifetime": lifetime,
+                "grant_state_revision": state["grant_state_revision"],
+                "installation_id": state["installation_id"],
+                "uid": state["uid"],
+                "capability_generation": state["capability_generation"],
+            }
+            state["requests"][request["request_id"]] = request
+            state["updated_at"] = now.isoformat()
+            self.installation.save(state)
+            return {"grant": None, "request": self._v2_request_public(project, request)}
+
+    def begin_card_request(self, project, *, lifetime="timed",
+                           duration_seconds=DEFAULT_DURATION_SECONDS, allow_codex=False):
+        self._validate_card_options(
+            lifetime=lifetime, duration_seconds=duration_seconds, allow_codex=allow_codex)
+        if lifetime != "timed" and not self._v2_marker_present():
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED")
+        return self._versioned(
+            lambda: self._begin_card_request_v2(
+                project, lifetime=lifetime, duration_seconds=duration_seconds,
+                allow_codex=allow_codex),
+            lambda: self._begin_card_request_v1(
+                project, lifetime=lifetime, duration_seconds=duration_seconds,
+                allow_codex=allow_codex),
+        )
+
+    def card_request_valid(self, project, *, request_id, lifetime,
+                           grant_state_revision=None):
+        root = self._project_root(project)
+        if self._v2_marker_present():
+            with self._v2_locked() as state:
+                request = state["requests"].get(request_id)
+                return bool(request is not None
+                            and request["project"] == project
+                            and request["lifetime"] == lifetime
+                            and request["grant_state_revision"] == grant_state_revision
+                            and _timestamp(request["expires_at"]) > _utcnow())
+        if lifetime != "timed" or grant_state_revision is not None:
+            return False
+        with _lock(self._lock_path(project)):
+            record = self._load(project, root)
+            return any(item["request_id"] == request_id
+                       and _timestamp(item["expires_at"]) > _utcnow()
+                       and self._binding_error(item, self._binding(root), request=True) is None
+                       for item in record["requests"])
+
+    def replace_card_request(self, project, *, request_id, lifetime,
+                             grant_state_revision=None):
+        root = self._project_root(project)
+        if lifetime != "timed" and not self._v2_marker_present():
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED")
+        if self._v2_marker_present():
+            with self._v2_locked() as state:
+                old = state["requests"].get(request_id)
+                if (old is None or old["project"] != project
+                        or old["grant_state_revision"] != grant_state_revision
+                        or _timestamp(old["expires_at"]) <= _utcnow()):
+                    raise HostRuntimeError("HOST_ACCESS_REQUEST_STALE")
+                now = _utcnow()
+                request = {
+                    **old,
+                    "request_id": secrets.token_hex(16),
+                    "created_at": now.isoformat(),
+                    "expires_at": (now + timedelta(seconds=REQUEST_TTL_SECONDS)).isoformat(),
+                    "lifetime": lifetime,
+                }
+                state["requests"].pop(request_id)
+                state["requests"][request["request_id"]] = request
+                state["updated_at"] = now.isoformat()
+                self.installation.save(state)
+                return self._v2_request_public(project, request)
+        if lifetime != "timed" or grant_state_revision is not None:
+            raise HostRuntimeError("HOST_ACCESS_REQUEST_STALE")
+        with _lock(self._lock_path(project)):
+            record = self._load(project, root)
+            old = next((item for item in record["requests"]
+                        if item["request_id"] == request_id), None)
+            if old is None or _timestamp(old["expires_at"]) <= _utcnow():
+                raise HostRuntimeError("HOST_ACCESS_REQUEST_STALE")
+            return self._request_public(project, old)
+
+    def discard_card_request(self, project, *, request_id, required=False):
+        root = self._project_root(project)
+        if self._v2_marker_present():
+            with self._v2_locked() as state:
+                found = request_id in state["requests"]
+                if required and not found:
+                    raise HostRuntimeError("HOST_ACCESS_CARD_REQUEST_CONSUMED")
+                state["requests"].pop(request_id, None)
+                state["updated_at"] = _utcnow().isoformat()
+                self.installation.save(state)
+                return
+        with _lock(self._lock_path(project)):
+            record = self._load(project, root)
+            found = any(item["request_id"] == request_id for item in record["requests"])
+            if required and not found:
+                raise HostRuntimeError("HOST_ACCESS_CARD_REQUEST_CONSUMED")
+            record["requests"] = [item for item in record["requests"]
+                                  if item["request_id"] != request_id]
+            _save_private_json(self._record_path(project), record)
+
     def _get_v2(self, project):
         self._project_root(project)
         with self._v2_locked() as state:

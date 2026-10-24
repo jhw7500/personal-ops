@@ -97,17 +97,23 @@
 
   function localAccessStatus() {
     const hasGrant = access?.active === true && ID.test(access.grant_id || '');
-    const expiry = Date.parse(access?.expires_at || '');
-    const validExpiry = Number.isFinite(expiry);
-    return {hasGrant, expiry, validExpiry,
-      active: hasGrant && validExpiry && expiry > Date.now(),
-      expired: hasGrant && validExpiry && expiry <= Date.now()};
+    const lifetime = access?.lifetime || 'timed';
+    const expiry = lifetime === 'timed' ? Date.parse(access?.expires_at || '') : Infinity;
+    const validExpiry = lifetime === 'until_revoked'
+      ? access?.version === 2 && access?.expires_at === null
+      : lifetime === 'timed' && Number.isFinite(expiry);
+    return {hasGrant, lifetime, expiry, validExpiry,
+      active: hasGrant && validExpiry && (lifetime === 'until_revoked' || expiry > Date.now()),
+      expired: hasGrant && lifetime === 'timed' && validExpiry && expiry <= Date.now()};
   }
 
   function renderButtons() {
     const fresh = hasFreshApproval();
+    const pending = selectedRequestData();
+    const lifetime = pending?.lifetime || 'timed';
+    const validDuration = lifetime === 'until_revoked' || validMinutes();
     $('host-access-approve').disabled = !(fresh && validHostIdentity(access?.host_identity)
-      && selectedRequestData() && validMinutes());
+      && pending && validDuration);
     $('host-access-revoke').disabled = !(fresh && localAccessStatus().active);
     const selected = executionDetail?.operation_id === selectedExecution
       ? executionDetail : selectedExecutionData();
@@ -147,6 +153,10 @@
       select.append(option);
     }
     select.value = selectedRequest;
+    const pending = selectedRequestData();
+    const requestedLifetime = pending?.lifetime || 'timed';
+    $('host-access-lifetime').value = requestedLifetime;
+    $('host-access-duration').disabled = requestedLifetime === 'until_revoked';
     if (focusHandled && focusedRequest && project === focusedRequest.project
         && access?.project === project && !focusScrolled) {
       focusScrolled = true;
@@ -178,7 +188,9 @@
       $('host-access-state').textContent = '프로젝트를 선택하세요.';
       $('host-access-guidance').textContent = '';
     } else if (localAccessStatus().active) {
-      $('host-access-state').textContent = '활성 · 만료 ' + String(access.expires_at || '')
+      const lifetimeText = access.lifetime === 'until_revoked'
+        ? '소유자가 취소할 때까지' : '만료 ' + String(access.expires_at || '');
+      $('host-access-state').textContent = '활성 · ' + lifetimeText
         + ' · Codex ' + (access.allow_codex === true ? '허용' : '허용 안 함');
       $('host-access-guidance').textContent = rows.length
         ? '새 요청을 승인하면 현재 액세스 시간이 새 승인으로 교체됩니다.'
@@ -218,7 +230,8 @@
     const local = localAccessStatus();
     const left = local.expiry - Date.now();
     if (local.active) {
-      const remaining = left >= 86400000
+      const remaining = local.lifetime === 'until_revoked' ? '소유자가 취소할 때까지'
+        : left >= 86400000
         ? `${Math.floor(left / 86400000)}일 ${Math.floor((left % 86400000) / 3600000)}시간 남음`
         : left >= 3600000
           ? `${Math.floor(left / 3600000)}시간 ${Math.floor((left % 3600000) / 60000)}분 남음`
@@ -499,13 +512,16 @@
 
   $('host-access-approve').addEventListener('click', () => {
     const pending = selectedRequestData();
-    const minutes = validMinutes();
+    const lifetime = pending?.lifetime || 'timed';
+    const minutes = lifetime === 'timed' ? validMinutes() : null;
     const expectedProject = project;
-    if (!pending || !minutes || !validHostIdentity(access?.host_identity)) return;
+    if (!pending || lifetime === 'timed' && !minutes
+        || !validHostIdentity(access?.host_identity)) return;
     const requestId = pending.request_id;
     void mutate('/api/host-access-approve', {
       request_id: requestId,
-      duration_seconds: minutes * 60,
+      lifetime,
+      duration_seconds: minutes === null ? null : minutes * 60,
       allow_codex: $('host-access-codex').checked === true,
       confirmation: expectedProject,
       admin_token: $('host-access-token').value,

@@ -223,6 +223,16 @@ class AdminBrowserTest(unittest.TestCase):
         duration.fill('43201')
         expect(self.page.locator('#host-access-approve')).to_be_disabled()
 
+    def test_host_access_lifetime_controls_match_installation_scope(self):
+        duration = self.prepare_host_access_duration_form()
+        lifetime = self.page.locator('#host-access-lifetime')
+        expect(lifetime).to_have_value('timed')
+        expect(self.page.locator('#host-access')).to_contain_text(
+            '이 MCP 설치 전체의 호출자')
+        expect(self.page.locator('#host-access')).to_contain_text('OS 호스트 사용자 계정')
+        expect(lifetime).to_be_disabled()
+        expect(duration).to_be_enabled()
+
     def test_rpg_default_map_and_mission_fit_first_viewport(self):
         expect(self.page.locator('#nav-workroom')).to_have_attribute('aria-selected', 'true')
         expect(self.page.locator('#overview-current-work')).to_be_hidden()

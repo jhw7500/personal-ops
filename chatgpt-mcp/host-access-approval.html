@@ -58,6 +58,7 @@
       <div class="row"><dt>프로젝트 문맥</dt><dd id="project">불러오는 중…</dd></div>
       <div class="row"><dt>작업 디렉터리</dt><dd><code id="root">불러오는 중…</code></dd></div>
       <div class="row"><dt>접근 범위</dt><dd>설치 전체 · 호스트 사용자 파일·네트워크·그룹 권한</dd></div>
+      <div class="row"><dt>유지 방식</dt><dd id="lifetime">불러오는 중…</dd></div>
       <div class="row"><dt>유지 시간</dt><dd id="duration">불러오는 중…</dd></div>
       <div class="row"><dt>Codex 호출</dt><dd id="codex">불러오는 중…</dd></div>
     </dl>
@@ -70,6 +71,11 @@
     <div class="meta"><span id="revision">개정 -</span><span id="expiry">만료 -</span></div>
 
     <form id="options" class="options" hidden>
+      <label for="lifetime-select">권한 유지 방식</label>
+      <select id="lifetime-select">
+        <option value="timed">시간 제한</option>
+        <option value="until_revoked">소유자가 취소할 때까지</option>
+      </select>
       <label for="duration-select">권한 유지 시간</label>
       <select id="duration-select">
         <option value="900">15분</option>
@@ -107,9 +113,11 @@
       host: document.querySelector("#host"), user: document.querySelector("#user"),
       groups: document.querySelector("#groups"),
       project: document.querySelector("#project"), root: document.querySelector("#root"),
-      duration: document.querySelector("#duration"), codex: document.querySelector("#codex"),
+      lifetime: document.querySelector("#lifetime"), duration: document.querySelector("#duration"),
+      codex: document.querySelector("#codex"),
       revision: document.querySelector("#revision"), expiry: document.querySelector("#expiry"),
-      options: document.querySelector("#options"), durationSelect: document.querySelector("#duration-select"),
+      options: document.querySelector("#options"), lifetimeSelect: document.querySelector("#lifetime-select"),
+      durationSelect: document.querySelector("#duration-select"),
       allowCodex: document.querySelector("#allow-codex"), approve: document.querySelector("#approve"),
       change: document.querySelector("#change"), cancel: document.querySelector("#cancel"),
       closeOptions: document.querySelector("#close-options"), status: document.querySelector("#status"),
@@ -190,14 +198,26 @@
 
     function validPublic(value) {
       const identity = value?.host_identity;
+      const validLifetime = value?.lifetime === "timed" || value?.lifetime === "until_revoked";
+      const validDuration = value?.lifetime === "timed"
+        ? Number.isInteger(value.duration_seconds) && value.duration_seconds >= 1 &&
+          value.duration_seconds <= 2592000
+        : value?.lifetime === "until_revoked" && value.duration_seconds === null;
+      const grant = value?.grant;
+      const grantLifetime = grant?.lifetime || "timed";
+      const validGrant = grant === undefined || grant && /^[0-9a-f]{32}$/.test(grant.grant_id) &&
+        grant.scope === "installation" && grant.project === value.project &&
+        (grantLifetime === "timed" && typeof grant.expires_at === "string" &&
+          !Number.isNaN(Date.parse(grant.expires_at)) ||
+         grantLifetime === "until_revoked" && grant.expires_at === null) &&
+        typeof grant.allow_codex === "boolean";
       return value && typeof value.project === "string" && value.project &&
         value.scope === "installation" && /^[0-9a-f]{32}$/.test(value.card_id) &&
         Number.isInteger(value.revision) && value.revision >= 1 &&
         ["pending", "approved", "cancelled"].includes(value.state) &&
         typeof value.expires_at === "string" && !Number.isNaN(Date.parse(value.expires_at)) &&
-        typeof value.project_root === "string" && value.project_root &&
-        Number.isInteger(value.duration_seconds) && value.duration_seconds >= 1 &&
-        value.duration_seconds <= 2592000 && typeof value.allow_codex === "boolean" &&
+        typeof value.project_root === "string" && value.project_root && validLifetime &&
+        validDuration && validGrant && typeof value.allow_codex === "boolean" &&
         identity && typeof identity.hostname === "string" && typeof identity.user === "string" &&
         Number.isInteger(identity.uid) && Array.isArray(identity.groups) &&
         identity.groups.every(group => typeof group === "string") &&
@@ -209,7 +229,8 @@
       const receipt = {
         project: value.project, scope: value.scope, card_id: value.card_id,
         revision: value.revision, state: value.state, expires_at: value.expires_at,
-        duration_seconds: value.duration_seconds, allow_codex: value.allow_codex,
+        lifetime: value.lifetime, duration_seconds: value.duration_seconds,
+        allow_codex: value.allow_codex,
       };
       if (value.grant) receipt.grant = value.grant;
       return receipt;
@@ -267,7 +288,8 @@
       elements.approve.disabled = disabled || !elements.options.hidden;
       elements.change.disabled = disabled;
       elements.cancel.disabled = disabled;
-      elements.durationSelect.disabled = disabled;
+      elements.lifetimeSelect.disabled = disabled;
+      elements.durationSelect.disabled = disabled || elements.lifetimeSelect.value === "until_revoked";
       elements.allowCodex.disabled = disabled;
       elements.options.querySelector("button[type=submit]").disabled = disabled;
       elements.closeOptions.disabled = busy;
@@ -285,11 +307,15 @@
       elements.groups.textContent = card.host_identity.groups.join(", ") || "없음";
       elements.project.textContent = card.project;
       elements.root.textContent = card.project_root;
-      elements.duration.textContent = formatDuration(card.duration_seconds);
+      elements.lifetime.textContent = card.lifetime === "until_revoked"
+        ? "취소할 때까지" : "시간 제한";
+      elements.duration.textContent = card.duration_seconds === null
+        ? "해당 없음" : formatDuration(card.duration_seconds);
       elements.codex.textContent = card.allow_codex ? "허용" : "허용 안 함";
       elements.revision.textContent = `개정 ${card.revision}`;
       elements.expiry.textContent = `카드 만료 ${new Date(card.expires_at).toLocaleString("ko-KR")}`;
-      ensureDurationOption(card.duration_seconds);
+      elements.lifetimeSelect.value = card.lifetime;
+      if (card.duration_seconds !== null) ensureDurationOption(card.duration_seconds);
       elements.allowCodex.checked = card.allow_codex;
       clearTimeout(expiryTimer);
       const remaining = Date.parse(card.expires_at) - Date.now();
@@ -365,18 +391,21 @@
     elements.closeOptions.addEventListener("click", () => {
       elements.options.hidden = true;
       if (card) {
-        ensureDurationOption(card.duration_seconds);
+        elements.lifetimeSelect.value = card.lifetime;
+        if (card.duration_seconds !== null) ensureDurationOption(card.duration_seconds);
         elements.allowCodex.checked = card.allow_codex;
       }
       syncControls();
     });
     elements.options.addEventListener("submit", event => {
       event.preventDefault();
-      const durationSeconds = Number(elements.durationSelect.value);
+      const lifetime = elements.lifetimeSelect.value;
+      const durationSeconds = lifetime === "timed" ? Number(elements.durationSelect.value) : null;
       callTool("update_host_access_approval", {
-        duration_seconds: durationSeconds, allow_codex: elements.allowCodex.checked,
+        lifetime, duration_seconds: durationSeconds, allow_codex: elements.allowCodex.checked,
       });
     });
+    elements.lifetimeSelect.addEventListener("change", syncControls);
 
     function updateTheme(context) {
       if (context?.theme === "light" || context?.theme === "dark") {

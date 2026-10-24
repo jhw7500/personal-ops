@@ -7,6 +7,7 @@ host/installation is inside this trust boundary; widget IDs are not identity.
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import hashlib
 import hmac
 import json
@@ -24,15 +25,21 @@ UI_URI = "ui://host-access/approval-v2.html"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 _BINDING_KEYS = {"boot_id", "runtime_identity", "uid", "project_root"}
-_FIELDS = _BINDING_KEYS | {
+_FIELDS_V1 = _BINDING_KEYS | {
     "version", "project", "card_id", "request_id", "created_at", "expires_at",
     "duration_seconds", "allow_codex", "revision", "token_digest", "state",
 }
+_FIELDS_V2 = _FIELDS_V1 | {"lifetime", "grant_state_revision"}
 
 
-def _options(duration_seconds, allow_codex):
-    if (type(duration_seconds) is not int
-            or not 1 <= duration_seconds <= host_access.MAX_DURATION_SECONDS):
+def _options(lifetime, duration_seconds, allow_codex):
+    if lifetime not in {"timed", "until_revoked"}:
+        raise HostRuntimeError("INVALID_HOST_ACCESS_LIFETIME")
+    if lifetime == "timed":
+        if (type(duration_seconds) is not int
+                or not 1 <= duration_seconds <= host_access.MAX_DURATION_SECONDS):
+            raise HostRuntimeError("INVALID_HOST_ACCESS_DURATION")
+    elif duration_seconds is not None:
         raise HostRuntimeError("INVALID_HOST_ACCESS_DURATION")
     if type(allow_codex) is not bool:
         raise HostRuntimeError("INVALID_HOST_ACCESS_REQUEST")
@@ -67,16 +74,24 @@ class HostAccessApprovals:
             raise HostRuntimeError("HOST_ACCESS_CARD_DENIED")
         try:
             card = _read_private_json(path)
-            if (set(card) != _FIELDS or card["version"] != 1 or card["project"] != project
+            version = card.get("version")
+            expected = _FIELDS_V1 if version == 1 else _FIELDS_V2
+            if (set(card) != expected or version not in {1, 2} or card["project"] != project
                     or type(card["revision"]) is not int or card["revision"] < 1
                     or card["state"] not in {"pending", "spent", "approved", "cancelled"}
                     or not isinstance(card["token_digest"], str)
                     or _TOKEN.fullmatch(card["token_digest"]) is None):
                 raise HostRuntimeError("HOST_ACCESS_CARD_STATE_INVALID")
-            _options(card["duration_seconds"], card["allow_codex"])
-            # The request validator also validates every persisted authority binding.
-            self.access._validate_request({key: card[key] for key in
-                _BINDING_KEYS | {"request_id", "created_at", "expires_at"}})
+            lifetime = card.get("lifetime", "timed")
+            _options(lifetime, card["duration_seconds"], card["allow_codex"])
+            if version == 1:
+                # The request validator also validates every persisted authority binding.
+                self.access._validate_request({key: card[key] for key in
+                    _BINDING_KEYS | {"request_id", "created_at", "expires_at"}})
+            elif (card["grant_state_revision"] is not None
+                  and (type(card["grant_state_revision"]) is not int
+                       or card["grant_state_revision"] < 1)):
+                raise HostRuntimeError("HOST_ACCESS_CARD_STATE_INVALID")
             if not isinstance(card["card_id"], str) or _ID.fullmatch(card["card_id"]) is None:
                 raise HostRuntimeError("HOST_ACCESS_CARD_STATE_INVALID")
             return card
@@ -96,20 +111,19 @@ class HostAccessApprovals:
             raise HostRuntimeError("HOST_ACCESS_CARD_SPENT")
         if host_access._timestamp(card["expires_at"]) <= host_access._utcnow():
             raise HostRuntimeError("HOST_ACCESS_CARD_EXPIRED")
-        if self.access._binding_error(card, self.access._binding(root), request=True):
+        if card["version"] == 1 or card.get("grant_state_revision") is None:
+            if self.access._binding_error(card, self.access._binding(root), request=True):
+                raise HostRuntimeError("HOST_ACCESS_CARD_STALE")
+        elif not self.access.card_request_valid(
+                project, request_id=card["request_id"], lifetime=card["lifetime"],
+                grant_state_revision=card["grant_state_revision"]):
             raise HostRuntimeError("HOST_ACCESS_CARD_STALE")
         return card
 
     def _discard_request(self, project, root, card, *, required=False):
-        # Cancellation/supersession must also invalidate the admin-visible request.
-        with _lock(self.access._lock_path(project)):
-            record = self.access._load(project, root)
-            if required and not any(item["request_id"] == card["request_id"]
-                                    for item in record["requests"]):
-                raise HostRuntimeError("HOST_ACCESS_CARD_REQUEST_CONSUMED")
-            record["requests"] = [item for item in record["requests"]
-                                  if item["request_id"] != card["request_id"]]
-            _save_private_json(self.access._record_path(project), record)
+        # HostAccess owns both legacy and installation-wide persistence locks.
+        self.access.discard_card_request(
+            project, request_id=card["request_id"], required=required)
 
     @staticmethod
     def _result(card, *, token=None, grant=None):
@@ -117,6 +131,9 @@ class HostAccessApprovals:
             "project", "card_id", "revision", "state", "expires_at", "project_root",
             "duration_seconds", "allow_codex",
         )}
+        public["request_id"] = card.get("request_id")
+        public["lifetime"] = card.get("lifetime", "timed")
+        public["grant_state_revision"] = card.get("grant_state_revision")
         public["scope"] = host_access.SCOPE
         public["host_identity"] = host_access._host_identity()
         if grant is not None:
@@ -127,36 +144,70 @@ class HostAccessApprovals:
             result["_meta"] = {"host_access_confirmation": token}
         return result
 
-    def open(self, project, *, duration_seconds=host_access.DEFAULT_DURATION_SECONDS,
-             allow_codex=False):
-        _options(duration_seconds, allow_codex)
+    def open(self, project, *, lifetime="timed", duration_seconds=None, allow_codex=False):
+        if lifetime == "timed" and duration_seconds is None:
+            duration_seconds = host_access.DEFAULT_DURATION_SECONDS
+        _options(lifetime, duration_seconds, allow_codex)
         root = self.access._project_root(project)
         with _lock(self._lock_path(project)):
             if self._path(project).exists() or self._path(project).is_symlink():
                 old = self._load(project)
                 if old["state"] == "pending":
                     self._discard_request(project, root, old)
-            request = self.access.request(project)
+            opened = self.access.begin_card_request(
+                project, lifetime=lifetime, duration_seconds=duration_seconds,
+                allow_codex=allow_codex)
+            grant = opened["grant"]
+            if grant is not None:
+                now = host_access._utcnow()
+                grant_lifetime = grant.get("lifetime", "timed")
+                card = {
+                    "project": project, "card_id": secrets.token_hex(16),
+                    "request_id": None, "created_at": now.isoformat(),
+                    "expires_at": (now + timedelta(
+                        seconds=host_access.REQUEST_TTL_SECONDS)).isoformat(),
+                    "duration_seconds": (duration_seconds
+                                         if grant_lifetime == "timed" else None),
+                    "lifetime": grant_lifetime,
+                    "allow_codex": grant["allow_codex"], "revision": 1,
+                    "state": "approved", "project_root": str(root),
+                    "grant_state_revision": grant.get("grant_state_revision"),
+                }
+                return self._result(card, grant=grant)
+            request = opened["request"]
             token = secrets.token_hex(32)
             card = {
-                "version": 1, "project": project, "card_id": secrets.token_hex(16),
+                "version": 2, "project": project, "card_id": secrets.token_hex(16),
                 "request_id": request["request_id"],
                 "created_at": host_access._utcnow().isoformat(),
                 "expires_at": request["expires_at"],
-                "duration_seconds": duration_seconds, "allow_codex": allow_codex,
+                "duration_seconds": duration_seconds, "lifetime": lifetime,
+                "allow_codex": allow_codex,
                 "revision": 1, "token_digest": _digest(token), "state": "pending",
+                "grant_state_revision": request.get("grant_state_revision"),
                 **self.access._binding(root),
             }
             _save_private_json(self._path(project), card)
             return self._result(card, token=token)
 
-    def update(self, project, *, card_id, confirmation_token, duration_seconds, allow_codex):
-        _options(duration_seconds, allow_codex)
+    def update(self, project, *, card_id, confirmation_token, duration_seconds,
+               allow_codex, lifetime=None):
         root = self.access._project_root(project)
         with _lock(self._lock_path(project)):
             card = self._checked(project, root, card_id, confirmation_token)
+            lifetime = card.get("lifetime", "timed") if lifetime is None else lifetime
+            _options(lifetime, duration_seconds, allow_codex)
+            if lifetime != card.get("lifetime", "timed"):
+                request = self.access.replace_card_request(
+                    project, request_id=card["request_id"], lifetime=lifetime,
+                    grant_state_revision=card.get("grant_state_revision"))
+                card.update(
+                    request_id=request["request_id"], expires_at=request["expires_at"],
+                    lifetime=request.get("lifetime", "timed"),
+                    grant_state_revision=request.get("grant_state_revision"))
             token = secrets.token_hex(32)
-            card.update(duration_seconds=duration_seconds, allow_codex=allow_codex,
+            card.update(version=2, duration_seconds=duration_seconds, allow_codex=allow_codex,
+                        lifetime=lifetime,
                         revision=card["revision"] + 1, token_digest=_digest(token))
             _save_private_json(self._path(project), card)
             return self._result(card, token=token)
@@ -170,7 +221,7 @@ class HostAccessApprovals:
             grant = self.access.approve_web(
                 project, request_id=card["request_id"],
                 duration_seconds=card["duration_seconds"], allow_codex=card["allow_codex"],
-                confirmation=project)
+                confirmation=project, lifetime=card.get("lifetime", "timed"))
             card["state"] = "approved"
             _save_private_json(self._path(project), card)
             return self._result(card, grant=grant)
@@ -197,7 +248,7 @@ _REQUIRED = {
     "confirm_host_access_approval": {"project", "card_id", "confirmation_token"},
     "cancel_host_access_approval": {"project", "card_id", "confirmation_token"},
 }
-_OPTIONS = {"duration_seconds", "allow_codex"}
+_OPTIONS = {"duration_seconds", "allow_codex", "lifetime"}
 
 
 def tool_specs(projects):
@@ -205,9 +256,10 @@ def tool_specs(projects):
         "project": {"type": "string", "enum": list(projects)},
         "card_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "confirmation_token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "duration_seconds": {"type": "integer", "minimum": 1,
+        "duration_seconds": {"type": ["integer", "null"], "minimum": 1,
                              "maximum": host_access.MAX_DURATION_SECONDS},
         "allow_codex": {"type": "boolean"},
+        "lifetime": {"type": "string", "enum": ["timed", "until_revoked"]},
     }
     titles = {"open": "호스트 권한 승인 카드", "update": "호스트 권한 옵션 변경",
               "confirm": "호스트 권한 승인", "cancel": "호스트 권한 요청 취소"}
@@ -225,7 +277,7 @@ def tool_specs(projects):
         yield {
             "name": name, "title": titles[action],
             "description": (
-                "Open an explicit user confirmation card for expiring installation-wide "
+                "Open an explicit user confirmation card for installation-wide "
                 "host-user access. Does not grant access or start work. Use only when the "
                 "user requests host access/renewal. Project selects cwd, not containment."
                 if opener else "App-only callback requiring the hidden, one-use card capability."),
@@ -257,8 +309,11 @@ class HostAccessApprovalTools:
         if not isinstance(project, str) or project not in self.projects:
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
         if name in {"open_host_access_approval", "update_host_access_approval"}:
-            _options(arguments.get("duration_seconds", host_access.DEFAULT_DURATION_SECONDS),
-                     arguments.get("allow_codex", False))
+            lifetime = arguments.get("lifetime", "timed")
+            duration = arguments.get(
+                "duration_seconds",
+                None if lifetime == "until_revoked" else host_access.DEFAULT_DURATION_SECONDS)
+            _options(lifetime, duration, arguments.get("allow_codex", False))
         if name != "open_host_access_approval":
             if (not isinstance(arguments["card_id"], str)
                     or _ID.fullmatch(arguments["card_id"]) is None

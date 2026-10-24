@@ -55,6 +55,10 @@ class ChatHostAccessRouterTests(unittest.IsolatedAsyncioTestCase):
                             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
                             self.assertIn("open_host_access_approval", tools)
                             opener = tools["open_host_access_approval"]
+                            self.assertEqual(
+                                opener.inputSchema["properties"]["lifetime"],
+                                {"type": "string", "enum": ["timed", "until_revoked"]},
+                            )
                             self.assertEqual(opener.meta["ui"], {
                                 "resourceUri": CARD_URI, "visibility": ["model"]})
                             self.assertFalse(opener.meta["openai/widgetAccessible"])

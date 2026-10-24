@@ -8,6 +8,7 @@ from host_runtime_config import HostRuntimeError
 
 
 PROJECT = {"type": "string"}
+LIFETIME = {"type": "string", "enum": ["timed", "until_revoked"]}
 REQUEST = {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,80}$"}
 OPERATION = {"type": "string", "pattern": "^[0-9a-f]{32}$"}
 NAMES = (
@@ -23,7 +24,7 @@ REQUIRED = {
     "cancel_host_execution": {"project", "operation_id"},
 }
 OPTIONAL = {
-    "request_host_access": set(), "get_host_access": set(),
+    "request_host_access": {"lifetime"}, "get_host_access": set(),
     "start_host_execution": {"timeout_seconds", "input_text", "task_label"},
     "get_host_execution": set(),
     "read_host_execution_log": {"stream", "cursor", "max_bytes"},
@@ -52,9 +53,10 @@ def _spec(name, title, description, fields, *, readonly):
 
 
 HOST_EXECUTION_TOOL_SPECS = [
-    _spec("request_host_access", "호스트 접근 요청", "Legacy management-web access request. "
+    _spec("request_host_access", "호스트 접근 요청", "Management-web access request. "
           "For chat approval, call open_host_access_approval directly instead of this tool. "
-          "This tool cannot approve, issue, or extend a grant.", {}, readonly=False),
+          "This tool cannot approve, issue, or extend a grant.",
+          {"lifetime": LIFETIME}, readonly=False),
     _spec("get_host_access", "호스트 접근 상태", "Read the current owner-controlled host access state. "
           "Reuse an active grant; chat/plugin refresh does not revoke or extend it. When renewal "
           "is needed, follow the supplied approval_card to the inline chat card.",
@@ -146,7 +148,9 @@ class HostExecutionTools:
         if not isinstance(project, str) or project not in self.projects:
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
         if name == "request_host_access":
-            return await asyncio.to_thread(self.access().request, project)
+            return await asyncio.to_thread(
+                self.access().request, project,
+                lifetime=arguments.get("lifetime", "timed"))
         if name == "get_host_access":
             result = await asyncio.to_thread(self.access().get, project)
             if result.get("active") is False and result.get("reason") in _RENEWABLE_ACCESS_REASONS:

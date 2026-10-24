@@ -89,8 +89,12 @@ APPROVAL_BODIES = {
                                   'confirmation', 'admin_token'},
     '/api/runtime-rollout-approve': {'operation_id', 'plan_digest', 'source_digest',
                                      'confirmation', 'admin_token'},
-    '/api/host-access-approve': {'request_id', 'duration_seconds', 'allow_codex',
-                                 'confirmation', 'admin_token'},
+    '/api/host-access-approve': (
+        frozenset({'request_id', 'duration_seconds', 'allow_codex',
+                   'confirmation', 'admin_token'}),
+        frozenset({'request_id', 'duration_seconds', 'allow_codex', 'lifetime',
+                   'confirmation', 'admin_token'}),
+    ),
     '/api/host-access-revoke': {'grant_id', 'confirmation', 'admin_token'},
     '/api/host-execution-cancel': {'operation_id', 'confirmation', 'admin_token'},
 }
@@ -643,12 +647,13 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
             forwarded_bad = ((self.headers.get('Forwarded')
                               or self.headers.get('X-Forwarded-Host')) if is_local
                              else (self.headers.get('X-Forwarded-Proto') not in (None, 'https')))
+            allowed_keys = keys if isinstance(keys, tuple) else (keys,)
             return (bind_host == '127.0.0.1'
                     and (is_local or is_tailnet)
                     and self.headers.get_all('Origin', []) == [expected_origin]
                     and self.headers.get('Sec-Fetch-Site', 'same-origin') == 'same-origin'
                     and not forwarded_bad
-                    and set(body) == keys
+                    and any(set(body) == candidate for candidate in allowed_keys)
                     and isinstance(body['admin_token'], str)
                     and hmac.compare_digest(body['admin_token'].encode(), token.encode()))
 
@@ -781,6 +786,7 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
                     elif parsed.path == '/api/host-access-approve':
                         if set(query) != {'project'}:
                             raise ValueError('Exact host access scope required')
+                        fields.setdefault('lifetime', 'timed')
                         result = registered(lambda: host_access().approve_web(project, **fields))
                     elif parsed.path == '/api/host-access-revoke':
                         if set(query) != {'project'}:
