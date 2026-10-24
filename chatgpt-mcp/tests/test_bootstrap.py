@@ -184,6 +184,16 @@ class BootstrapTest(unittest.TestCase):
         self.assertFalse(self.library_root.exists())
         self.assertEqual(outside.read_text(), "protected")
 
+    def test_apply_refuses_unsafe_owner_ancestor_before_any_write(self):
+        self.home.chmod(0o775)
+
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "UNSAFE_EXISTING_SETUP"):
+            self.run_bootstrap(apply=True)
+
+        self.assertFalse(self.config_home.exists())
+        self.assertFalse(self.state_home.exists())
+        self.assertFalse(self.library_root.exists())
+
     def test_server_default_config_honors_xdg_config_home(self):
         environment = dict(os.environ, **self.environment, PYTHONPATH=str(MODULE_DIR))
         completed = subprocess.run(

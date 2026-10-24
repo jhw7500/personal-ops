@@ -40,6 +40,28 @@ def _json_bytes(value) -> bytes:
                        separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def _safe_ancestor(info) -> bool:
+    mode = stat.S_IMODE(info.st_mode)
+    writable = mode & (stat.S_IWGRP | stat.S_IWOTH)
+    return (stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+            and info.st_uid in (0, os.getuid())
+            and (not writable or info.st_uid == 0 and info.st_mode & stat.S_ISVTX))
+
+
+def _check_ancestor_chain(path: Path) -> None:
+    current = Path(path.absolute().anchor)
+    for component in path.absolute().parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise BootstrapError("UNSAFE_EXISTING_SETUP") from exc
+        if not _safe_ancestor(info):
+            raise BootstrapError("UNSAFE_EXISTING_SETUP")
+
+
 def _private_directory(path: Path) -> None:
     path = path.absolute()
     current = Path(path.anchor)
@@ -59,11 +81,7 @@ def _private_directory(path: Path) -> None:
         except OSError as exc:
             raise BootstrapError("UNSAFE_EXISTING_SETUP") from exc
         mode = stat.S_IMODE(info.st_mode)
-        unsafe_writable = mode & (stat.S_IWGRP | stat.S_IWOTH) and not (
-            info.st_uid == 0 and info.st_mode & stat.S_ISVTX
-        )
-        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid not in (0, os.getuid()) or unsafe_writable):
+        if not _safe_ancestor(info):
             raise BootstrapError("UNSAFE_EXISTING_SETUP")
         if current == path and (info.st_uid != os.getuid() or mode != 0o700):
             if not created:
@@ -322,6 +340,8 @@ def run(argv=None) -> dict:
     if not options.apply:
         return plan
 
+    for target in (config_root, state_root, library_root):
+        _check_ancestor_chain(target)
     config_states = (
         _check_expected_file(projects_path, projects_payload),
         _check_expected_file(policy_path, policy_payload),
