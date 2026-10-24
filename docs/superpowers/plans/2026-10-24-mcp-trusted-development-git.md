@@ -90,7 +90,7 @@ Task 2 evidence note: initial Node/browser RED output was not retained; Python R
 - [x] **Step 2: Run focused RED tests.** `python -B rollout_test_runner.py --modules test_bootstrap --require-excluded-count 0`; expected new bootstrap behavior fails.
 - [x] **Step 3: Implement minimal stdlib bootstrap and clone-first guide.** Document required existing Serena/MCP dependency versions and official installation references, optional Codex profile readiness, loopback admin, PC alias, fresh identity/key flow, managed launcher usage and environment-only completion checks. Remove any requirement to transfer the temporary source archive. Add the module entry to root README without overwriting other remote changes.
 - [x] **Step 4: Validate focused GREEN, full MCP suite, UI/static checks, secret scan and a fresh local Git clone.** Verify the clean clone imports/discovers the complete MCP and install inventory, and default setup uses no original checkout path. Record actual Linux validation separately from unrun Windows/live ChatGPT checks.
-- [ ] **Step 5: Commit using jhw-commit v1, run independent whole-branch review, fix material findings, then push only `feat/mcp-trusted-development-wsl` to origin.** Confirm remote commit and provide exact `git clone --branch` and setup commands. Existing issue #66 is a related source-versioning reference; no automatic closure.
+- [x] **Step 5: Commit using jhw-commit v1, run independent whole-branch review, fix material findings, then push only `feat/mcp-trusted-development-wsl` to origin.** Confirm remote commit and provide exact `git clone --branch` and setup commands. Existing issue #66 is a related source-versioning reference; no automatic closure.
 
 Task 4 evidence note: review fix preserved the venv executable and repaired isolated
 runtime sibling imports after admission, while rejecting project-overlapping owner paths
@@ -105,3 +105,13 @@ installation grant; the pinned validator is part of the immutable ABI 3 inventor
 ordinary-command WSL readiness prerequisites are explicit; and invalid root layouts are
 rejected before owner writes. The task-2 scratch report is no longer tracked. Step 5 stays
 open until the root lane completes the fresh clean-clone suite and feature-branch push.
+
+## Publication completed (2026-10-24)
+
+Feature branch `feat/mcp-trusted-development-wsl` was pushed to origin. The remote
+commit and a fresh HTTPS GitHub clone both resolved to
+`69abcd53ff976f1adddbc2922214094d777d8d48`. Final source verification and historical
+commit mapping are recorded in
+`docs/reviews/2026-10-24-mcp-trusted-development-verification.md`. The original main
+and its worktree were preserved; real WSL/Windows, live ChatGPT and target QA remain
+separate environment checks.
