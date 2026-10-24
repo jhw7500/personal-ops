@@ -32,6 +32,12 @@ Browser <-> SSH local forwarding <-> admin HTTP (127.0.0.1:8765)
                                      +-> host grant / revoke / task stop
 ```
 
+새 WSL 설치는 임시 아카이브를 옮기지 않고 Git clone에서 시작한다. Python 3.11,
+고정 Serena commit, MCP 1.23.0의 검증된 제약과 read-only 계획 → 명시적 적용 절차는
+[WSL clone-first setup](./WSL-SETUP.md)을 따른다. 초기 적용은 새 로컬 identity와
+ABI 3 authority 및 설치 범위만 준비하며 host grant, 외부 credential, 서비스와
+tunnel을 만들거나 시작하지 않는다.
+
 ## 로컬 MCP
 
 ```bash

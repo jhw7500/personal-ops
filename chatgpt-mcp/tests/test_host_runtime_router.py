@@ -42,6 +42,7 @@ class HostRuntimeRouterTest(unittest.IsolatedAsyncioTestCase):
                 "from pathlib import Path\n"
                 f"sys.path.insert(0, {str(MODULE_DIR)!r})\n"
                 "import server\n"
+                "server.SERENA_ENV = Path(sys.prefix)\n"
                 "connection = server.toss_console_codex.CodexConsoleConnection\n"
                 "server.toss_console_codex.CodexConsoleConnection = lambda projects, state: "
                 f"connection(projects, state, config_path=Path({str(root / 'absent-console.json')!r}))\n"

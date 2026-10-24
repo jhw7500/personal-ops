@@ -49,7 +49,7 @@ from runtime_rollout_tools import RUNTIME_ROLLOUT_TOOL_SPECS
 
 MODULE_DIR = Path(__file__).resolve().parent
 SERENA_ENV = Path.home() / ".local/share/uv/tools/serena-agent"
-CONFIG = Path.home() / ".config/chatgpt-coding-mcp/projects.json"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "chatgpt-coding-mcp/projects.json"
 FILE_TOOLS = {"read_file", "list_dir", "find_file", "search_for_pattern",
               "create_text_file", "replace_content"}
 FILE_TOOL_DISPLAY = {

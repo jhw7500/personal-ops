@@ -2,7 +2,20 @@
 
 검토일: 2026-10-24. 대상: [설계안](../superpowers/specs/2026-10-24-mcp-trusted-development-design.md).
 
-결론: 독립 architect 검토의 세 지적을 수정했고, 재검토에서 모두 해소됐음을 확인했다. 남은 중대 모순이나 이번 준비에 필요한 새 사용자 결정 사항은 발견되지 않았다. **설계 검토 결과이며, 기능 구현·운영 적용·동적 테스트 통과를 뜻하지 않는다.**
+결론: 독립 architect 검토의 세 지적을 수정했고, 재검토에서 모두 해소됐음을 확인했다. 이후 feature branch에서 설치 단위 v2 권한, ABI 3 admission, policy v2 text 읽기와 clone-first bootstrap을 구현했다. 운영 WSL·live ChatGPT 적용은 아직 수행하지 않았다.
+
+## 현재 구현 상태
+
+- 새 bootstrap은 기본 read-only 계획이고 명시적 `--apply`에서만 XDG config/state와
+  홈 library에 private 설치를 만든다.
+- 설치된 실제 runtime manifest와 controller를 검증하고 minimum ABI 3 authority를
+  admission한 뒤에만 설치 범위를 활성화한다. 새 grant·credential·서비스는 만들지 않는다.
+- `pim-check`의 `reports`, `hw-results`, `events`는 policy v2의 명시적 `text`
+  후보이며 `fields`는 빈 배열이다.
+- 고정 Serena commit은 Python 3.11과 MCP 1.23.0으로 별도 private 환경에서
+  resolve/install 검증했다. 기존 Python 3.12 실행 기록은 새 설치 호환 계약이 아니다.
+- 실제 Windows/WSL, Windows native driver, live tunnel/ChatGPT, PIM/target QA는
+  미실행 상태로 남긴다.
 
 ## 지적과 반영
 

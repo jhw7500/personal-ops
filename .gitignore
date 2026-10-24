@@ -26,3 +26,9 @@ HANDOFF.*.md
 **/.omc/
 **/.bkit/
 **/.claude/
+
+# MCP owner-local setup must stay outside Git; ignore accidental in-tree copies.
+chatgpt-mcp/.venv/
+chatgpt-mcp/projects.json
+chatgpt-mcp/workspace-policy.json
+chatgpt-mcp/runtime-key

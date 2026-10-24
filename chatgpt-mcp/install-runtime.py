@@ -13,7 +13,7 @@ from jobs import private_directory, private_file
 from server import CONFIG, load_projects
 
 
-FILES = ("server.py", "catalog_refresh.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
+FILES = ("server.py", "bootstrap.py", "catalog_refresh.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
          "host_runtime_config.py", "host_runtime.py", "host_runtime_operations.py",
          "host_runtime_tools.py", "host_runtime_web.py", "host_db_migration.py", "host_schema014.py",
          "toss_console_evidence.py", "toss_console_tools.py", "toss_console_sdk_bridge.py",

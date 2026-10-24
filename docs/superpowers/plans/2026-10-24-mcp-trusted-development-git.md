@@ -6,7 +6,7 @@
 
 **Architecture:** 검증된 기존 소스만 최신 origin/main 위의 전용 브랜치에 추가한다. 기존 범용 실행 도구와 Workspace authority를 재사용하고, 설치 단위의 명시적 v2 grant 전환을 기존 소유자 관리 절차에 연결한다. 런타임 설치와 새 PC의 키·권한 발급은 Git 공개와 별개다.
 
-**Tech Stack:** Python 3.12 / unittest, 기존 MCP SDK 및 Serena, JavaScript / node:test, 기존 Workspace launch controller. 새 제품 의존성은 추가하지 않는다.
+**Tech Stack:** Python 3.11 / unittest, 기존 MCP SDK 및 고정 Serena(`66cbe310`, MCP 1.23.0), JavaScript / node:test, 기존 Workspace launch controller. 과거 Python 3.12 실행 기록은 기존 호스트 증거이며 새 설치 계약이 아니다. 새 제품 의존성은 추가하지 않는다.
 
 **Spec:** `docs/superpowers/specs/2026-10-24-mcp-trusted-development-design.md`
 
@@ -72,11 +72,11 @@ Task 2 evidence note: initial Node/browser RED output was not retained; Python R
 - Consumes: ABI 3 admission and unchanged WorkspaceAuthority binding/cursors.
 - Produces: policy version 2 artifact `content_mode` plus unchanged `read_registered_artifact`/listing tool names and signed-page shape. Version 1 remains exact legacy schema.
 
-- [ ] **Step 1: Write tests before implementation.** Register a not-yet-created reports directory, create ignored UTF-8 JSON/text with new keys, then read without new registrations. Assert json_fields projections stay restricted; text requires empty fields; mixed overlapping namespaces, oversized/binary/symlink/secret-bearing files remain denied; pagination respects UTF-8 boundaries and invalidates stale cursors.
-- [ ] **Step 2: Run focused RED tests.** `python -B rollout_test_runner.py --modules test_workspace_policy test_workspace_tools test_workspace_files --require-excluded-count 0`; expected new-mode assertions fail.
-- [ ] **Step 3: Implement exact version-aware schema/read behavior.** Keep existing read/list policies, protected-path checks, file race defenses and byte limits. Text reads remain explicit owner-selected directory or file rules; no shell fallback and no automatic broadening of existing installations.
-- [ ] **Step 4: Run focused GREEN and full MCP suite; update tool descriptions with accurate supported content.** Runtime admission/activation tests cover v2 policy acceptance only in compatible managed release.
-- [ ] **Step 5: Commit this task using jhw-commit v1.**
+- [x] **Step 1: Write tests before implementation.** Register a not-yet-created reports directory, create ignored UTF-8 JSON/text with new keys, then read without new registrations. Assert json_fields projections stay restricted; text requires empty fields; mixed overlapping namespaces, oversized/binary/symlink/secret-bearing files remain denied; pagination respects UTF-8 boundaries and invalidates stale cursors.
+- [x] **Step 2: Run focused RED tests.** `python -B rollout_test_runner.py --modules test_workspace_policy test_workspace_tools test_workspace_files --require-excluded-count 0`; expected new-mode assertions fail.
+- [x] **Step 3: Implement exact version-aware schema/read behavior.** Keep existing read/list policies, protected-path checks, file race defenses and byte limits. Text reads remain explicit owner-selected directory or file rules; no shell fallback and no automatic broadening of existing installations.
+- [x] **Step 4: Run focused GREEN and full MCP suite; update tool descriptions with accurate supported content.** Runtime admission/activation tests cover v2 policy acceptance only in compatible managed release.
+- [x] **Step 5: Commit this task using jhw-commit v1.**
 
 ### Task 4: Git clone 기반 WSL 초기 설정과 배포 검증
 
@@ -86,8 +86,8 @@ Task 2 evidence note: initial Node/browser RED output was not retained; Python R
 - Consumes: installed runtime manifest, Task 1 owner enable API and minimum ABI 3, Task 3 policy v2. Bootstrap creates fresh local configuration only through an explicit `--apply` flag; default is a read-only plan.
 - Produces: portable setup for actual Linux home/projects with per-PC keys/state omitted from Git, immutable runtime/controller paths and next steps for tunnel creation. Repeat application preserves matching files and refuses differing existing owner config. No automatic tunnel credentials, owner grants, service switch, PIM tests or board contact.
 
-- [ ] **Step 1: Write tests before implementation.** Use isolated HOME/config/state and fake projects to assert default performs no writes; explicit apply creates private new settings at actual user paths; repeat is idempotent; existing/different/symlinked config fails without overwrite; install manifest completeness is validated; no credentials or grants are created by configuration.
-- [ ] **Step 2: Run focused RED tests.** `python -B rollout_test_runner.py --modules test_bootstrap --require-excluded-count 0`; expected new bootstrap behavior fails.
-- [ ] **Step 3: Implement minimal stdlib bootstrap and clone-first guide.** Document required existing Serena/MCP dependency versions and official installation references, optional Codex profile readiness, loopback admin, PC alias, fresh identity/key flow, managed launcher usage and environment-only completion checks. Remove any requirement to transfer the temporary source archive. Add the module entry to root README without overwriting other remote changes.
+- [x] **Step 1: Write tests before implementation.** Use isolated HOME/config/state and fake projects to assert default performs no writes; explicit apply creates private new settings at actual user paths; repeat is idempotent; existing/different/symlinked config fails without overwrite; install manifest completeness is validated; no credentials or grants are created by configuration.
+- [x] **Step 2: Run focused RED tests.** `python -B rollout_test_runner.py --modules test_bootstrap --require-excluded-count 0`; expected new bootstrap behavior fails.
+- [x] **Step 3: Implement minimal stdlib bootstrap and clone-first guide.** Document required existing Serena/MCP dependency versions and official installation references, optional Codex profile readiness, loopback admin, PC alias, fresh identity/key flow, managed launcher usage and environment-only completion checks. Remove any requirement to transfer the temporary source archive. Add the module entry to root README without overwriting other remote changes.
 - [ ] **Step 4: Validate focused GREEN, full MCP suite, UI/static checks, secret scan and a fresh local Git clone.** Verify the clean clone imports/discovers the complete MCP and install inventory, and default setup uses no original checkout path. Record actual Linux validation separately from unrun Windows/live ChatGPT checks.
 - [ ] **Step 5: Commit using jhw-commit v1, run independent whole-branch review, fix material findings, then push only `feat/mcp-trusted-development-wsl` to origin.** Confirm remote commit and provide exact `git clone --branch` and setup commands. Existing issue #66 is a related source-versioning reference; no automatic closure.
