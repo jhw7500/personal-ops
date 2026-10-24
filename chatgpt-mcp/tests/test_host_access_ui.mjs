@@ -367,6 +367,50 @@ test('until-revoked request submits a null duration and remains locally active',
   assert.match(text(durable, 'host-access-state'), /소유자가 취소할 때까지/);
 });
 
+test('switching mixed lifetime requests keeps displayed consent and payload identical', async () => {
+  const alternate = '9'.repeat(32);
+  for (const scenario of [
+    {
+      requests: [
+        {request_id: REQUEST, lifetime: 'timed', expires_at: '2026-10-15T05:00:00+00:00'},
+        {request_id: alternate, lifetime: 'until_revoked',
+          expires_at: '2026-10-15T05:00:00+00:00'},
+      ],
+      selected: alternate, initialLifetime: 'timed', lifetime: 'until_revoked', disabled: true,
+      durationSeconds: null,
+    },
+    {
+      requests: [
+        {request_id: REQUEST, lifetime: 'until_revoked',
+          expires_at: '2026-10-15T05:00:00+00:00'},
+        {request_id: alternate, lifetime: 'timed', expires_at: '2026-10-15T05:00:00+00:00'},
+      ],
+      selected: alternate, initialLifetime: 'until_revoked', lifetime: 'timed', disabled: false,
+      durationSeconds: 2592000,
+    },
+  ]) {
+    const app = await loadUi({routes: {
+      'GET /api/host-access': () => [200, access({version: 2, requests: scenario.requests})],
+    }});
+    assert.equal(app.byId.get('host-access-lifetime').value, scenario.initialLifetime);
+    app.byId.get('host-access-request').value = scenario.selected;
+    await app.byId.get('host-access-request').dispatch('change');
+    assert.equal(app.byId.get('host-access-lifetime').value, scenario.lifetime);
+    assert.equal(app.byId.get('host-access-duration').disabled, scenario.disabled);
+    app.byId.get('host-access-confirmation').value = 'alpha';
+    app.byId.get('host-access-token').value = 'fresh-token';
+    await app.byId.get('host-access-confirmation').dispatch('input');
+    await app.byId.get('host-access-token').dispatch('input');
+    await app.byId.get('host-access-approve').dispatch('click');
+    await settle();
+    assert.deepEqual(calls(app, 'POST', '/api/host-access-approve')[0].body, {
+      request_id: scenario.selected, lifetime: scenario.lifetime,
+      duration_seconds: scenario.durationSeconds, allow_codex: false,
+      confirmation: 'alpha', admin_token: 'fresh-token',
+    });
+  }
+});
+
 test('approval rejects durations above thirty days', async () => {
   const overLimit = await loadUi();
   overLimit.byId.get('host-access-confirmation').value = 'alpha';

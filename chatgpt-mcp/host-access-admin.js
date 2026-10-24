@@ -121,6 +121,13 @@
       && !TERMINAL.has(selected.state));
   }
 
+  function renderRequestOptions() {
+    const pending = selectedRequestData();
+    const requestedLifetime = pending?.lifetime || 'timed';
+    $('host-access-lifetime').value = requestedLifetime;
+    $('host-access-duration').disabled = requestedLifetime === 'until_revoked';
+  }
+
   function renderAccess() {
     const select = $('host-access-request');
     const previousRequest = selectedRequest;
@@ -153,10 +160,7 @@
       select.append(option);
     }
     select.value = selectedRequest;
-    const pending = selectedRequestData();
-    const requestedLifetime = pending?.lifetime || 'timed';
-    $('host-access-lifetime').value = requestedLifetime;
-    $('host-access-duration').disabled = requestedLifetime === 'until_revoked';
+    renderRequestOptions();
     if (focusHandled && focusedRequest && project === focusedRequest.project
         && access?.project === project && !focusScrolled) {
       focusScrolled = true;
@@ -477,6 +481,7 @@
     focusedRequestMissing = false;
     selectedRequest = $('host-access-request').value;
     clearFreshApproval();
+    renderRequestOptions();
     renderButtons();
   });
   $('host-execution').addEventListener('change', () => {

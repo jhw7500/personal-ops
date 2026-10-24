@@ -205,6 +205,7 @@ class HostAccessApprovals:
                     request_id=request["request_id"], expires_at=request["expires_at"],
                     lifetime=request.get("lifetime", "timed"),
                     grant_state_revision=request.get("grant_state_revision"))
+            card.setdefault("grant_state_revision", None)
             token = secrets.token_hex(32)
             card.update(version=2, duration_seconds=duration_seconds, allow_codex=allow_codex,
                         lifetime=lifetime,
@@ -266,7 +267,9 @@ def tool_specs(projects):
     for name in sorted(NAMES):
         action = name.split("_", 1)[0]
         opener = action == "open"
-        fields = _REQUIRED[name] | (_OPTIONS if opener else set())
+        fields = _REQUIRED[name] | (
+            _OPTIONS if name in {"open_host_access_approval", "update_host_access_approval"}
+            else set())
         metadata = {"ui": {"visibility": ["model"] if opener else ["app"]},
                     "openai/widgetAccessible": not opener,
                     "openai/toolInvocation/invoking": titles[action] + " 중입니다",
@@ -300,7 +303,9 @@ class HostAccessApprovalTools:
     def validate_arguments(self, name, arguments):
         """Run BEFORE SDK validation, whose error text can echo secret values."""
         required = _REQUIRED.get(name)
-        optional = _OPTIONS if name == "open_host_access_approval" else set()
+        optional = (_OPTIONS
+                    if name in {"open_host_access_approval", "update_host_access_approval"}
+                    else set())
         if (required is None or not isinstance(arguments, dict)
                 or not required.issubset(arguments)
                 or not set(arguments).issubset(required | optional)):
