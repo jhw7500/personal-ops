@@ -14,6 +14,8 @@
   후보이며 `fields`는 빈 배열이다.
 - 고정 Serena commit은 Python 3.11과 MCP 1.23.0으로 별도 private 환경에서
   resolve/install 검증했다. 기존 Python 3.12 실행 기록은 새 설치 호환 계약이 아니다.
+- committed clean clone `e37848a`에서 read-only plan 무쓰기, 적용·재적용,
+  실제 installed admission과 전체 MCP 1,498개 통과(skip 1, excluded 5)를 확인했다.
 - 실제 Windows/WSL, Windows native driver, live tunnel/ChatGPT, PIM/target QA는
   미실행 상태로 남긴다.
 
