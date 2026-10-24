@@ -74,7 +74,7 @@ Task 2 evidence note: initial Node/browser RED output was not retained; Python R
 
 - [ ] **Step 1: Write tests before implementation.** Register a not-yet-created reports directory, create ignored UTF-8 JSON/text with new keys, then read without new registrations. Assert json_fields projections stay restricted; text requires empty fields; mixed overlapping namespaces, oversized/binary/symlink/secret-bearing files remain denied; pagination respects UTF-8 boundaries and invalidates stale cursors.
 - [ ] **Step 2: Run focused RED tests.** `python -B rollout_test_runner.py --modules test_workspace_policy test_workspace_tools test_workspace_files --require-excluded-count 0`; expected new-mode assertions fail.
-- [ ] **Step 3: Implement exact version-aware schema/read behavior.** Keep existing read/list policies, protected-path checks, file race defenses and byte limits. Text reads remain explicit owner-directory rules; no shell fallback and no automatic broadening of existing installations.
+- [ ] **Step 3: Implement exact version-aware schema/read behavior.** Keep existing read/list policies, protected-path checks, file race defenses and byte limits. Text reads remain explicit owner-selected directory or file rules; no shell fallback and no automatic broadening of existing installations.
 - [ ] **Step 4: Run focused GREEN and full MCP suite; update tool descriptions with accurate supported content.** Runtime admission/activation tests cover v2 policy acceptance only in compatible managed release.
 - [ ] **Step 5: Commit this task using jhw-commit v1.**
 

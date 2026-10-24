@@ -109,6 +109,53 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertEqual(text_payload["content"], report.read_text())
         self.assertEqual(text_payload["policy_version"], 2)
 
+    def test_version_two_reads_an_explicit_owner_selected_text_file_rule(self):
+        self.policy = {
+            "version": 2,
+            "base_root": str(self.base),
+            "artifacts": [{
+                "project": "alpha", "path": "qa/report.txt", "kind": "file",
+                "operations": ["read"], "fields": [], "content_mode": "text",
+                "recursive": False, "max_file_bytes": 1048576,
+            }],
+        }
+        self.config.write_text(json.dumps(self.policy))
+        report = self.project / "qa/report.txt"
+        report.parent.mkdir()
+        report.write_text("explicit owner-selected report")
+        tools = self.tools()
+
+        result, payload = self.call(
+            tools, "read_registered_artifact", relative_path="qa/report.txt",
+        )
+
+        self.assertFalse(result["isError"], result)
+        self.assertEqual(payload["content"], "explicit owner-selected report")
+
+    def test_text_artifacts_reject_json_and_plain_sensitive_key_assignments(self):
+        self.policy["version"] = 2
+        self.policy["artifacts"][0].update(content_mode="text", fields=[])
+        self.config.write_text(json.dumps(self.policy))
+        tools = self.tools()
+        sensitive = {
+            "json-secret.txt": '{"outer":{"api_key":"must-not-leak-json"}}',
+            "dotenv-secret.txt": "CLIENT_SECRET=must-not-leak-dotenv\n",
+            "yaml-secret.txt": "password: must-not-leak-yaml\n",
+        }
+
+        for name, content in sensitive.items():
+            with self.subTest(name=name):
+                path = self.result.parent / name
+                path.write_text(content)
+                denied, payload = self.call(
+                    tools, "read_registered_artifact",
+                    relative_path=f"build/results/{name}",
+                )
+                self.assertTrue(denied["isError"])
+                self.assertEqual(payload["code"], "WORKSPACE_SENSITIVE_CONTENT")
+                self.assertNotIn("must-not-leak", json.dumps(denied))
+                self.assertNotIn("content", payload)
+
     def test_text_artifact_utf8_pages_bind_cursor_to_file_and_path(self):
         self.policy["version"] = 2
         self.policy["artifacts"][0].update(content_mode="text", fields=[])

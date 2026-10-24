@@ -1,4 +1,4 @@
-"""Explicit workspace access and registered, bounded JSON artifact reads.
+"""Explicit workspace access and registered projected JSON or UTF-8 artifact reads.
 
 Confirmation capabilities belong to the trusted MCP app host, not model text.
 An installation is the authority boundary; a project/session label is not a
@@ -28,6 +28,13 @@ MAX_FILE_BYTES = 1048576
 MAX_LIST_ENTRIES = 2000
 _SECRET_KEYS = re.compile(r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|private[_-]?key|client[_-]?secret)\Z", re.I)
 _SECRET_TEXT = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer\s+[A-Za-z0-9._~-]{12,}|\bsk-[A-Za-z0-9_-]{16,}")
+_SECRET_ASSIGNMENT = re.compile(
+    r'''(?:^|[\s,{;])["']?'''
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|"
+    r'''private[_-]?key|client[_-]?secret)["']?\s*[:=]\s*'''
+    r'''(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;}]+)''',
+    re.I | re.M,
+)
 
 
 def result(payload, *, error=False, meta=None):
@@ -45,6 +52,16 @@ def _contains_secret(value):
     if isinstance(value, list):
         return any(_contains_secret(item) for item in value)
     return isinstance(value, str) and bool(_SECRET_TEXT.search(value))
+
+
+def _contains_text_secret(text: str) -> bool:
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        value = None
+    if value is not None and _contains_secret(value):
+        return True
+    return bool(_SECRET_TEXT.search(text) or _SECRET_ASSIGNMENT.search(text))
 
 
 def _properties(extra, required=()):
@@ -250,7 +267,7 @@ class WorkspaceTools:
                 text = file.data.decode("utf-8")
             except UnicodeError:
                 raise WorkspaceError("WORKSPACE_BINARY_FILE") from None
-            if _contains_secret(text):
+            if _contains_text_secret(text):
                 raise WorkspaceError("WORKSPACE_SENSITIVE_CONTENT")
             data = file.data
         else:

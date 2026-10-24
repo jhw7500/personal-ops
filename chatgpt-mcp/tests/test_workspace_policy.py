@@ -343,6 +343,37 @@ class WorkspacePolicyTest(unittest.TestCase):
             rule["content_mode"] == "json_fields" for rule in snapshot.artifacts
         ))
 
+    def test_version_two_rejects_mixed_mode_nested_namespaces_in_both_directions(self):
+        for parent_mode, child_mode in (
+            ("json_fields", "text"),
+            ("text", "json_fields"),
+        ):
+            with self.subTest(parent_mode=parent_mode, child_mode=child_mode):
+                document = self.policy_document(version=2)
+                document["artifacts"] = [
+                    {
+                        "project": "repo", "path": "qa/reports", "kind": "directory",
+                        "operations": ["list", "read"],
+                        "fields": ["status"] if parent_mode == "json_fields" else [],
+                        "content_mode": parent_mode, "recursive": True,
+                        "max_file_bytes": 1048576,
+                    },
+                    {
+                        "project": "repo", "path": "qa/reports/detail",
+                        "kind": "directory", "operations": ["list", "read"],
+                        "fields": ["status"] if child_mode == "json_fields" else [],
+                        "content_mode": child_mode, "recursive": True,
+                        "max_file_bytes": 1048576,
+                    },
+                ]
+                self.write_policy(document)
+
+                self.assert_code(
+                    "INVALID_POLICY",
+                    WorkspacePolicy({"repo": self.project}, config_path=self.config).load,
+                    required=True,
+                )
+
     def test_load_allows_omitted_optional_protected_paths(self):
         document = self.policy_document()
         del document["protected_paths"]

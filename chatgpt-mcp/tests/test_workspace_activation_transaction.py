@@ -407,6 +407,19 @@ class ActivationTransactionTest(unittest.TestCase):
         self.assertEqual(prepared["plan"]["minimum_abi"], 3)
         self.assertEqual(set(prepared["plan"]["allowed_releases"].values()), {3})
 
+    def test_prepare_rejects_version_two_with_all_abi_values_at_two_before_journal(self):
+        policy = json.loads(self.policy_candidate.read_text())
+        policy["version"] = 2
+        policy["artifacts"][0].update(content_mode="text", fields=[])
+        _private_file(self.policy_candidate, policy)
+
+        self.assert_code(
+            "ACTIVATION_ABI_INCOMPATIBLE",
+            lambda: self.prepare(target_abi=2, rollback_abi=2, minimum_abi=2),
+        )
+
+        self.assertFalse(self.journal.directory.exists())
+
     def test_prepare_rejects_changed_project_registration(self):
         _private_file(self.projects_path, {"projects": {"tossApp": str(self.root / "changed")}})
         self.assert_code("ACTIVATION_PROJECTS_CHANGED", self.prepare)
