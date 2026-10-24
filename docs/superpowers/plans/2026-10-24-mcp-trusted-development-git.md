@@ -35,7 +35,7 @@
 
 ### Task 1: 설치 단위 grant 저장과 ABI 3 전환
 
-**Files:** Modify `chatgpt-mcp/host_access.py`, `workspace_control.py`, `workspace_authority.py`, `install-runtime.py`; create `host_access_installation.py` only if separating the storage contract keeps HostAccess readable. Tests: `tests/test_host_access.py`, new `tests/test_host_access_installation.py`, `tests/test_workspace_control.py`, `tests/test_workspace_authority.py`.
+**Files:** Modify `chatgpt-mcp/host_access.py`, `workspace_control.py`, `workspace_authority.py`, `install-runtime.py`; create `host_access_installation.py` only if separating the storage contract keeps HostAccess readable. Tests: `tests/test_host_access.py`, new `tests/test_host_access_installation.py`, `tests/test_workspace_control.py`, `tests/test_workspace_authority.py`, ABI compatibility fixtures in `tests/test_workspace_activation_gate.py` and `tests/test_workspace_activation_transaction.py`.
 
 **Interfaces:**
 - Consumes: existing `WorkspaceTools`, `workspace_host.publication_lane`, `workspace_control.verify_launch` and authority private-file helpers.

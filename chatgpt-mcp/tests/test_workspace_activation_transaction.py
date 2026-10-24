@@ -203,9 +203,9 @@ class ActivationTransactionTest(unittest.TestCase):
             "projects_path": self.projects_path,
             "target_release": self.host_fixture.target,
             "rollback_release": self.host_fixture.rollback,
-            "target_abi": 2,
-            "rollback_abi": 2,
-            "minimum_abi": 2,
+            "target_abi": 3,
+            "rollback_abi": 3,
+            "minimum_abi": 3,
         }
         arguments.update(updates)
         return self.coordinator.prepare(TRANSACTION, **arguments)
@@ -402,7 +402,7 @@ class ActivationTransactionTest(unittest.TestCase):
     def test_prepare_rejects_rollback_below_minimum_abi(self):
         self.assert_code(
             "ACTIVATION_ABI_INCOMPATIBLE",
-            lambda: self.prepare(rollback_abi=1, minimum_abi=2),
+            lambda: self.prepare(rollback_abi=2, minimum_abi=3),
         )
 
     def test_prepare_rejects_legacy_abi_floor_before_creating_journal(self):
@@ -421,25 +421,25 @@ class ActivationTransactionTest(unittest.TestCase):
     def test_prepare_rejects_abi_value_conflicting_with_release_declaration(self):
         self.assert_code(
             "ACTIVATION_ABI_INCOMPATIBLE",
-            lambda: self.prepare(target_abi=3),
+            lambda: self.prepare(target_abi=2),
         )
 
     def test_prepare_accepts_same_release_with_one_matching_abi(self):
         prepared = self.prepare(
             rollback_release=self.host_fixture.target,
-            rollback_abi=2,
+            rollback_abi=3,
         )
 
         self.assertEqual(
             prepared["plan"]["allowed_releases"],
-            {prepared["plan"]["target_digest"]: 2},
+            {prepared["plan"]["target_digest"]: 3},
         )
 
     def test_resealed_plan_with_third_digest_fails_before_host_mutation(self):
         self.prepare()
         before_calls = list(self.host_fixture.calls)
         self.rewrite_plan(
-            lambda plan: plan["allowed_releases"].update({"f" * 64: 2}))
+            lambda plan: plan["allowed_releases"].update({"f" * 64: 3}))
 
         self.assert_code(
             "ACTIVATION_PLAN_INVALID",

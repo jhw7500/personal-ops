@@ -21,6 +21,7 @@ from workspace_paths import WorkspaceError  # noqa: E402
 from host_runtime_config import HostRuntimeError  # noqa: E402
 from workspace_control import (  # noqa: E402
     ENFORCEMENT_ABI,
+    HOST_ACCESS_CAPABILITY_GENERATION,
     MANDATORY_RELEASE_FILES,
     WorkspaceControlError,
     activation_admission,
@@ -65,11 +66,14 @@ class WorkspaceActivationGateTest(unittest.TestCase):
         authority.initialize(POLICY, {})
         return authority
 
-    def release(self, marker="release"):
+    def release(self, marker="release", *, enforcement_abi=ENFORCEMENT_ABI):
         manifest = {}
         contents = {}
         for name in MANDATORY_RELEASE_FILES:
-            payload = (f"ENFORCEMENT_ABI = {ENFORCEMENT_ABI}\n".encode()
+            payload = ((f"ENFORCEMENT_ABI = {enforcement_abi}\n"
+                        + (f"HOST_ACCESS_CAPABILITY_GENERATION = "
+                           f"{HOST_ACCESS_CAPABILITY_GENERATION}\n"
+                           if enforcement_abi >= 3 else "")).encode()
                        if name == "workspace_control.py"
                        else f"{marker}:{name}\n".encode())
             contents[name] = payload
@@ -285,7 +289,7 @@ class WorkspaceActivationGateTest(unittest.TestCase):
         self.assertTrue(activation_paths(self.authority_dir)[1].exists())
 
     def test_optional_minimum_abi_floor_is_bound_to_canonical_authority(self):
-        release, digest = self.release()
+        release, digest = self.release(enforcement_abi=2)
         pin = minimum_abi_path(self.authority_dir)
         document = {
             "version": 1,
@@ -311,7 +315,7 @@ class WorkspaceActivationGateTest(unittest.TestCase):
         )
 
     def test_minimum_abi_two_rejects_unversioned_or_conflicting_release_source(self):
-        release, digest = self.release()
+        release, digest = self.release(enforcement_abi=2)
         control = release / "workspace_control.py"
         manifest_path = release / "manifest.json"
         manifest = json.loads(manifest_path.read_text())

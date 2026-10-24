@@ -41,6 +41,7 @@ _MAX_STATE_BYTES = 2 * 1024 * 1024
 _REQUEST_TTL_SECONDS = 7 * 24 * 60 * 60
 _DEFAULT_DURATION_SECONDS = 30 * 24 * 60 * 60
 _MAX_DURATION_SECONDS = 30 * 24 * 60 * 60
+_MAXIMUM_ENFORCEMENT_ABI = 3
 
 
 def _fail(code: str, cause: BaseException | None = None):
@@ -339,10 +340,13 @@ class WorkspaceAuthority:
         return value["minimum_abi"]
 
     def _ensure_minimum_abi(self, parent_fd: int, releases: dict[str, int],
-                            *, create: bool) -> int:
+                            *, create: bool, requested: int = 1) -> int:
+        if (type(requested) is not int or requested < 1
+                or requested > _MAXIMUM_ENFORCEMENT_ABI):
+            _fail("INVALID_MINIMUM_ABI")
         minimum_abi = self._read_minimum_abi(parent_fd, required=not create)
         if minimum_abi is None:
-            minimum_abi = 1
+            minimum_abi = requested
             _create_private_file(
                 parent_fd, self.minimum_abi_path.name,
                 self._minimum_abi_payload(minimum_abi),
@@ -995,9 +999,12 @@ class WorkspaceAuthority:
         finally:
             os.close(parent_fd)
 
-    def initialize(self, policy_digest, allowed_releases):
+    def initialize(self, policy_digest, allowed_releases, *, minimum_abi=1):
         policy_digest = _validate_digest(policy_digest)
         releases = _validate_releases(allowed_releases)
+        if (type(minimum_abi) is not int or minimum_abi < 1
+                or minimum_abi > _MAXIMUM_ENFORCEMENT_ABI):
+            _fail("INVALID_MINIMUM_ABI")
         self._check_state_location()
         if self._enforcement_exists():
             _fail("AUTHORITY_ALREADY_INITIALIZED")
@@ -1005,7 +1012,9 @@ class WorkspaceAuthority:
         try:
             parent_fd = _private_directory(self.state_dir.parent, create=False)
             try:
-                self._ensure_minimum_abi(parent_fd, releases, create=True)
+                self._ensure_minimum_abi(
+                    parent_fd, releases, create=True, requested=minimum_abi,
+                )
                 _create_private_file(
                     parent_fd, self.enforcement_path.name,
                     self._enforcement_payload(),

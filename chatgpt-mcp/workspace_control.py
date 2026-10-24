@@ -53,10 +53,13 @@ MANDATORY_RELEASE_FILES = frozenset({
     "workspace_paths.py", "workspace_policy.py", "workspace_authority.py",
     "workspace_jobs.py", "workspace_tools.py", "workspace_control.py",
     "workspace_files.py", "workspace_host.py", "workspace-launcher.py",
+    "host_access.py", "host_access_installation.py",
     "workspace-access-approval.html", "runtime_rollout_web.py",
     "runtime_rollout_worker.py",
 })
-ENFORCEMENT_ABI = 2
+ENFORCEMENT_ABI = 3
+HOST_ACCESS_CAPABILITY_GENERATION = 1
+_DECLARED_ABI_FLOOR = 2
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[0-9a-f]{32}\Z")
 _STATE_LIMIT = 2 * 1024 * 1024
@@ -1000,6 +1003,58 @@ def release_enforcement_abi(release_dir) -> int:
     return declarations[0]
 
 
+def release_host_access_capability_generation(release_dir) -> int:
+    """Read the ABI 3 host-access generation without importing release code."""
+    release_path = Path(release_dir).absolute()
+    manifest, _ = _release_manifest(release_path)
+    if "workspace_control.py" not in manifest:
+        _fail("WORKSPACE_RELEASE_INCOMPATIBLE")
+    parent_fd = _private_dir(release_path.parent, "UNSAFE_WORKSPACE_RELEASE")
+    release_fd = None
+    try:
+        release_fd = os.open(
+            release_path.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        payload = _private_file(
+            release_fd, "workspace_control.py", "UNSAFE_WORKSPACE_RELEASE",
+            16 * 1024 * 1024,
+        )
+    except OSError as exc:
+        _fail("UNSAFE_WORKSPACE_RELEASE", exc)
+    finally:
+        if release_fd is not None:
+            os.close(release_fd)
+        os.close(parent_fd)
+    try:
+        tree = ast.parse(payload.decode("utf-8"), filename="workspace_control.py")
+    except (SyntaxError, UnicodeError) as exc:
+        _fail("WORKSPACE_RELEASE_ABI_MISMATCH", exc)
+    declarations = []
+    for node in tree.body:
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name)
+                        and target.id == "HOST_ACCESS_CAPABILITY_GENERATION"
+                        for target in node.targets)):
+            if (not isinstance(node.value, ast.Constant)
+                    or type(node.value.value) is not int
+                    or node.value.value < 1):
+                _fail("WORKSPACE_RELEASE_ABI_MISMATCH")
+            declarations.append(node.value.value)
+        elif (isinstance(node, ast.AnnAssign)
+              and isinstance(node.target, ast.Name)
+              and node.target.id == "HOST_ACCESS_CAPABILITY_GENERATION"):
+            if (not isinstance(node.value, ast.Constant)
+                    or type(node.value.value) is not int
+                    or node.value.value < 1):
+                _fail("WORKSPACE_RELEASE_ABI_MISMATCH")
+            declarations.append(node.value.value)
+    if len(declarations) != 1:
+        _fail("WORKSPACE_RELEASE_ABI_MISMATCH")
+    return declarations[0]
+
+
 def read_activation_binding(authority_dir) -> dict:
     """Read enforced authority for owner recovery; this grants no launch admission."""
     authority_path = Path(authority_dir).absolute()
@@ -1033,14 +1088,20 @@ def verify_launch(release_dir, authority_dir=None, *, enforcement_required=False
         abi = state["allowed_releases"].get(release_digest)
         if abi is None:
             _fail("WORKSPACE_RELEASE_UNLISTED")
+        if abi > ENFORCEMENT_ABI:
+            _fail("WORKSPACE_RELEASE_INCOMPATIBLE")
         minimum_abi = _minimum_enforcement_abi(authority_path)
         if abi < minimum_abi:
             _fail("WORKSPACE_RELEASE_INCOMPATIBLE")
         declared_abi = abi
-        if minimum_abi >= ENFORCEMENT_ABI:
+        if minimum_abi >= _DECLARED_ABI_FLOOR:
             declared_abi = release_enforcement_abi(release_path)
             if declared_abi != abi:
                 _fail("WORKSPACE_RELEASE_ABI_MISMATCH")
+        capability_generation = None
+        if minimum_abi >= 3:
+            capability_generation = release_host_access_capability_generation(
+                release_path)
         binding = {
             "installation_id": state["installation_id"],
             "authority_epoch": state["authority_epoch"],
@@ -1056,6 +1117,7 @@ def verify_launch(release_dir, authority_dir=None, *, enforcement_required=False
             "release_abi": abi,
             "enforcement_abi": declared_abi,
             "minimum_abi": minimum_abi,
+            "host_access_capability_generation": capability_generation,
             "runtime": str(release_path),
             "authority_dir": str(authority_path),
             "binding": binding,

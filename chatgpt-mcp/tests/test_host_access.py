@@ -243,6 +243,19 @@ class HostAccessTests(unittest.TestCase):
         self.assertEqual(
             datetime.fromisoformat(grant["expires_at"]), self.now + timedelta(days=30))
 
+    def test_legacy_grant_rejects_null_expiry_as_malformed_state(self):
+        self.approve(duration_seconds=60)
+        path = self.access._record_path("personal-ops")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["grant"]["expires_at"] = None
+        path.write_text(json.dumps(record), encoding="utf-8")
+        path.chmod(0o600)
+
+        self.assert_error(
+            "HOST_ACCESS_STATE_INVALID",
+            lambda: self.access.require("personal-ops"),
+        )
+
     def test_thirty_day_grant_survives_reconnect_and_expires_at_the_limit(self):
         grant = self.approve(duration_seconds=30 * 24 * 60 * 60)
         before = self.access._record_path("personal-ops").read_bytes()

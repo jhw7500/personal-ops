@@ -21,6 +21,13 @@ from host_runtime_config import HostRuntimeError, private_dir, private_file, val
 from host_runtime_operations import (
     VERIFIED_RUNTIME_FILES, _lock, _read_private_json, _save_private_json, _verified_installation,
 )
+from host_access_installation import InstallationGrantState
+from workspace_control import (
+    HOST_ACCESS_CAPABILITY_GENERATION, WorkspaceControlError,
+    activation_admission, verify_launch,
+)
+from workspace_host import publication_lane
+from workspace_paths import WorkspaceError
 
 
 DEFAULT_DURATION_SECONDS = 30 * 24 * 60 * 60
@@ -147,6 +154,7 @@ class HostAccess:
         self.state_dir = private_dir(overall_state / "host-access")
         self.records_dir = private_dir(self.state_dir / "records")
         self.locks_dir = private_dir(self.state_dir / "locks")
+        self.installation = InstallationGrantState(self.state_dir)
         self._runtime_source = trusted_runtime
         try:
             from workspace_host import resolve_workspace
@@ -310,7 +318,7 @@ class HostAccess:
             return "HOST_ACCESS_REQUEST_STALE" if request else "HOST_ACCESS_BOOT_CHANGED"
         return None
 
-    def request(self, project):
+    def _request_v1(self, project):
         root = self._project_root(project)
         binding = self._binding(root)
         now = _utcnow()
@@ -328,7 +336,7 @@ class HostAccess:
             _save_private_json(self._record_path(project), record)
         return self._request_public(project, request)
 
-    def get(self, project):
+    def _get_v1(self, project):
         root = self._project_root(project)
         now = _utcnow()
         host_identity = _host_identity()
@@ -371,7 +379,8 @@ class HostAccess:
                     "reason": None, "requests": pending,
                     "host_identity": host_identity}
 
-    def approve_web(self, project, *, request_id, duration_seconds, allow_codex, confirmation):
+    def _approve_web_v1(self, project, *, request_id, duration_seconds,
+                        allow_codex, confirmation):
         root = self._project_root(project)
         if confirmation != project:
             raise HostRuntimeError("HOST_ACCESS_CONFIRMATION_DENIED")
@@ -437,18 +446,18 @@ class HostAccess:
             raise HostRuntimeError("HOST_ACCESS_CODEX_DENIED")
         return self._grant_public(project, grant)
 
-    def require(self, project, *, grant_id=None, codex=False):
+    def _require_v1(self, project, *, grant_id=None, codex=False):
         root = self._project_root(project)
         with _lock(self._lock_path(project)):
             return self._require_locked(project, root, grant_id, codex)
 
     @contextmanager
-    def guard(self, project, grant_id, *, codex=False):
+    def _guard_v1(self, project, grant_id, *, codex=False):
         root = self._project_root(project)
         with _lock(self._lock_path(project)):
             yield self._require_locked(project, root, grant_id, codex)
 
-    def revoke_web(self, project, *, grant_id, confirmation):
+    def _revoke_web_v1(self, project, *, grant_id, confirmation):
         root = self._project_root(project)
         if confirmation != project:
             raise HostRuntimeError("HOST_ACCESS_CONFIRMATION_DENIED")
@@ -463,3 +472,378 @@ class HostAccess:
                 grant["revoked_at"] = _utcnow().isoformat()
                 _save_private_json(self._record_path(project), record)
         return {"project": project, "grant_id": grant_id, "revoked": True}
+
+    def _v2_marker_present(self) -> bool:
+        path = self.installation.marker_path
+        return path.exists() or path.is_symlink()
+
+    def _launch_v2(self) -> dict:
+        if self.workspace is None or self.workspace.enabled is not True:
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED")
+        try:
+            admitted = verify_launch(
+                Path(__file__).resolve().parent,
+                self.workspace.authority.state_dir,
+                enforcement_required=True,
+            )
+        except (WorkspaceControlError, WorkspaceError, OSError) as exc:
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED") from exc
+        if (admitted.get("status") != "launch_allowed"
+                or admitted.get("authority_active") is not True
+                or admitted.get("release_abi") != 3
+                or admitted.get("enforcement_abi") != 3
+                or admitted.get("minimum_abi") != 3
+                or admitted.get("host_access_capability_generation")
+                != HOST_ACCESS_CAPABILITY_GENERATION):
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED")
+        return admitted
+
+    @contextmanager
+    def _v2_authority_admission(self, launch: dict):
+        try:
+            snapshot = self.workspace.policy.load(required=True)
+            with self.workspace.authority.admission(snapshot.digest) as binding:
+                if binding != launch.get("binding"):
+                    raise HostRuntimeError("HOST_ACCESS_WORKSPACE_INVALID")
+                yield {
+                    "installation_id": binding["installation_id"],
+                    "uid": os.getuid(),
+                    "capability_generation": HOST_ACCESS_CAPABILITY_GENERATION,
+                }
+        except WorkspaceError as exc:
+            raise HostRuntimeError("HOST_ACCESS_WORKSPACE_INVALID") from exc
+
+    @staticmethod
+    def _check_v2_binding(state: dict, current: dict) -> None:
+        if state["installation_id"] != current["installation_id"]:
+            raise HostRuntimeError("HOST_ACCESS_INSTALLATION_CHANGED")
+        if state["uid"] != current["uid"]:
+            raise HostRuntimeError("HOST_ACCESS_UID_CHANGED")
+        if state["capability_generation"] != current["capability_generation"]:
+            raise HostRuntimeError("HOST_ACCESS_CAPABILITY_CHANGED")
+
+    @contextmanager
+    def _v2_locked(self):
+        launch = self._launch_v2()
+        with self.installation.lock():
+            state = self.installation.load()
+            with self._v2_authority_admission(launch) as current:
+                self._check_v2_binding(state, current)
+                yield state
+
+    def installation_scope_enabled(self) -> bool:
+        with self.installation.lock():
+            return self.installation.enabled()
+
+    def enable_installation_scope(self) -> dict:
+        if self.workspace is None or self.workspace.enabled is not True:
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED")
+        authority_dir = self.workspace.authority.state_dir
+        try:
+            with activation_admission(authority_dir, create=True):
+                launch = self._launch_v2()
+                with publication_lane(self.workspace):
+                    with self.installation.lock():
+                        if self.installation.enabled():
+                            state = self.installation.load()
+                            return {
+                                "version": 2, "enabled": True,
+                                "grant_state_revision": state["grant_state_revision"],
+                            }
+                        with self._v2_authority_admission(launch) as current:
+                            now = _utcnow().isoformat()
+                            state = {
+                                "version": 2,
+                                **current,
+                                "grant_state_revision": 1,
+                                "requests": {},
+                                "grant": None,
+                                "updated_at": now,
+                            }
+                            self.installation.mark_enabled()
+                            self.installation.invalidate_legacy(self.records_dir)
+                            self.installation.create(state)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED") from exc
+        return {"version": 2, "enabled": True, "grant_state_revision": 1}
+
+    @staticmethod
+    def _v2_request_public(project: str, request: dict) -> dict:
+        return {
+            "version": 2,
+            "project": project,
+            "scope": SCOPE,
+            "request_id": request["request_id"],
+            "expires_at": request["expires_at"],
+            "lifetime": request["lifetime"],
+            "grant_state_revision": request["grant_state_revision"],
+        }
+
+    @staticmethod
+    def _v2_grant_public(project: str, grant: dict, revision: int) -> dict:
+        return {
+            "version": 2,
+            "grant_id": grant["grant_id"],
+            "expires_at": grant["expires_at"],
+            "lifetime": grant["lifetime"],
+            "allow_codex": grant["allow_codex"],
+            "grant_state_revision": revision,
+            "project": project,
+            "scope": SCOPE,
+        }
+
+    def _request_v2(self, project, lifetime):
+        self._project_root(project)
+        if lifetime not in {"timed", "until_revoked"}:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_LIFETIME")
+        with self._v2_locked() as state:
+            now = _utcnow()
+            state["requests"] = {
+                key: item for key, item in state["requests"].items()
+                if _timestamp(item["expires_at"]) > now
+            }
+            request = {
+                "request_id": secrets.token_hex(16),
+                "project": project,
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(seconds=REQUEST_TTL_SECONDS)).isoformat(),
+                "lifetime": lifetime,
+                "grant_state_revision": state["grant_state_revision"],
+                "installation_id": state["installation_id"],
+                "uid": state["uid"],
+                "capability_generation": state["capability_generation"],
+            }
+            state["requests"][request["request_id"]] = request
+            state["updated_at"] = now.isoformat()
+            self.installation.save(state)
+            return self._v2_request_public(project, request)
+
+    def _get_v2(self, project):
+        self._project_root(project)
+        with self._v2_locked() as state:
+            now = _utcnow()
+            pending = [{
+                "request_id": request["request_id"],
+                "expires_at": request["expires_at"],
+                "lifetime": request["lifetime"],
+                "grant_state_revision": request["grant_state_revision"],
+            } for request in state["requests"].values()
+                if _timestamp(request["expires_at"]) > now]
+            base = {
+                "version": 2,
+                "project": project,
+                "scope": SCOPE,
+                "active": False,
+                "reason": "NO_GRANT",
+                "requests": pending,
+                "host_identity": _host_identity(),
+                "lifetime": None,
+                "expires_at": None,
+                "grant_state_revision": state["grant_state_revision"],
+            }
+            grant = state["grant"]
+            if grant is None:
+                return base
+            base["lifetime"] = grant["lifetime"]
+            base["expires_at"] = grant["expires_at"]
+            if grant["revoked_at"] is not None:
+                base["reason"] = "REVOKED"
+                return base
+            if (grant["lifetime"] == "timed"
+                    and _timestamp(grant["expires_at"]) <= now):
+                base["reason"] = "EXPIRED"
+                return base
+            return {
+                **base,
+                **self._v2_grant_public(
+                    project, grant, state["grant_state_revision"],
+                ),
+                "active": True,
+                "reason": None,
+            }
+
+    def _approve_web_v2(self, project, *, request_id, duration_seconds,
+                        allow_codex, confirmation, lifetime):
+        self._project_root(project)
+        if confirmation != project:
+            raise HostRuntimeError("HOST_ACCESS_CONFIRMATION_DENIED")
+        if lifetime not in {"timed", "until_revoked"}:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_LIFETIME")
+        if lifetime == "timed":
+            if duration_seconds is None:
+                duration_seconds = DEFAULT_DURATION_SECONDS
+            if (type(duration_seconds) is not int or duration_seconds <= 0
+                    or duration_seconds > MAX_DURATION_SECONDS):
+                raise HostRuntimeError("INVALID_HOST_ACCESS_DURATION")
+        elif duration_seconds is not None:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_DURATION")
+        if type(allow_codex) is not bool:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_REQUEST")
+        if not isinstance(request_id, str) or _HEX_ID.fullmatch(request_id) is None:
+            raise HostRuntimeError("HOST_ACCESS_REQUEST_NOT_FOUND")
+        with self._v2_locked() as state:
+            now = _utcnow()
+            request = state["requests"].get(request_id)
+            if request is None or request.get("project") != project:
+                raise HostRuntimeError("HOST_ACCESS_REQUEST_NOT_FOUND")
+            if _timestamp(request["expires_at"]) <= now:
+                raise HostRuntimeError("HOST_ACCESS_REQUEST_EXPIRED")
+            if (request["grant_state_revision"] != state["grant_state_revision"]
+                    or request["lifetime"] != lifetime):
+                raise HostRuntimeError("HOST_ACCESS_REQUEST_STALE")
+            revision = state["grant_state_revision"] + 1
+            grant = {
+                "grant_id": secrets.token_hex(16),
+                "created_at": now.isoformat(),
+                "expires_at": ((now + timedelta(seconds=duration_seconds)).isoformat()
+                               if lifetime == "timed" else None),
+                "lifetime": lifetime,
+                "allow_codex": allow_codex,
+                "revoked_at": None,
+                "grant_state_revision": revision,
+                "installation_id": state["installation_id"],
+                "uid": state["uid"],
+                "capability_generation": state["capability_generation"],
+            }
+            state["grant_state_revision"] = revision
+            state["requests"] = {}
+            state["grant"] = grant
+            state["updated_at"] = now.isoformat()
+            self.installation.save(state)
+            return self._v2_grant_public(project, grant, revision)
+
+    def _require_v2_locked(self, state, project, grant_id, codex):
+        if type(codex) is not bool:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_REQUEST")
+        if grant_id is not None and (not isinstance(grant_id, str)
+                                     or _HEX_ID.fullmatch(grant_id) is None):
+            raise HostRuntimeError("HOST_ACCESS_GRANT_MISMATCH")
+        grant = state["grant"]
+        if grant is None:
+            raise HostRuntimeError("HOST_ACCESS_REQUIRED")
+        if grant_id is not None and grant["grant_id"] != grant_id:
+            raise HostRuntimeError("HOST_ACCESS_GRANT_MISMATCH")
+        if grant["revoked_at"] is not None:
+            raise HostRuntimeError("HOST_ACCESS_REVOKED")
+        if (grant["lifetime"] == "timed"
+                and _timestamp(grant["expires_at"]) <= _utcnow()):
+            raise HostRuntimeError("HOST_ACCESS_EXPIRED")
+        if codex and not grant["allow_codex"]:
+            raise HostRuntimeError("HOST_ACCESS_CODEX_DENIED")
+        return self._v2_grant_public(
+            project, grant, state["grant_state_revision"],
+        )
+
+    def _require_v2(self, project, *, grant_id=None, codex=False):
+        self._project_root(project)
+        with self._v2_locked() as state:
+            return self._require_v2_locked(
+                state, project, grant_id, codex,
+            )
+
+    @contextmanager
+    def _guard_v2(self, project, grant_id, *, codex=False):
+        self._project_root(project)
+        with self._v2_locked() as state:
+            yield self._require_v2_locked(
+                state, project, grant_id, codex,
+            )
+
+    def _revoke_web_v2(self, project, *, grant_id, confirmation):
+        self._project_root(project)
+        if confirmation != project:
+            raise HostRuntimeError("HOST_ACCESS_CONFIRMATION_DENIED")
+        if not isinstance(grant_id, str) or _HEX_ID.fullmatch(grant_id) is None:
+            raise HostRuntimeError("HOST_ACCESS_GRANT_MISMATCH")
+        with self._v2_locked() as state:
+            grant = state["grant"]
+            if grant is None or grant["grant_id"] != grant_id:
+                raise HostRuntimeError("HOST_ACCESS_GRANT_MISMATCH")
+            if grant["revoked_at"] is None:
+                now = _utcnow().isoformat()
+                grant["revoked_at"] = now
+                state["grant_state_revision"] += 1
+                state["requests"] = {}
+                state["updated_at"] = now
+                self.installation.save(state)
+            return {
+                "version": 2,
+                "project": project,
+                "grant_id": grant_id,
+                "grant_state_revision": state["grant_state_revision"],
+                "revoked": True,
+            }
+
+    def _versioned(self, v2, v1):
+        if self._v2_marker_present():
+            return v2()
+        with self.installation.lock():
+            switched = self._v2_marker_present()
+            if not switched:
+                return v1()
+        return v2()
+
+    def request(self, project, *, lifetime="timed"):
+        if lifetime != "timed" and not self._v2_marker_present():
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED")
+        return self._versioned(
+            lambda: self._request_v2(project, lifetime),
+            lambda: self._request_v1(project),
+        )
+
+    def get(self, project):
+        return self._versioned(
+            lambda: self._get_v2(project),
+            lambda: self._get_v1(project),
+        )
+
+    def approve_web(self, project, *, request_id, duration_seconds,
+                    allow_codex, confirmation, lifetime="timed"):
+        if lifetime != "timed" and not self._v2_marker_present():
+            raise HostRuntimeError("HOST_ACCESS_OWNER_SETUP_REQUIRED")
+        return self._versioned(
+            lambda: self._approve_web_v2(
+                project, request_id=request_id,
+                duration_seconds=duration_seconds, allow_codex=allow_codex,
+                confirmation=confirmation, lifetime=lifetime,
+            ),
+            lambda: self._approve_web_v1(
+                project, request_id=request_id,
+                duration_seconds=duration_seconds, allow_codex=allow_codex,
+                confirmation=confirmation,
+            ),
+        )
+
+    def require(self, project, *, grant_id=None, codex=False):
+        return self._versioned(
+            lambda: self._require_v2(
+                project, grant_id=grant_id, codex=codex,
+            ),
+            lambda: self._require_v1(
+                project, grant_id=grant_id, codex=codex,
+            ),
+        )
+
+    @contextmanager
+    def guard(self, project, grant_id, *, codex=False):
+        if self._v2_marker_present():
+            with self._guard_v2(project, grant_id, codex=codex) as grant:
+                yield grant
+            return
+        with self.installation.lock():
+            if not self._v2_marker_present():
+                with self._guard_v1(project, grant_id, codex=codex) as grant:
+                    yield grant
+                return
+        with self._guard_v2(project, grant_id, codex=codex) as grant:
+            yield grant
+
+    def revoke_web(self, project, *, grant_id, confirmation):
+        return self._versioned(
+            lambda: self._revoke_web_v2(
+                project, grant_id=grant_id, confirmation=confirmation,
+            ),
+            lambda: self._revoke_web_v1(
+                project, grant_id=grant_id, confirmation=confirmation,
+            ),
+        )

@@ -54,12 +54,19 @@ class WorkspaceControlTest(unittest.TestCase):
         self.assertTrue({"workspace_files.py", "workspace_host.py"}
                         <= MANDATORY_RELEASE_FILES)
 
-    def make_release(self, marker, *, omit=()):
+    def make_release(self, marker, *, omit=(), enforcement_abi=None,
+                     capability_generation=None):
         manifest = {}
         for name in MANDATORY_RELEASE_FILES:
             if name in omit:
                 continue
-            content = f"{marker}:{name}\n".encode()
+            content = ((f"# {marker}:{name}\n" if name == "workspace_control.py"
+                        and enforcement_abi is not None else f"{marker}:{name}\n").encode())
+            if name == "workspace_control.py" and enforcement_abi is not None:
+                content += f"ENFORCEMENT_ABI = {enforcement_abi}\n".encode()
+                if capability_generation is not None:
+                    content += ("HOST_ACCESS_CAPABILITY_GENERATION = "
+                                f"{capability_generation}\n").encode()
             manifest[name] = hashlib.sha256(content).hexdigest()
         digest = hashlib.sha256(
             json.dumps(manifest, sort_keys=True).encode()
@@ -69,7 +76,16 @@ class WorkspaceControlTest(unittest.TestCase):
         for name in manifest:
             path = release / name
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            path.write_bytes(f"{marker}:{name}\n".encode())
+            path.write_bytes(((f"# {marker}:{name}\n" if name == "workspace_control.py"
+                               and enforcement_abi is not None else
+                               f"{marker}:{name}\n").encode()
+                              + (f"ENFORCEMENT_ABI = {enforcement_abi}\n".encode()
+                                 if name == "workspace_control.py"
+                                 and enforcement_abi is not None else b"")
+                              + (("HOST_ACCESS_CAPABILITY_GENERATION = "
+                                  f"{capability_generation}\n").encode()
+                                 if name == "workspace_control.py"
+                                 and capability_generation is not None else b"")))
             path.chmod(0o600)
         (release / "manifest.json").write_text(
             json.dumps(manifest, sort_keys=True), encoding="utf-8",
@@ -103,6 +119,41 @@ class WorkspaceControlTest(unittest.TestCase):
         self.assertEqual(result["release_abi"], 3)
         self.assertEqual(result["binding"], binding)
         self.assertEqual(result["authority_dir"], str(self.authority_dir.absolute()))
+
+    def test_floor_two_still_validates_declared_release_abi(self):
+        release, digest = self.make_release("floor-two", enforcement_abi=1)
+        authority = WorkspaceAuthority(
+            {"demo": self.project}, state_dir=self.authority_dir,
+        )
+        authority.initialize(POLICY_A, {digest: 2}, minimum_abi=2)
+
+        self.assert_code(
+            "WORKSPACE_RELEASE_ABI_MISMATCH",
+            lambda: verify_launch(release, self.authority_dir),
+        )
+
+    def test_unknown_future_release_abi_is_rejected(self):
+        release, digest = self.make_release("future", enforcement_abi=4)
+        self.authority({digest: 4})
+
+        self.assert_code(
+            "WORKSPACE_RELEASE_INCOMPATIBLE",
+            lambda: verify_launch(release, self.authority_dir),
+        )
+
+    def test_abi_three_admission_exposes_declared_host_access_generation(self):
+        release, digest = self.make_release(
+            "abi-three", enforcement_abi=3, capability_generation=7,
+        )
+        authority = WorkspaceAuthority(
+            {"demo": self.project}, state_dir=self.authority_dir,
+        )
+        authority.initialize(POLICY_A, {digest: 3}, minimum_abi=3)
+
+        result = verify_launch(release, self.authority_dir)
+
+        self.assertEqual(result["enforcement_abi"], 3)
+        self.assertEqual(result["host_access_capability_generation"], 7)
 
     def test_enforcement_latch_blocks_legacy_after_authority_root_deletion(self):
         release, digest = self.make_release("compatible")
