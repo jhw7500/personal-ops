@@ -17,6 +17,16 @@ from workspace_control import (_default_authority_dir, WorkspaceControlError,  #
                                verify_launch)
 
 
+_ISOLATED_BOOTSTRAP = """\
+import runpy
+import sys
+release, entrypoint, *arguments = sys.argv[1:]
+sys.path.insert(0, release)
+sys.argv = [entrypoint, *arguments]
+runpy.run_path(entrypoint, run_name="__main__")
+"""
+
+
 def _interpreter(path: str) -> str:
     candidate = Path(path)
     try:
@@ -61,8 +71,12 @@ def main(argv=None) -> int:
     interpreter = _interpreter(args.interpreter)
     entrypoint = release / args.entrypoint
     arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-    isolated = ["-I"] if args.isolated else []
-    os.execv(interpreter, [interpreter, *isolated, str(entrypoint), *arguments])
+    if args.isolated:
+        child = [interpreter, "-I", "-c", _ISOLATED_BOOTSTRAP,
+                 str(release), str(entrypoint), *arguments]
+    else:
+        child = [interpreter, str(entrypoint), *arguments]
+    os.execv(interpreter, child)
     return 127
 
 

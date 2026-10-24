@@ -124,6 +124,17 @@ class BootstrapTest(unittest.TestCase):
         self.assertFalse((self.config_home / "chatgpt-coding-mcp/runtime-key").exists())
         self.assertFalse((self.state_home / "chatgpt-coding-mcp/tunnel").exists())
 
+        self.assertEqual(result["launch_argv"][0], sys.executable)
+        interpreter_index = result["launch_argv"].index("--interpreter") + 1
+        self.assertEqual(result["launch_argv"][interpreter_index], sys.executable)
+        completed = subprocess.run(
+            [*result["launch_argv"], "--help"], cwd=self.root,
+            env=dict(os.environ, **self.environment, PYTHONPATH=str(self.root / "rogue")),
+            text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("usage:", completed.stdout)
+
     def test_apply_creates_private_xdg_ancestors_independent_of_umask(self):
         previous = os.umask(0o002)
         try:
@@ -192,6 +203,30 @@ class BootstrapTest(unittest.TestCase):
 
         self.assertFalse(self.config_home.exists())
         self.assertFalse(self.state_home.exists())
+        self.assertFalse(self.library_root.exists())
+
+    def test_apply_refuses_config_root_inside_project_before_any_write(self):
+        self.environment["XDG_CONFIG_HOME"] = str(self.personal_ops / "owner-config")
+        config_root = Path(self.environment["XDG_CONFIG_HOME"]) / "chatgpt-coding-mcp"
+
+        with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                    "OWNER_PATH_OVERLAPS_PROJECT"):
+            self.run_bootstrap(apply=True)
+
+        self.assertFalse(config_root.exists())
+        self.assertFalse(self.state_home.exists())
+        self.assertFalse(self.library_root.exists())
+
+    def test_apply_refuses_state_root_inside_project_before_any_write(self):
+        self.environment["XDG_STATE_HOME"] = str(self.pim_check / "owner-state")
+        state_root = Path(self.environment["XDG_STATE_HOME"]) / "chatgpt-coding-mcp"
+
+        with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                    "OWNER_PATH_OVERLAPS_PROJECT"):
+            self.run_bootstrap(apply=True)
+
+        self.assertFalse(self.config_home.exists())
+        self.assertFalse(state_root.exists())
         self.assertFalse(self.library_root.exists())
 
     def test_server_default_config_honors_xdg_config_home(self):

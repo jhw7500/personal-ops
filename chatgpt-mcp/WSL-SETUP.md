@@ -73,11 +73,14 @@ Copy `runtime`, `launcher`, and `projects_config` from bootstrap output. Keep
 shape for the MCP server is:
 
 ```bash
+RUNTIME=/ABSOLUTE/RUNTIME/FROM/BOOTSTRAP
+LAUNCHER=/ABSOLUTE/LAUNCHER/FROM/BOOTSTRAP
+PROJECTS_CONFIG=/ABSOLUTE/PROJECTS_CONFIG/FROM/BOOTSTRAP
 "$HOME/.local/share/uv/tools/serena-agent/bin/python" -B \
-  "$HOME/.local/lib/chatgpt-coding-mcp/workspace-controller/workspace-launcher.py" \
-  --release /ABSOLUTE/RUNTIME \
+  "$LAUNCHER" \
+  --release "$RUNTIME" \
   --interpreter "$HOME/.local/share/uv/tools/serena-agent/bin/python" \
-  --isolated -- --config "$HOME/.config/chatgpt-coding-mcp/projects.json"
+  --isolated -- --config "$PROJECTS_CONFIG"
 ```
 
 Use the same launcher with `--entrypoint admin_server.py` only when you choose

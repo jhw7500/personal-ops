@@ -62,6 +62,33 @@ def _check_ancestor_chain(path: Path) -> None:
             raise BootstrapError("UNSAFE_EXISTING_SETUP")
 
 
+def _check_owner_path_separation(projects: dict[str, Path], targets: tuple[Path, ...]) -> None:
+    for target in targets:
+        canonical = Path(os.path.realpath(target))
+        if any(canonical == project or canonical.is_relative_to(project)
+               or project.is_relative_to(canonical)
+               for project in projects.values()):
+            raise BootstrapError("OWNER_PATH_OVERLAPS_PROJECT")
+
+
+def _validated_interpreter(path: str) -> str:
+    candidate = Path(path)
+    try:
+        resolved = candidate.resolve(strict=True)
+        info = resolved.stat()
+    except OSError as exc:
+        raise BootstrapError("UNSAFE_BOOTSTRAP_INTERPRETER") from exc
+    trusted_system = resolved.is_relative_to(Path("/usr/bin")) or resolved.is_relative_to(
+        Path("/usr/local/bin")
+    )
+    if (not candidate.is_absolute() or not stat.S_ISREG(info.st_mode)
+            or not os.access(resolved, os.X_OK)
+            or stat.S_IMODE(info.st_mode) & 0o022
+            or (info.st_uid != os.getuid() and not (trusted_system and info.st_uid == 0))):
+        raise BootstrapError("UNSAFE_BOOTSTRAP_INTERPRETER")
+    return str(candidate)
+
+
 def _private_directory(path: Path) -> None:
     path = path.absolute()
     current = Path(path.anchor)
@@ -252,7 +279,7 @@ print(json.dumps({"result": result, "state": state}, sort_keys=True))
 def _configured_result(*, runtime: Path, controller: dict, launch: dict,
                        projects: dict[str, Path], projects_path: Path,
                        authority_dir: Path, status: str) -> dict:
-    interpreter = Path(sys.executable).resolve()
+    interpreter = _validated_interpreter(sys.executable)
     return {
         "status": status,
         "applied": True,
@@ -260,12 +287,12 @@ def _configured_result(*, runtime: Path, controller: dict, launch: dict,
         "projects": {name: str(path) for name, path in projects.items()},
         "runtime": str(runtime),
         "launcher": controller["launcher"],
-        "interpreter": str(interpreter),
+        "interpreter": interpreter,
         "projects_config": str(projects_path),
         "authority": str(authority_dir),
         "launch_argv": [
-            str(interpreter), controller["launcher"], "--release", str(runtime),
-            "--interpreter", str(interpreter), "--isolated", "--",
+            interpreter, controller["launcher"], "--release", str(runtime),
+            "--interpreter", interpreter, "--isolated", "--",
             "--config", str(projects_path),
         ],
         "launch": launch,
@@ -300,6 +327,8 @@ def run(argv=None) -> dict:
     authority_dir = state_root / "workspace-authority"
     projects_path = config_root / "projects.json"
     policy_path = config_root / "workspace-policy.json"
+
+    _check_owner_path_separation(projects, (config_root, state_root, library_root))
 
     installer = _load_file_module("bootstrap_install_runtime", source / "install-runtime.py")
     manifest, snapshot, _dashboard = _source_inventory(source, installer)
