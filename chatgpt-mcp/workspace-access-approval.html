@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>경로 접근 승인</title>
+<style>
+:root{color-scheme:light dark;font:14px/1.5 system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;padding:20px;color:light-dark(#202124,#f1f1f1);background:light-dark(#fff,#202020)}main{max-width:560px;margin:auto}h1{font-size:21px;margin:0}.lead{color:light-dark(#555,#c8c8c8);margin:8px 0 16px}.summary{display:grid;gap:10px;padding:14px;margin:0;border:1px solid light-dark(#ddd,#555);border-radius:12px;background:light-dark(#f7f8fa,#292b2e)}dt{font-size:12px;color:light-dark(#666,#bbb)}dd{margin:2px 0 0;overflow-wrap:anywhere;font-weight:650}code{font:12px/1.5 ui-monospace,monospace}.warning{margin-top:14px;padding:12px;border-radius:10px;background:light-dark(#fff4d6,#493b18)}.actions{display:flex;gap:9px;margin-top:16px}button{min-height:44px;padding:9px 15px;border-radius:9px;font:inherit;font-weight:700}button:disabled{opacity:.55}#status{min-height:24px;margin-top:14px}#status[data-error="true"]{color:light-dark(#a51d24,#ffacae)}
+</style></head><body><main>
+<h1>경로 접근 승인</h1>
+<p class="lead">아래 경로와 작업 범위를 확인한 뒤 직접 승인하세요.</p>
+<dl class="summary">
+<div><dt>프로젝트</dt><dd id="project">불러오는 중…</dd></div>
+<div><dt>경로</dt><dd><code id="path">불러오는 중…</code></dd></div>
+<div><dt>대상 종류</dt><dd id="kind">불러오는 중…</dd></div>
+<div><dt>허용 작업</dt><dd id="operations">불러오는 중…</dd></div>
+<div><dt>유지 시간</dt><dd id="duration">불러오는 중…</dd></div>
+<div><dt>요청 목적</dt><dd id="purpose">불러오는 중…</dd></div>
+<div><dt>요청 만료</dt><dd id="expiry">불러오는 중…</dd></div>
+<div><dt>권한 세대</dt><dd id="epoch">불러오는 중…</dd></div>
+<div><dt>정책 식별값</dt><dd><code id="digest">불러오는 중…</code></dd></div>
+<div><dt>적용 범위</dt><dd id="scope">현재 MCP 설치</dd></div>
+</dl>
+<p class="warning">이 승인은 표시한 경로 작업에만 적용됩니다. 명령 실행, 네트워크, 배포 권한은 포함하지 않습니다.</p>
+<div class="actions"><button id="approve" disabled>표시한 범위 승인</button><button id="cancel" disabled>요청 취소</button></div>
+<p id="status" role="status" aria-live="polite">ChatGPT에 연결하는 중…</p>
+</main><script>
+"use strict";
+const elements={project:document.querySelector("#project"),path:document.querySelector("#path"),
+  kind:document.querySelector("#kind"),operations:document.querySelector("#operations"),
+  duration:document.querySelector("#duration"),purpose:document.querySelector("#purpose"),
+  expiry:document.querySelector("#expiry"),epoch:document.querySelector("#epoch"),
+  digest:document.querySelector("#digest"),scope:document.querySelector("#scope"),
+  approve:document.querySelector("#approve"),cancel:document.querySelector("#cancel"),
+  status:document.querySelector("#status")};
+const pending=new Map();let rpcId=0,card=null,confirmation=null,busy=false,locked=false,
+  serial=0,legacy=Boolean(window.openai),expiryTimer=null,sizeObserver=null,sizeFrame=null,lastSize=null;
+const OPERATION_LABEL={read:"읽기",list:"목록 보기",write:"쓰기"};
+function message(text,error=false){elements.status.textContent=text;elements.status.dataset.error=String(error)}
+function request(method,params){
+  if(legacy&&method==="tools/call")return window.openai.callTool(params.name,params.arguments);
+  return new Promise((resolve,reject)=>{const id=++rpcId;
+    const timer=setTimeout(()=>{pending.delete(id);reject(Error("TIMEOUT"))},method==="tools/call"?60000:15000);
+    pending.set(id,{resolve,reject,timer});window.parent.postMessage({jsonrpc:"2.0",id,method,params},"*");});
+}
+function scheduleSize(){if(legacy||sizeFrame!==null)return;sizeFrame=requestAnimationFrame(()=>{
+  sizeFrame=null;const size={height:Math.ceil(document.documentElement.getBoundingClientRect().height),width:Math.ceil(window.innerWidth)};
+  if(size.height<=0||size.width<=0||(lastSize&&lastSize.height===size.height&&lastSize.width===size.width))return;
+  lastSize=size;window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/size-changed",params:size},"*");});}
+function startSize(){if(legacy||sizeObserver)return;sizeObserver=new ResizeObserver(scheduleSize);sizeObserver.observe(document.documentElement);sizeObserver.observe(document.body);scheduleSize()}
+function updateTheme(context){if(context?.theme==="light"||context?.theme==="dark")document.documentElement.style.colorScheme=context.theme;}
+function validPending(value){return value&&value.status==="pending"&&value.scope==="installation"&&
+  /^[0-9a-f]{32}$/.test(value.request_id||"")&&typeof value.project==="string"&&value.project&&
+  typeof value.path==="string"&&value.path&&["file","directory"].includes(value.scope_kind)&&
+  Array.isArray(value.operations)&&value.operations.length>0&&value.operations.length<=3&&
+  new Set(value.operations).size===value.operations.length&&value.operations.every(item=>OPERATION_LABEL[item])&&
+  Number.isInteger(value.duration_seconds)&&value.duration_seconds>0&&value.duration_seconds<=2592000&&
+  typeof value.purpose==="string"&&value.purpose&&Number.isInteger(value.authority_epoch)&&value.authority_epoch>=1&&
+  /^[0-9a-f]{64}$/.test(value.policy_digest||"")&&typeof value.request_expires_at==="string"&&
+  !Number.isNaN(Date.parse(value.request_expires_at));}
+function sameRequest(a,b){return a.request_id===b.request_id&&a.project===b.project&&a.path===b.path&&
+  a.scope_kind===b.scope_kind&&JSON.stringify(a.operations)===JSON.stringify(b.operations)&&
+  a.duration_seconds===b.duration_seconds&&a.purpose===b.purpose&&
+  a.request_expires_at===b.request_expires_at&&a.authority_epoch===b.authority_epoch&&
+  a.policy_digest===b.policy_digest;}
+function lock(text){locked=true;confirmation=null;sync();message(text,true)}
+function sync(){const expired=card&&Date.now()>=Date.parse(card.request_expires_at);
+  if(expired&&!locked){locked=true;confirmation=null;message("승인 요청이 만료되었습니다. 채팅에서 카드를 다시 열어주세요.",true)}
+  const disabled=!card||!confirmation||busy||locked||expired;elements.approve.disabled=disabled;elements.cancel.disabled=disabled;}
+function formatDuration(value){return value%86400===0?`${value/86400}일`:value%60===0?`${value/60}분`:`${value}초`}
+function render(){if(!card)return;elements.project.textContent=card.project;elements.path.textContent=card.path;
+  elements.kind.textContent=card.scope_kind==="file"?"파일":"디렉터리";
+  elements.operations.textContent=card.operations.map(item=>OPERATION_LABEL[item]).join(", ");
+  elements.duration.textContent=formatDuration(card.duration_seconds);elements.purpose.textContent=card.purpose;
+  elements.expiry.textContent=new Date(card.request_expires_at).toLocaleString("ko-KR");
+  elements.epoch.textContent=String(card.authority_epoch);elements.digest.textContent=card.policy_digest;
+  elements.scope.textContent="현재 MCP 설치";
+  clearTimeout(expiryTimer);const remaining=Date.parse(card.request_expires_at)-Date.now();
+  if(remaining>0)expiryTimer=setTimeout(sync,Math.min(remaining+20,2147483647));sync();scheduleSize();}
+function accept(result){if(locked){lock("이 카드는 더 이상 사용할 수 없습니다. 채팅에서 카드를 다시 열어주세요.");return;}
+  if(result?.isError||!validPending(result?.structuredContent)){lock("승인 요청을 확인할 수 없습니다. 채팅에서 카드를 다시 열어주세요.");return;}
+  const next=result.structuredContent,token=result?._meta?.workspace_confirmation;
+  if(card&&!sameRequest(card,next)){lock("승인 요청이 변경되었습니다. 채팅에서 카드를 다시 열어주세요.");return;}
+  if(!/^[0-9a-f]{64}$/.test(token||"")){card=next;lock("확인 정보가 없습니다. 채팅에서 카드를 다시 열어주세요.");render();return;}
+  serial++;card=next;confirmation=token;locked=false;render();if(!locked)message("표시한 범위를 확인한 뒤 승인하거나 취소하세요.");}
+function validTerminal(value,approved){if(!value||value.request_id!==card.request_id)return false;
+  if(approved)return value.status==="approved"&&value.project===card.project&&
+    /^[0-9a-f]{32}$/.test(value.grant_id||"")&&Date.parse(value.expires_at)>Date.now()&&value.scope_path===card.path&&
+    JSON.stringify(value.operations)===JSON.stringify(card.operations)&&value.authority_epoch===card.authority_epoch&&
+    value.policy_digest===card.policy_digest;
+  return value.status==="cancelled"&&value.authority_epoch===card.authority_epoch&&value.policy_digest===card.policy_digest;}
+function receipt(value){return {...(value.status==="approved"?{grant_id:value.grant_id,project:value.project,expires_at:value.expires_at}:{}),request_id:value.request_id,status:value.status,
+  scope_path:value.scope_path||card.path,operations:value.operations||card.operations,
+  authority_epoch:value.authority_epoch,policy_digest:value.policy_digest};}
+function publish(value){const safe=receipt(value),context={content:[{type:"text",text:`경로 접근 요청 상태: ${safe.status}`}],structuredContent:{workspaceAccess:safe}};
+  if(!legacy)request("ui/update-model-context",context).catch(()=>{});
+  try{window.openai?.setWidgetState?.({modelContent:context.structuredContent})}catch(_){} }
+async function action(name){if(!card||!confirmation||busy||locked)return;busy=true;sync();const version=serial,frozen=card,token=confirmation;
+  try{const response=await request("tools/call",{name,arguments:{project:frozen.project,request_id:frozen.request_id,confirmation_token:token}});
+    const value=response?.structuredContent,approved=name.startsWith("confirm");
+    if(version!==serial||response?.isError||!validTerminal(value,approved))throw Error("INVALID_RESULT");
+    confirmation=null;locked=true;publish(value);message(approved?"표시한 경로의 접근을 승인했습니다.":"경로 접근 요청을 취소했습니다.");
+  }catch(_){lock("승인 결과를 확인할 수 없습니다. 채팅에서 카드를 다시 열어주세요.")}
+  finally{busy=false;sync();scheduleSize();}}
+elements.approve.addEventListener("click",()=>action("confirm_workspace_access_approval"));
+elements.cancel.addEventListener("click",()=>action("cancel_workspace_access_approval"));
+window.addEventListener("message",event=>{if(event.source!==window.parent||event.data?.jsonrpc!=="2.0")return;
+  const item=pending.get(event.data.id);if(item){pending.delete(event.data.id);clearTimeout(item.timer);
+    event.data.error?item.reject(Error("HOST_ERROR")):item.resolve(event.data.result);return;}
+  if(event.data.method==="ui/notifications/tool-result")accept(event.data.params);
+  else if(event.data.method==="ui/notifications/host-context-changed")updateTheme(event.data.params);});
+if(legacy)accept({structuredContent:window.openai.toolOutput,_meta:window.openai.toolResponseMetadata});
+else request("ui/initialize",{protocolVersion:"2026-01-26",appInfo:{name:"workspace-access",version:"1"},appCapabilities:{}})
+  .then(host=>{updateTheme(host?.hostContext);window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/initialized",params:{}},"*");startSize()})
+  .catch(()=>lock("승인 카드 연결을 확인할 수 없습니다. 채팅에서 카드를 다시 열어주세요."));
+</script></body></html>

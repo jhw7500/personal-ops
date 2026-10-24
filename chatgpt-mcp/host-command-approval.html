@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>호스트 명령 승인</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 18px; color: light-dark(#202124, #f1f1f1); background: light-dark(#fff, #202020); }
+    main { width: 100%; max-width: 600px; margin: 0 auto; }
+    h1 { margin: 0; font-size: 21px; }
+    .lead { margin: 7px 0 15px; color: light-dark(#555b62, #c7cbd0); }
+    dl { display: grid; gap: 9px; margin: 0; padding: 14px; border: 1px solid light-dark(#d8dce2, #51555a); border-radius: 12px; background: light-dark(#f7f8fa, #292b2e); }
+    dt { color: light-dark(#666a70, #b9bdc2); font-size: 12px; }
+    dd { margin: 2px 0 0; overflow-wrap: anywhere; font-weight: 650; }
+    code { font: 12px/1.45 ui-monospace, monospace; }
+    .warning { margin-top: 13px; padding: 12px; border-radius: 10px; background: light-dark(#fff2d2, #493b18); color: light-dark(#594300, #ffe59a); }
+    .warning strong { display: block; margin-bottom: 3px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 15px; }
+    button { min-height: 44px; padding: 9px 16px; border-radius: 9px; border: 1px solid transparent; font: inherit; font-weight: 700; cursor: pointer; }
+    button:disabled { cursor: default; opacity: .55; }
+    .primary { background: light-dark(#202124, #ededed); color: light-dark(#fff, #202124); }
+    .secondary { color: inherit; border-color: light-dark(#b8bcc2, #666a70); background: transparent; }
+    #status { min-height: 23px; margin: 13px 0 0; }
+    #status[data-error="true"] { color: light-dark(#a51d24, #ffacae); }
+    .footnote { margin: 6px 0 0; color: light-dark(#666a70, #b9bdc2); font-size: 12px; }
+    @media (max-width: 420px) { body { padding: 13px; } .actions button { flex: 1 1 130px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>호스트 명령 승인</h1>
+    <p class="lead">호스트가 고정한 명령 프로필과 입력을 확인하세요.</p>
+    <dl>
+      <div><dt>프로젝트</dt><dd id="project">불러오는 중…</dd></div>
+      <div><dt>프로필</dt><dd><code id="profile">불러오는 중…</code></dd></div>
+      <div><dt>작업</dt><dd id="label">불러오는 중…</dd></div>
+      <div><dt>영향</dt><dd id="effect">불러오는 중…</dd></div>
+      <div><dt>작업 ID</dt><dd><code id="operation">불러오는 중…</code></dd></div>
+      <div><dt>계획 SHA-256</dt><dd><code id="plan">불러오는 중…</code></dd></div>
+      <div><dt>소스 SHA-256</dt><dd><code id="source">불러오는 중…</code></dd></div>
+      <div><dt>실행 파일 SHA-256</dt><dd><code id="executable">불러오는 중…</code></dd></div>
+      <div><dt>고정 입력</dt><dd id="inputs">불러오는 중…</dd></div>
+      <div><dt>실행 제한</dt><dd id="timeout">불러오는 중…</dd></div>
+      <div><dt>카드 만료</dt><dd id="expiry">불러오는 중…</dd></div>
+    </dl>
+    <div class="warning">
+      <strong id="warning-title">승인만으로 명령을 실행하지 않습니다.</strong>
+      <span id="warning-detail">이 버튼은 1회용 승인 영수증만 발급합니다. 실제 빌드나 TEST 업로드·외부 게시는 채팅의 별도 실행 요청에서 시작됩니다.</span>
+    </div>
+    <div class="actions">
+      <button id="approve" class="primary" type="button" disabled>이 계획 승인</button>
+      <button id="cancel" class="secondary" type="button" disabled>취소</button>
+    </div>
+    <p id="status" role="status" aria-live="polite">ChatGPT에 연결하는 중…</p>
+    <p class="footnote">호스트 경로와 명령 인자는 카드에 표시되지 않습니다. 다른 계획에는 이 승인을 사용할 수 없습니다.</p>
+  </main>
+  <script>
+    "use strict";
+    const element = Object.fromEntries([
+      "project", "profile", "label", "effect", "operation", "plan", "source",
+      "executable", "inputs", "timeout", "expiry", "warning-title", "warning-detail",
+      "approve", "cancel", "status",
+    ].map(id => [id, document.getElementById(id)]));
+    const pending = new Map();
+    const HEX32 = /^[0-9a-f]{32}$/;
+    const HEX64 = /^[0-9a-f]{64}$/;
+    const PROFILE = /^[a-z][a-z0-9_-]{0,62}$/;
+    const EFFECTS = new Set(["read_only", "build", "external_publish"]);
+    const STATES = new Set(["pending", "approved", "cancelled"]);
+    const FORBIDDEN_PLAN_KEYS = new Set([
+      "argv", "cwd", "cwd_relative", "executable", "approval_url", "approval_command",
+      "confirmation_token", "host_command_confirmation", "environment", "env",
+    ]);
+    let rpcId = 0;
+    let legacyBridge = false;
+    let supportsContextRPC = false;
+    let card = null;
+    let confirmationToken = null;
+    let busy = false;
+    let locked = false;
+    let expiryTimer = null;
+    let sizeObserver = null;
+    let sizeFrame = null;
+    let lastSize = null;
+
+    function scheduleSizeReport() {
+      if (sizeFrame !== null) return;
+      sizeFrame = requestAnimationFrame(() => {
+        sizeFrame = null;
+        const root = document.documentElement;
+        const previous = root.style.height;
+        let height;
+        try {
+          root.style.height = "max-content";
+          height = Math.ceil(root.getBoundingClientRect().height);
+        } finally {
+          root.style.height = previous;
+        }
+        const width = Math.ceil(window.innerWidth);
+        if (height <= 0 || width <= 0 ||
+            (lastSize?.height === height && lastSize?.width === width)) return;
+        lastSize = {height, width};
+        window.parent.postMessage({jsonrpc: "2.0", method: "ui/notifications/size-changed",
+          params: lastSize}, "*");
+      });
+    }
+
+    function startSizeReporting() {
+      if (sizeObserver) return;
+      sizeObserver = new ResizeObserver(scheduleSizeReport);
+      sizeObserver.observe(document.documentElement);
+      sizeObserver.observe(document.body);
+      window.addEventListener("resize", scheduleSizeReport);
+      scheduleSizeReport();
+    }
+
+    function stopSizeReporting() {
+      sizeObserver?.disconnect();
+      sizeObserver = null;
+      if (sizeFrame !== null) cancelAnimationFrame(sizeFrame);
+      sizeFrame = null;
+      window.removeEventListener("resize", scheduleSizeReport);
+    }
+
+    function setStatus(text, error = false) {
+      element.status.textContent = text;
+      element.status.dataset.error = String(error);
+      scheduleSizeReport();
+    }
+
+    function request(method, params) {
+      if (legacyBridge && method === "tools/call") {
+        return window.openai.callTool(params.name, params.arguments);
+      }
+      return new Promise((resolve, reject) => {
+        const id = ++rpcId;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error("요청 결과를 확인할 수 없습니다."));
+        }, method === "tools/call" ? 60000 : 15000);
+        pending.set(id, {resolve, reject, timer});
+        window.parent.postMessage({jsonrpc: "2.0", id, method, params}, "*");
+      });
+    }
+
+    function safeText(value, maximum) {
+      return typeof value === "string" && value.length >= 1 && value.length <= maximum &&
+        !/[\u0000-\u001f\u007f]/u.test(value);
+    }
+
+    function safePlan(value, depth = 0, budget = {count: 0}) {
+      if (depth > 4 || budget.count > 64) return false;
+      if (value === null || typeof value === "boolean" ||
+          (typeof value === "number" && Number.isFinite(value))) return true;
+      if (typeof value === "string") return safeText(value, 512);
+      if (Array.isArray(value)) {
+        if (value.length > 32) return false;
+        return value.every(item => safePlan(item, depth + 1, budget));
+      }
+      if (typeof value !== "object" ||
+          Object.prototype.toString.call(value) !== "[object Object]") return false;
+      const entries = Object.entries(value);
+      budget.count += entries.length;
+      return budget.count <= 64 && entries.every(([key, item]) =>
+        safeText(key, 64) && !FORBIDDEN_PLAN_KEYS.has(key) && safePlan(item, depth + 1, budget));
+    }
+
+    function exactNextAction(value, current, tool) {
+      return value && Object.keys(value).length === 2 && value.tool === tool &&
+        value.arguments && Object.keys(value.arguments).length === 2 &&
+        value.arguments.project === current.project &&
+        value.arguments.operation_id === current.operation_id;
+    }
+
+    function validPublic(value) {
+      if (!value || !safeText(value.project, 200) || value.component !== "host_command" ||
+          !PROFILE.test(value.profile_id || "") || !safeText(value.label, 100) ||
+          !EFFECTS.has(value.effect) || !HEX32.test(value.operation_id || "") ||
+          !HEX32.test(value.card_id || "") || !STATES.has(value.state) ||
+          ![value.plan_digest, value.source_digest, value.executable_sha256].every(
+            digest => HEX64.test(digest || "")) || !Number.isInteger(value.input_count) ||
+          value.input_count < 0 || !Number.isInteger(value.timeout_seconds) ||
+          value.timeout_seconds <= 0 || !safeText(value.expires_at, 64) ||
+          Number.isNaN(Date.parse(value.expires_at)) || value.executes_on_approval !== false ||
+          typeof value.receipt_verified !== "boolean" || !safePlan(value.plan) ||
+          (value.supports_direct_execution !== undefined &&
+            typeof value.supports_direct_execution !== "boolean")) return false;
+      if (value.plan.project !== undefined && value.plan.project !== value.project) return false;
+      if (value.plan.profile_id !== undefined && value.plan.profile_id !== value.profile_id) return false;
+      if (value.plan.effect !== undefined && value.plan.effect !== value.effect) return false;
+      if (value.approved !== undefined && typeof value.approved !== "boolean") return false;
+      if (value.state === "approved") {
+        if (value.receipt_verified !== true || value.approved !== true) return false;
+        if (value.execution_requested === true) {
+          return value.supports_direct_execution === false &&
+            typeof value.execution_started === "boolean" &&
+            exactNextAction(value.next_action, value, "get_host_command");
+        }
+        return value.execution_requested === undefined && value.execution_started === undefined &&
+          exactNextAction(value.next_action, value, "execute_host_command");
+      }
+      return value.receipt_verified === false && value.approved !== true &&
+        value.execution_requested === undefined && value.execution_started === undefined &&
+        value.next_action === undefined;
+    }
+
+    function terminal(value) { return value?.state === "approved" || value?.state === "cancelled"; }
+
+    function syncControls() {
+      const expired = card ? Date.now() >= Date.parse(card.expires_at) : true;
+      const disabled = !card || card.state !== "pending" || !confirmationToken || busy || locked || expired;
+      element.approve.disabled = disabled;
+      element.cancel.disabled = disabled;
+      if (expired && card?.state === "pending" && !locked) {
+        locked = true;
+        confirmationToken = null;
+        setStatus("승인 카드가 만료되었습니다. 계획 상태를 다시 조회하거나 카드를 다시 여세요.", true);
+      }
+    }
+
+    function effectText(effect) {
+      if (effect === "external_publish") return "TEST 업로드 · 외부 게시";
+      if (effect === "build") return "빌드 · 로컬 산출물 생성";
+      return "읽기 전용";
+    }
+
+    function syncIntentCopy() {
+      const direct = card?.supports_direct_execution === true || card?.execution_requested === true;
+      element.approve.textContent = direct ? "승인하고 실행" : "이 계획 승인";
+      if (direct) {
+        element["warning-title"].textContent = "승인하면 고정된 명령 실행을 시작합니다.";
+        element["warning-detail"].textContent = card.effect === "external_publish" ?
+          "한 번의 클릭으로 승인 후 TEST 업로드와 외부 게시를 즉시 시작합니다." :
+          card.effect === "build" ? "한 번의 클릭으로 승인 후 빌드와 로컬 산출물 생성을 즉시 시작합니다." :
+          "한 번의 클릭으로 승인 후 읽기 전용 명령을 즉시 시작합니다.";
+      } else {
+        element["warning-title"].textContent = "승인만으로 명령을 실행하지 않습니다.";
+        element["warning-detail"].textContent =
+          "이 버튼은 1회용 승인 영수증만 발급합니다. 실제 빌드나 TEST 업로드·외부 게시는 채팅의 별도 실행 요청에서 시작됩니다.";
+      }
+    }
+
+    function render() {
+      if (!card) { syncControls(); return; }
+      element.project.textContent = card.project;
+      element.profile.textContent = card.profile_id;
+      element.label.textContent = card.label;
+      element.effect.textContent = effectText(card.effect);
+      element.operation.textContent = card.operation_id;
+      element.plan.textContent = card.plan_digest;
+      element.source.textContent = card.source_digest;
+      element.executable.textContent = card.executable_sha256;
+      element.inputs.textContent = `${card.input_count}개`;
+      element.timeout.textContent = `${card.timeout_seconds}초`;
+      clearTimeout(expiryTimer);
+      const remaining = Date.parse(card.expires_at) - Date.now();
+      element.expiry.textContent = new Date(card.expires_at).toLocaleString("ko-KR") +
+        (card.state === "pending" && remaining > 0 ? ` · ${Math.ceil(remaining / 60000)}분 남음` : "");
+      if (card.state === "pending" && remaining > 0) {
+        expiryTimer = setTimeout(render, Math.min(remaining + 20, 60000));
+      }
+      syncIntentCopy();
+      syncControls();
+      scheduleSizeReport();
+    }
+
+    function acceptResult(result) {
+      if (result?.isError || !validPublic(result?.structuredContent)) {
+        throw new Error("호스트가 카드를 거부했습니다.");
+      }
+      const next = result.structuredContent;
+      const immutableFields = [
+        "project", "profile_id", "operation_id", "card_id", "plan_digest", "source_digest",
+        "executable_sha256", "effect", "label", "input_count", "timeout_seconds", "expires_at",
+      ];
+      if (card && (immutableFields.some(field => next[field] !== card[field]) ||
+          (next.state === "pending" &&
+            next.supports_direct_execution !== card.supports_direct_execution))) return false;
+      if (terminal(card) && next.state === "pending") return false;
+      const token = result?._meta?.host_command_confirmation;
+      card = next;
+      if (next.state === "pending" && !HEX64.test(token || "")) {
+        locked = true;
+        confirmationToken = null;
+        render();
+        setStatus("확인 정보가 없습니다. 채팅에서 승인 카드를 다시 열어주세요.", true);
+        return true;
+      }
+      confirmationToken = next.state === "pending" ? token : null;
+      if (terminal(next)) locked = true;
+      render();
+      return true;
+    }
+
+    function publicReceipt(value) {
+      const receipt = {
+        project: value.project, component: value.component, profile_id: value.profile_id,
+        operation_id: value.operation_id, card_id: value.card_id, state: value.state,
+        approved: value.approved === true, receipt_verified: value.receipt_verified,
+      };
+      if (value.execution_requested === true) {
+        receipt.execution_requested = true;
+        receipt.execution_started = value.execution_started;
+        receipt.plan = value.plan;
+      }
+      return receipt;
+    }
+
+    async function publish() {
+      const receipt = publicReceipt(card);
+      const context = {
+        content: [{type: "text", text: `호스트 명령 승인 ${receipt.operation_id}: ${receipt.state}`}],
+        structuredContent: {hostCommandApproval: receipt},
+      };
+      if (supportsContextRPC) {
+        await request("ui/update-model-context", context);
+        try { window.openai?.setWidgetState?.({modelContent: context.structuredContent}); }
+        catch (_) { /* The RPC already delivered bounded public state. */ }
+      } else if (typeof window.openai?.setWidgetState === "function") {
+        window.openai.setWidgetState({modelContent: context.structuredContent});
+      }
+    }
+
+    function failClosed() {
+      locked = true;
+      confirmationToken = null;
+      syncControls();
+      setStatus("결과를 확정할 수 없습니다. get_host_command로 상태를 다시 조회하거나 카드를 다시 여세요.", true);
+    }
+
+    async function submit(action) {
+      if (!card || !confirmationToken || busy || locked) return;
+      busy = true;
+      syncControls();
+      setStatus(action === "confirm_and_execute" ? "승인 후 실행을 시작하는 중…" :
+        action === "confirm" ? "승인 중…" : "취소 중…");
+      const args = {project: card.project, operation_id: card.operation_id,
+        card_id: card.card_id, confirmation_token: confirmationToken};
+      try {
+        const result = await request("tools/call", {
+          name: action === "confirm_and_execute" ? "confirm_and_execute_host_command" :
+            `${action}_host_command_approval`, arguments: args,
+        });
+        if (!acceptResult(result)) { failClosed(); return; }
+        await publish();
+        if (card.state === "approved") {
+          if (card.execution_requested === true) {
+            const prefix = action === "cancel" ? "이미 승인된 계획입니다. " : "승인되었습니다. ";
+            setStatus(card.execution_started ? prefix +
+              "고정된 명령 실행을 시작했습니다. get_host_command로 상태를 확인할 수 있습니다." : prefix +
+              "계획이 만료되어 실행을 시작하지 않았습니다. get_host_command로 상태를 확인하세요.",
+              card.execution_started === false);
+          } else {
+            setStatus((action === "cancel" ? "이미 승인된 계획입니다. " : "승인 영수증을 확인했습니다. ") +
+              "명령 실행은 별도 채팅 요청에서 시작됩니다.");
+          }
+        } else {
+          setStatus("승인 요청을 취소했습니다.");
+        }
+      } catch (_) {
+        failClosed();
+      } finally {
+        busy = false;
+        syncControls();
+      }
+    }
+
+    element.approve.addEventListener("click", () =>
+      submit(card?.supports_direct_execution === true ? "confirm_and_execute" : "confirm"));
+    element.cancel.addEventListener("click", () => submit("cancel"));
+
+    function updateTheme(context) {
+      if (context?.theme === "light" || context?.theme === "dark") {
+        document.documentElement.style.colorScheme = context.theme;
+      }
+    }
+
+    function takeLegacyMetadata(fallback) {
+      const metadata = fallback ?? window.openai?.toolResponseMetadata;
+      try { window.openai.toolResponseMetadata = undefined; }
+      catch (_) { /* Compatibility metadata may be read-only. */ }
+      return metadata;
+    }
+
+    window.addEventListener("message", event => {
+      if (event.source !== window.parent) return;
+      const data = event.data;
+      if (!data || data.jsonrpc !== "2.0") return;
+      if (pending.has(data.id)) {
+        const response = pending.get(data.id);
+        clearTimeout(response.timer);
+        pending.delete(data.id);
+        data.error ? response.reject(new Error("ChatGPT 요청에 실패했습니다.")) :
+          response.resolve(data.result);
+      } else if (data.method === "ui/notifications/tool-result") {
+        try {
+          if (acceptResult(data.params) && card?.state === "pending" && !locked) {
+            setStatus("계획을 확인한 뒤 승인하세요.");
+          }
+        } catch (_) {
+          locked = true;
+          confirmationToken = null;
+          syncControls();
+          setStatus("승인 카드 데이터를 확인할 수 없습니다. 카드를 다시 여세요.", true);
+        }
+      } else if (data.method === "ui/notifications/host-context-changed") {
+        updateTheme(data.params);
+      } else if (data.method === "ui/resource-teardown") {
+        confirmationToken = null;
+        stopSizeReporting();
+        window.parent.postMessage({jsonrpc: "2.0", id: data.id, result: {}}, "*");
+      }
+    });
+
+    window.addEventListener("openai:set_globals", event => {
+      const globals = event.detail?.globals;
+      updateTheme(globals);
+      if (globals?.toolOutput) {
+        try { acceptResult({structuredContent: globals.toolOutput,
+          _meta: takeLegacyMetadata(globals.toolResponseMetadata)}); }
+        catch (_) { /* Initialization reports a bounded error below. */ }
+      }
+    });
+
+    async function initialize() {
+      let host;
+      try {
+        host = await request("ui/initialize", {
+          appInfo: {name: "host-command-approval", version: "1.0.0"},
+          appCapabilities: {availableDisplayModes: ["inline"]},
+          protocolVersion: "2026-01-26",
+        });
+      } catch (_) {
+        if (typeof window.openai?.callTool !== "function") {
+          locked = true;
+          setStatus("이 화면에서는 승인할 수 없습니다. 채팅에서 카드를 다시 열어주세요.", true);
+          syncControls();
+          startSizeReporting();
+          return;
+        }
+        legacyBridge = true;
+        host = {hostContext: {theme: window.openai.theme}};
+      }
+      supportsContextRPC = Boolean(host?.hostCapabilities?.updateModelContext);
+      updateTheme(host?.hostContext);
+      if (!legacyBridge) {
+        window.parent.postMessage({jsonrpc: "2.0", method: "ui/notifications/initialized", params: {}}, "*");
+      }
+      if (!card && window.openai?.toolOutput) {
+        try { acceptResult({structuredContent: window.openai.toolOutput,
+          _meta: takeLegacyMetadata()}); }
+        catch (_) {
+          locked = true;
+          setStatus("승인 카드 데이터를 확인할 수 없습니다. 카드를 다시 여세요.", true);
+        }
+      }
+      if (card?.state === "approved") setStatus(card.execution_requested === true ?
+        (card.execution_started ? "승인됨 · 고정된 명령 실행을 시작했습니다." :
+          "승인됨 · 계획이 만료되어 실행을 시작하지 않았습니다.") :
+        "승인됨 · 명령 실행은 별도 요청입니다.");
+      else if (card?.state === "cancelled") setStatus("취소된 승인 계획입니다.");
+      else if (card && !locked) setStatus("계획을 확인한 뒤 승인하세요.");
+      else if (!card) setStatus("승인 정보를 기다리는 중…");
+      syncControls();
+      startSizeReporting();
+    }
+    initialize();
+  </script>
+</body>
+</html>

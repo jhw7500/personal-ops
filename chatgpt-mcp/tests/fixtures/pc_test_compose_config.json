@@ -1,0 +1,638 @@
+{
+ "capture": {
+  "captured_at": "2026-10-13",
+  "compose_version": "Docker Compose version v2.35.1",
+  "copied_inputs": [
+   "deploy/pc-test/compose.yaml",
+   "deploy/pc-test/Dockerfile",
+   ".dockerignore"
+  ],
+  "env": {
+   "TARORORO_CONFIG_DIR": "<private temp dir with dummy 0600 files>",
+   "TARORORO_GID": "1000",
+   "TARORORO_READING_MONETIZATION_TEST_MODE": "disabled",
+   "TARORORO_UID": "1000"
+  },
+  "model_command": "env -i HOME PATH LANG TARORORO_* docker compose --project-name tarororo-test --env-file /dev/null --project-directory <copy>/deploy/pc-test --file <copy>/deploy/pc-test/compose.yaml config --format json",
+  "purpose": "Real resolved model of the registered tarororo-test stack, for policy tests.",
+  "raw_model_command": "<same> config --format json --no-interpolate --no-env-resolution",
+  "scrubbed": "<copy> -> {snapshot}, <secret dir> -> {secret_dir}. config only resolves secret file paths; no secret value is present.",
+  "source": "tossApp deploy/pc-test/compose.yaml sha256 f87ba0e1a4d4b747c64885dc2c8933e904a4f1dca7636eef5d3bf48eaa3a07cf"
+ },
+ "model": {
+  "name": "tarororo-test",
+  "networks": {
+   "content-internal": {
+    "internal": true,
+    "ipam": {},
+    "name": "tarororo-test-content-internal"
+   },
+   "default": {
+    "ipam": {},
+    "name": "tarororo-test_default"
+   }
+  },
+  "secrets": {
+   "db-password": {
+    "file": "{secret_dir}/db-password",
+    "name": "tarororo-test_db-password"
+   },
+   "gemini-api-key": {
+    "file": "{secret_dir}/gemini-api-key",
+    "name": "tarororo-test_gemini-api-key"
+   },
+   "subject-secret": {
+    "file": "{secret_dir}/subject-secret",
+    "name": "tarororo-test_subject-secret"
+   },
+   "toss-client.crt": {
+    "file": "{secret_dir}/toss-client.crt",
+    "name": "tarororo-test_toss-client.crt"
+   },
+   "toss-client.key": {
+    "file": "{secret_dir}/toss-client.key",
+    "name": "tarororo-test_toss-client.key"
+   }
+  },
+  "services": {
+   "api": {
+    "build": {
+     "context": "{snapshot}",
+     "dockerfile": "deploy/pc-test/Dockerfile"
+    },
+    "cap_drop": [
+     "ALL"
+    ],
+    "command": [
+     "api"
+    ],
+    "depends_on": {
+     "db": {
+      "condition": "service_healthy",
+      "required": true
+     }
+    },
+    "entrypoint": null,
+    "environment": {
+     "ALLOWED_ORIGINS": "https://tarororo.private-apps.tossmini.com",
+     "APP_ENV": "test",
+     "AUTH_MODE": "toss",
+     "HOST": "0.0.0.0",
+     "PORT": "3000",
+     "READING_MONETIZATION_TEST_MODE": "disabled",
+     "TOSS_MTLS_CERT_PATH": "/run/secrets/toss-client.crt",
+     "TOSS_MTLS_KEY_PATH": "/run/secrets/toss-client.key"
+    },
+    "healthcheck": {
+     "interval": "10s",
+     "retries": 3,
+     "test": [
+      "CMD",
+      "node",
+      "-e",
+      "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+     ],
+     "timeout": "5s"
+    },
+    "image": "tarororo-pc-test:local",
+    "init": true,
+    "logging": {
+     "driver": "local",
+     "options": {
+      "max-file": "3",
+      "max-size": "10m"
+     }
+    },
+    "networks": {
+     "default": null
+    },
+    "ports": [
+     {
+      "host_ip": "127.0.0.1",
+      "mode": "ingress",
+      "protocol": "tcp",
+      "published": "3200",
+      "target": 3000
+     }
+    ],
+    "read_only": true,
+    "restart": "unless-stopped",
+    "secrets": [
+     {
+      "source": "db-password",
+      "target": "/run/secrets/db-password"
+     },
+     {
+      "source": "subject-secret",
+      "target": "/run/secrets/subject-secret"
+     },
+     {
+      "source": "toss-client.crt",
+      "target": "/run/secrets/toss-client.crt"
+     },
+     {
+      "source": "toss-client.key",
+      "target": "/run/secrets/toss-client.key"
+     }
+    ],
+    "security_opt": [
+     "no-new-privileges:true"
+    ],
+    "stop_grace_period": "30s",
+    "tmpfs": [
+     "/tmp:size=16m,mode=1777"
+    ],
+    "user": "1000:1000"
+   },
+   "db": {
+    "command": null,
+    "entrypoint": null,
+    "environment": {
+     "POSTGRES_DB": "tarororo_test",
+     "POSTGRES_PASSWORD_FILE": "/run/secrets/db-password",
+     "POSTGRES_USER": "tarororo"
+    },
+    "healthcheck": {
+     "interval": "5s",
+     "retries": 12,
+     "test": [
+      "CMD-SHELL",
+      "pg_isready -U tarororo -d tarororo_test"
+     ],
+     "timeout": "3s"
+    },
+    "image": "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2",
+    "logging": {
+     "driver": "local",
+     "options": {
+      "max-file": "3",
+      "max-size": "10m"
+     }
+    },
+    "networks": {
+     "content-internal": null,
+     "default": null
+    },
+    "restart": "unless-stopped",
+    "secrets": [
+     {
+      "source": "db-password",
+      "target": "/run/secrets/db-password"
+     }
+    ],
+    "volumes": [
+     {
+      "source": "database",
+      "target": "/var/lib/postgresql",
+      "type": "volume",
+      "volume": {}
+     }
+    ]
+   },
+   "worker": {
+    "build": {
+     "context": "{snapshot}",
+     "dockerfile": "deploy/pc-test/Dockerfile"
+    },
+    "cap_drop": [
+     "ALL"
+    ],
+    "command": [
+     "worker"
+    ],
+    "depends_on": {
+     "db": {
+      "condition": "service_healthy",
+      "required": true
+     }
+    },
+    "entrypoint": null,
+    "environment": {
+     "AI_GENERATION_TIMEOUT_MS": "60000",
+     "AI_MODEL": "gemini-3.1-flash-lite",
+     "AI_PROVIDER": "gemini"
+    },
+    "image": "tarororo-pc-test:local",
+    "init": true,
+    "logging": {
+     "driver": "local",
+     "options": {
+      "max-file": "3",
+      "max-size": "10m"
+     }
+    },
+    "networks": {
+     "default": null
+    },
+    "read_only": true,
+    "restart": "unless-stopped",
+    "secrets": [
+     {
+      "source": "db-password",
+      "target": "/run/secrets/db-password"
+     },
+     {
+      "source": "gemini-api-key",
+      "target": "/run/secrets/gemini-api-key"
+     }
+    ],
+    "security_opt": [
+     "no-new-privileges:true"
+    ],
+    "stop_grace_period": "30s",
+    "tmpfs": [
+     "/tmp:size=16m,mode=1777"
+    ],
+    "user": "1000:1000"
+   }
+  },
+  "volumes": {
+   "database": {
+    "name": "tarororo-test_database"
+   }
+  },
+  "x-app": {
+   "build": {
+    "context": "../..",
+    "dockerfile": "deploy/pc-test/Dockerfile"
+   },
+   "cap_drop": [
+    "ALL"
+   ],
+   "image": "tarororo-pc-test:local",
+   "init": true,
+   "logging": {
+    "driver": "local",
+    "options": {
+     "max-file": "3",
+     "max-size": "10m"
+    }
+   },
+   "read_only": true,
+   "security_opt": [
+    "no-new-privileges:true"
+   ],
+   "stop_grace_period": "30s",
+   "tmpfs": [
+    "/tmp:size=16m,mode=1777"
+   ],
+   "user": "1000:1000"
+  }
+ },
+ "raw_model": {
+  "name": "tarororo-test",
+  "networks": {
+   "content-internal": {
+    "internal": true,
+    "name": "tarororo-test-content-internal"
+   },
+   "default": {
+    "name": "tarororo-test_default"
+   }
+  },
+  "secrets": {
+   "db-password": {
+    "file": "{snapshot}/deploy/pc-test/${TARORORO_CONFIG_DIR:?Use manage.py}/db-password",
+    "name": "tarororo-test_db-password"
+   },
+   "gemini-api-key": {
+    "file": "{snapshot}/deploy/pc-test/${TARORORO_CONFIG_DIR:?Use manage.py}/gemini-api-key",
+    "name": "tarororo-test_gemini-api-key"
+   },
+   "subject-secret": {
+    "file": "{snapshot}/deploy/pc-test/${TARORORO_CONFIG_DIR:?Use manage.py}/subject-secret",
+    "name": "tarororo-test_subject-secret"
+   },
+   "toss-client.crt": {
+    "file": "{snapshot}/deploy/pc-test/${TARORORO_CONFIG_DIR:?Use manage.py}/toss-client.crt",
+    "name": "tarororo-test_toss-client.crt"
+   },
+   "toss-client.key": {
+    "file": "{snapshot}/deploy/pc-test/${TARORORO_CONFIG_DIR:?Use manage.py}/toss-client.key",
+    "name": "tarororo-test_toss-client.key"
+   }
+  },
+  "services": {
+   "api": {
+    "build": {
+     "context": "{snapshot}",
+     "dockerfile": "deploy/pc-test/Dockerfile"
+    },
+    "cap_drop": [
+     "ALL"
+    ],
+    "command": [
+     "api"
+    ],
+    "depends_on": {
+     "db": {
+      "condition": "service_healthy",
+      "required": true
+     }
+    },
+    "environment": {
+     "ALLOWED_ORIGINS": "https://tarororo.private-apps.tossmini.com",
+     "APP_ENV": "test",
+     "AUTH_MODE": "toss",
+     "HOST": "0.0.0.0",
+     "PORT": "3000",
+     "READING_MONETIZATION_TEST_MODE": "${TARORORO_READING_MONETIZATION_TEST_MODE:-disabled}",
+     "TOSS_MTLS_CERT_PATH": "/run/secrets/toss-client.crt",
+     "TOSS_MTLS_KEY_PATH": "/run/secrets/toss-client.key"
+    },
+    "healthcheck": {
+     "interval": "10s",
+     "retries": 3,
+     "test": [
+      "CMD",
+      "node",
+      "-e",
+      "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+     ],
+     "timeout": "5s"
+    },
+    "image": "tarororo-pc-test:local",
+    "init": true,
+    "logging": {
+     "driver": "local",
+     "options": {
+      "max-file": "3",
+      "max-size": "10m"
+     }
+    },
+    "networks": {
+     "default": null
+    },
+    "ports": [
+     {
+      "host_ip": "127.0.0.1",
+      "mode": "ingress",
+      "protocol": "tcp",
+      "published": "3200",
+      "target": 3000
+     }
+    ],
+    "read_only": true,
+    "restart": "unless-stopped",
+    "secrets": [
+     {
+      "source": "db-password",
+      "target": "/run/secrets/db-password"
+     },
+     {
+      "source": "subject-secret",
+      "target": "/run/secrets/subject-secret"
+     },
+     {
+      "source": "toss-client.crt",
+      "target": "/run/secrets/toss-client.crt"
+     },
+     {
+      "source": "toss-client.key",
+      "target": "/run/secrets/toss-client.key"
+     }
+    ],
+    "security_opt": [
+     "no-new-privileges:true"
+    ],
+    "stop_grace_period": "30s",
+    "tmpfs": [
+     "/tmp:size=16m,mode=1777"
+    ],
+    "user": "${TARORORO_UID:?Use manage.py}:${TARORORO_GID:?Use manage.py}"
+   },
+   "db": {
+    "environment": {
+     "POSTGRES_DB": "tarororo_test",
+     "POSTGRES_PASSWORD_FILE": "/run/secrets/db-password",
+     "POSTGRES_USER": "tarororo"
+    },
+    "healthcheck": {
+     "interval": "5s",
+     "retries": 12,
+     "test": [
+      "CMD-SHELL",
+      "pg_isready -U tarororo -d tarororo_test"
+     ],
+     "timeout": "3s"
+    },
+    "image": "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2",
+    "logging": {
+     "driver": "local",
+     "options": {
+      "max-file": "3",
+      "max-size": "10m"
+     }
+    },
+    "networks": {
+     "content-internal": null,
+     "default": null
+    },
+    "restart": "unless-stopped",
+    "secrets": [
+     {
+      "source": "db-password",
+      "target": "/run/secrets/db-password"
+     }
+    ],
+    "volumes": [
+     {
+      "source": "database",
+      "target": "/var/lib/postgresql",
+      "type": "volume",
+      "volume": {}
+     }
+    ]
+   },
+   "migrate": {
+    "build": {
+     "context": "{snapshot}",
+     "dockerfile": "deploy/pc-test/Dockerfile"
+    },
+    "cap_drop": [
+     "ALL"
+    ],
+    "command": [
+     "migrate"
+    ],
+    "depends_on": {
+     "db": {
+      "condition": "service_healthy",
+      "required": true
+     }
+    },
+    "environment": {
+     "APP_ENV": "test"
+    },
+    "image": "tarororo-pc-test:local",
+    "init": true,
+    "logging": {
+     "driver": "local",
+     "options": {
+      "max-file": "3",
+      "max-size": "10m"
+     }
+    },
+    "networks": {
+     "default": null
+    },
+    "profiles": [
+     "tools"
+    ],
+    "read_only": true,
+    "secrets": [
+     {
+      "source": "db-password",
+      "target": "/run/secrets/db-password"
+     }
+    ],
+    "security_opt": [
+     "no-new-privileges:true"
+    ],
+    "stop_grace_period": "30s",
+    "tmpfs": [
+     "/tmp:size=16m,mode=1777"
+    ],
+    "user": "${TARORORO_UID:?Use manage.py}:${TARORORO_GID:?Use manage.py}"
+   },
+   "seed": {
+    "build": {
+     "context": "{snapshot}",
+     "dockerfile": "deploy/pc-test/Dockerfile"
+    },
+    "cap_drop": [
+     "ALL"
+    ],
+    "command": [
+     "seed"
+    ],
+    "depends_on": {
+     "db": {
+      "condition": "service_healthy",
+      "required": true
+     }
+    },
+    "environment": {
+     "APP_ENV": "test"
+    },
+    "image": "tarororo-pc-test:local",
+    "init": true,
+    "logging": {
+     "driver": "local",
+     "options": {
+      "max-file": "3",
+      "max-size": "10m"
+     }
+    },
+    "networks": {
+     "default": null
+    },
+    "profiles": [
+     "tools"
+    ],
+    "read_only": true,
+    "secrets": [
+     {
+      "source": "db-password",
+      "target": "/run/secrets/db-password"
+     }
+    ],
+    "security_opt": [
+     "no-new-privileges:true"
+    ],
+    "stop_grace_period": "30s",
+    "tmpfs": [
+     "/tmp:size=16m,mode=1777"
+    ],
+    "user": "${TARORORO_UID:?Use manage.py}:${TARORORO_GID:?Use manage.py}"
+   },
+   "worker": {
+    "build": {
+     "context": "{snapshot}",
+     "dockerfile": "deploy/pc-test/Dockerfile"
+    },
+    "cap_drop": [
+     "ALL"
+    ],
+    "command": [
+     "worker"
+    ],
+    "depends_on": {
+     "db": {
+      "condition": "service_healthy",
+      "required": true
+     }
+    },
+    "environment": {
+     "AI_GENERATION_TIMEOUT_MS": "${TARORORO_AI_GENERATION_TIMEOUT_MS:-60000}",
+     "AI_MODEL": "gemini-3.1-flash-lite",
+     "AI_PROVIDER": "gemini"
+    },
+    "image": "tarororo-pc-test:local",
+    "init": true,
+    "logging": {
+     "driver": "local",
+     "options": {
+      "max-file": "3",
+      "max-size": "10m"
+     }
+    },
+    "networks": {
+     "default": null
+    },
+    "read_only": true,
+    "restart": "unless-stopped",
+    "secrets": [
+     {
+      "source": "db-password",
+      "target": "/run/secrets/db-password"
+     },
+     {
+      "source": "gemini-api-key",
+      "target": "/run/secrets/gemini-api-key"
+     }
+    ],
+    "security_opt": [
+     "no-new-privileges:true"
+    ],
+    "stop_grace_period": "30s",
+    "tmpfs": [
+     "/tmp:size=16m,mode=1777"
+    ],
+    "user": "${TARORORO_UID:?Use manage.py}:${TARORORO_GID:?Use manage.py}"
+   }
+  },
+  "volumes": {
+   "database": {
+    "name": "tarororo-test_database"
+   }
+  },
+  "x-app": {
+   "build": {
+    "context": "../..",
+    "dockerfile": "deploy/pc-test/Dockerfile"
+   },
+   "cap_drop": [
+    "ALL"
+   ],
+   "image": "tarororo-pc-test:local",
+   "init": true,
+   "logging": {
+    "driver": "local",
+    "options": {
+     "max-file": "3",
+     "max-size": "10m"
+    }
+   },
+   "read_only": true,
+   "security_opt": [
+    "no-new-privileges:true"
+   ],
+   "stop_grace_period": "30s",
+   "tmpfs": [
+    "/tmp:size=16m,mode=1777"
+   ],
+   "user": "${TARORORO_UID:?Use manage.py}:${TARORORO_GID:?Use manage.py}"
+  }
+ }
+}
