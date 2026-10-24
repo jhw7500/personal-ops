@@ -278,8 +278,7 @@ print(json.dumps({"result": result, "state": state}, sort_keys=True))
 
 def _configured_result(*, runtime: Path, controller: dict, launch: dict,
                        projects: dict[str, Path], projects_path: Path,
-                       authority_dir: Path, status: str) -> dict:
-    interpreter = _validated_interpreter(sys.executable)
+                       authority_dir: Path, interpreter: str, status: str) -> dict:
     return {
         "status": status,
         "applied": True,
@@ -369,6 +368,7 @@ def run(argv=None) -> dict:
     if not options.apply:
         return plan
 
+    interpreter = _validated_interpreter(sys.executable)
     for target in (config_root, state_root, library_root):
         _check_ancestor_chain(target)
     config_states = (
@@ -415,7 +415,8 @@ def run(argv=None) -> dict:
         return _configured_result(
             runtime=runtime, controller=controller, launch=launch,
             projects=projects, projects_path=projects_path,
-            authority_dir=authority_dir, status="already_configured",
+            authority_dir=authority_dir, interpreter=interpreter,
+            status="already_configured",
         )
 
     _private_directory(config_root)
@@ -453,7 +454,7 @@ def run(argv=None) -> dict:
     return _configured_result(
         runtime=runtime, controller=controller, launch=launch,
         projects=projects, projects_path=projects_path,
-        authority_dir=authority_dir, status="configured",
+        authority_dir=authority_dir, interpreter=interpreter, status="configured",
     )
 
 

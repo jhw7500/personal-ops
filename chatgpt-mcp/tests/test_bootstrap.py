@@ -205,6 +205,20 @@ class BootstrapTest(unittest.TestCase):
         self.assertFalse(self.state_home.exists())
         self.assertFalse(self.library_root.exists())
 
+    def test_apply_refuses_unsafe_interpreter_before_any_write(self):
+        with patch.object(
+            bootstrap, "_validated_interpreter",
+            side_effect=bootstrap.BootstrapError("UNSAFE_BOOTSTRAP_INTERPRETER"),
+        ) as validate:
+            with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                        "UNSAFE_BOOTSTRAP_INTERPRETER"):
+                self.run_bootstrap(apply=True)
+
+        validate.assert_called_once_with(sys.executable)
+        self.assertFalse(self.config_home.exists())
+        self.assertFalse(self.state_home.exists())
+        self.assertFalse(self.library_root.exists())
+
     def test_apply_refuses_config_root_inside_project_before_any_write(self):
         self.environment["XDG_CONFIG_HOME"] = str(self.personal_ops / "owner-config")
         config_root = Path(self.environment["XDG_CONFIG_HOME"]) / "chatgpt-coding-mcp"
