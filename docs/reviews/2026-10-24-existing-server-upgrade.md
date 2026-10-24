@@ -1,6 +1,6 @@
 # 기존 빌드서버 MCP 전환 검증
 
-상태: 새 ABI 3 runtime 적용 및 서비스 복구 완료. HostAccess v2 전환은 기존 작업 예약 23개의 종료 증거 부재로 보류. 전체 완료로 해석하지 않는다.
+상태: 최종 ABI 3 runtime `54091776c9f6d0676e4c` 적용 완료. HostAccess v2 전환은 기존 작업 예약 23개의 종료 증거 부재로 보류. 전체 완료로 해석하지 않는다.
 
 ## 범위와 보존 조건
 
@@ -52,11 +52,17 @@ runtime이 실제로 실행 중일 때 준비하고, tunnel/admin 중지와 work
 사용한다. 읽기 전용 준비 검사에서 5개를 모두 확인했다. PID가 바뀌어 남은 Codex도
 최종 독립 검사로 검출한다. Codex가 없는 MCP 구성도 지원한다.
 
-- 새 전환 테스트 35개, 관련 authority/HostAccess/activation 테스트 합계 166개 통과.
+- 최종 전환 테스트 39개, 관련 authority/HostAccess/activation 테스트 합계 170개 통과.
 - crash 지점별 재개, 오래된 journal 거부, floor 변경 출처, 서비스·worker·lease·잔존
   프로세스 거부, 실제 daemon 및 npm wrapper 구조를 검증했다.
 - 독립 검토에서 발견한 실행 상태·역할 매칭·복구 증거·최종 journal 기록·새 PID 배출
   문제를 보완했다. 최종 검토 결과는 운영 적용 항목에 기록한다.
+
+최종 독립 검토에서 재개 시 실행 파일 하나만 고정하면 의존 모듈이 다른 릴리스에서
+이전 transaction을 실행할 수 있는 문제를 발견했다. 실행 릴리스 전체 manifest와 ABI를
+검증하고, 전체 digest·경로·ABI가 준비 당시 대상과 일치해야 유지보수에 진입하도록
+보완했다. 구형 단일 파일 pin은 거부한다. 다른 릴리스·의존 파일 변조·구형 pin 거부와
+동일 릴리스 재개를 검증했고, 수정본 재검토는 APPROVE / architectural CLEAR다.
 
 ### 기존 Python에서의 검사 보완
 
@@ -71,11 +77,12 @@ bootstrap 테스트 13개가 의도된 Python 3.11 전제조건에서 중단되�
 
 실제 운영 Python 3.12.12로 공식 `rollout-host-runtime.py --apply` 사전 검사를 실행했다.
 
-- targeted 1,274개, full 1,545개: exit 0. 공식 Yocto fixture 제외 5개를 유지했다.
+- 최종 코드 `8154293057aa56ceec54f1d483d687e40d4e8cf8`에서 targeted 1,274개,
+  full 1,549개: exit 0. 공식 Yocto fixture 제외 5개를 유지했다.
 - 승인 UI·브라우저·JavaScript 7개 단계: 모두 exit 0.
 - 독립 코드 검토: 최초 지적 및 수정 중 발견한 문제 모두 해결, APPROVE.
-- 적용 snapshot: `6b5ac261d15caa480a61` (113 files).
-- 전체 release digest: `6b5ac261d15caa480a612a033404973f14d99e9663eaf266a3e029416474f54d`.
+- 최종 적용 snapshot: `54091776c9f6d0676e4c` (113 files).
+- 전체 release digest: `54091776c9f6d0676e4c476c9a306a31bc6fcf69bf4f864b938f4aafb008e6a7`.
 - controller를 지원되는 설치 명령으로 갱신했고, 기존 generated Python cache는 private 백업으로 이동했다.
 - rollout 결과: 새 runtime·tunnel 정상, `admin_ready`, 관측한 기존 CLI 세션 9개 보존.
 - actual connector: 등록 프로젝트 12개, bounded README 읽기, HostAccess 조회 성공.
@@ -84,8 +91,10 @@ bootstrap 테스트 13개가 의도된 Python 3.11 전제조건에서 중단되�
 - installation ID·policy digest·project mapping·두 원본 service unit·runtime key·admin token
   보존. 터널 프로파일은 MCP 실행 명령 이외의 값이 동일하다. Codex observer PID도 동일하다.
 
-private rollout receipt:
-`/home/jhw/.local/state/chatgpt-coding-mcp/rollouts/rollout-tv1lt65f/receipt.json`.
+최종 private rollout receipt:
+`/home/jhw/.local/state/chatgpt-coding-mcp/rollouts/rollout-c5bpm7w0/receipt.json`.
+첫 적용 snapshot `6b5ac261d15caa480a61`의 1,545개 전체 검사와 서비스 복구 기록은
+`/home/jhw/.local/state/chatgpt-coding-mcp/rollouts/rollout-tv1lt65f/receipt.json`에 있다.
 보존 비교와 전환 기록:
 `/home/jhw/.local/state/chatgpt-coding-mcp/rollouts/existing-upgrade-20261024T094251Z/`.
 이 경로의 자격증명은 출력하거나 Git에 포함하지 않았다.
@@ -108,13 +117,21 @@ host-runtime 8개, host-command 2개. 생성 시각은 2026-10-24 06:00:12–47 
 후 `ActivationMaintenance.finish(original_binding)`를 실행하고 같은 ABI 3 runtime의
 두 서비스만 다시 시작했다. authority/grant 파일 복원이나 수동 초기화는 하지 않았다.
 
-현재 확인 결과:
+첫 적용 복구 직후 확인 결과:
 
 - tunnel active/exited, admin active/running, observer active/running.
 - Workspace epoch 19, 최소 ABI 2. HostAccess v2는 활성화되지 않았다.
 - `pim-check` 실제 HostAccess 조회는 `NO_GRANT`다. 새 grant는 발급하지 않았다.
 - 서비스 복구 후 실제 connector README 읽기 및 refresh 알림 호출 성공.
 - 예전 준비 transaction은 원래 프로세스를 가리키므로 그대로 재사용하지 않는다.
+
+그 후 전체 릴리스 고정 보완본을 공식 검사한 뒤 같은 rollout 경로로 적용했다.
+최종 상태는 epoch 22 / 최소 ABI 2이며, HostAccess v2는 여전히 비활성이다.
+새 runtime의 tunnel/admin 정상 동작과 기존 CLI 세션 9개 보존을 다시 확인했다.
+실제 connector의 12개 프로젝트 조회·bounded README 읽기·`NO_GRANT` 조회·refresh
+알림을 검증했다. 예약 23개의 ID·kind·inode·mtime 등 정체성도 모두 동일하다.
+기존 blocker가 해소되지 않았으므로 최종 runtime에서는 전환을 재시도하지 않았다.
+상세 보존 비교는 private `final-operational-evidence.json`에 기록했다.
 
 ## 남은 단계와 재개 조건
 
@@ -126,7 +143,8 @@ host-runtime 8개, host-command 2개. 생성 시각은 2026-10-24 06:00:12–47 
 
 종료 증거 확보 후에는 private `operational-evidence.json`에 고정한 정확한 ID·kind와
 파일 정체성을 대조하고, `complete_host_operation`으로 확인된 예약만 종료 처리한다.
-그다음 설치된 owner CLI로 새 transaction을 준비하고, 두 서비스 중지 → apply → 재시작 →
+최종 릴리스는 구형 단일 파일 pin transaction도 거부하므로 이전 준비 결과를 재사용하지
+않는다. 설치된 owner CLI로 새 transaction을 준비하고, 두 서비스 중지 → apply → 재시작 →
 실제 connector 검증을 수행한다. floor 3 및 빈 HostAccess v2 상태까지 확인한 뒤에만
 전환 완료로 기록한다. 실제 장기 권한은 이후 웹에서 사용자가 최초 승인한다.
 

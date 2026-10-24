@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Task 1 검증 완료. Task 2 runtime 적용 완료, v2 전환은 기존 예약 23개의 종료 증거 부재로 보류. 서비스는 새 runtime으로 복구했다.
+**Status:** Task 1 최종 수정·재검토 및 full 1,549개 검증 완료. Task 2 최종 runtime `54091776c9f6d0676e4c` 적용 완료, epoch 22 / floor 2. v2 전환은 기존 예약 23개의 종료 증거 부재로 보류.
 
 **Goal:** 기존 빌드서버의 프로젝트와 정책을 보존하며 설치 단위 HostAccess v2를 사용할 수 있게 한다.
 
@@ -40,6 +40,7 @@
 
 - [x] 전환·거부·중단 재개 테스트를 먼저 작성하고 실패를 확인한다.
 - [x] journal에 target manifest/config/controller pin, 원래/최종 binding, 원래 marker/state 부재 및 전환 intent를 고정한다.
+- [x] 실행 릴리스 전체 manifest·ABI를 검증하고 준비 대상과 대조한다. 다른 릴리스 및 구형 단일 파일 pin은 유지보수 진입 전에 거부한다.
 - [x] rollout lock → maintenance → 새로운 drain 관측 → authority state 먼저 저장 → floor 3 저장 → 빈 v2 초기화 → 검증 → maintenance 해제 순서를 구현한다.
 - [x] 각 durable 쓰기 직후 crash, 반복 resume, tampered inputs, active workers/leases, old ABI rollback 거부를 테스트한다.
 - [x] immutable installer에 명령을 포함하고 기존 ABI 2 필수 파일 목록은 유지한다.
@@ -57,7 +58,7 @@
 - [x] 작업/lease 부재를 다시 확인하고 정확히 MCP tunnel/admin 서비스만 중지한다.
 - [ ] owner upgrade를 적용하고 동일 릴리스로 재시작한다. 실패 시 journal에 따라 재개한다.
 - [ ] 실제 connector의 catalog, 정책 읽기, 12개 프로젝트 HostAccess v2/no-grant 일치, 기존 credential/config digest 보존을 검증한다.
-- [ ] 변경 코드·문서와 검증 결과를 feature branch에 기록한다. main/PR merge는 수행하지 않는다.
+- [x] 변경 코드·문서와 검증 결과를 feature branch에 기록한다. main/PR merge는 수행하지 않는다.
 - [ ] 최종 응답에 적용 버전, 검증 결과, 웹에서 필요한 최초 승인 및 실제 사용자 채팅 검증 한계를 밝힌다.
 
 전환 보류와 안전한 서비스 복구, 정확한 재개 조건은 `docs/reviews/2026-10-24-existing-server-upgrade.md`에 기록했다.
