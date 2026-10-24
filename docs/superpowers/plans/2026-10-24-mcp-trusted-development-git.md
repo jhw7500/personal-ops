@@ -92,7 +92,9 @@ Task 2 evidence note: initial Node/browser RED output was not retained; Python R
 - [x] **Step 4: Validate focused GREEN, full MCP suite, UI/static checks, secret scan and a fresh local Git clone.** Verify the clean clone imports/discovers the complete MCP and install inventory, and default setup uses no original checkout path. Record actual Linux validation separately from unrun Windows/live ChatGPT checks.
 - [ ] **Step 5: Commit using jhw-commit v1, run independent whole-branch review, fix material findings, then push only `feat/mcp-trusted-development-wsl` to origin.** Confirm remote commit and provide exact `git clone --branch` and setup commands. Existing issue #66 is a related source-versioning reference; no automatic closure.
 
-Task 4 evidence note: committed clean clone `e37848a` used the private Python 3.11.14
-Serena environment and passed 1,498 tests (skip 1, excluded Yocto fixtures 5). The
-historical host path and Python 3.12 runs are not the new clone compatibility contract.
-Windows/WSL hardware, native drivers and live ChatGPT/tunnel checks remain unrun.
+Task 4 evidence note: review fix preserved the venv executable and repaired isolated
+runtime sibling imports after admission, while rejecting project-overlapping owner paths
+before mutation. Committed clean clone `a7cc4b4` used the private Python 3.11.14 Serena
+environment and passed 1,501 tests (skip 1, excluded Yocto fixtures 5). The historical
+host path and Python 3.12 runs are not the new clone compatibility contract. Windows/WSL
+hardware, native drivers and live ChatGPT/tunnel checks remain unrun.
