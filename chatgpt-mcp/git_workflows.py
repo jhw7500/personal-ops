@@ -32,11 +32,8 @@ from workspace_paths import WorkspaceError
 
 GIT = "/usr/bin/git"
 GH = "/usr/bin/gh"
-AUTOMATION_REPO = Path("/home/jhw/ai/opencode/projects/automation")
-CHANGE_EVIDENCE_VALIDATOR = AUTOMATION_REPO / "scripts/validate_change_evidence.py"
+CHANGE_EVIDENCE_VALIDATOR = Path(__file__).with_name("validate_change_evidence.py")
 CHANGE_EVIDENCE_VALIDATOR_BLOB = "4c07bbd2d36da0e626e8ac8d82ef8336f0272f5f"
-JHW_PR_SKILL = Path("/home/jhw/.codex/skills/jhw-pr/SKILL.md")
-PRE_PR_TRIBUNAL_SKILL = Path("/home/jhw/.codex/skills/pre-pr-tribunal/SKILL.md")
 MAX_CAPTURE = 512 * 1024
 MAX_OPERATIONS = 1000
 MAX_TEXT_BYTES = 64 * 1024
@@ -53,6 +50,16 @@ PR_URL_RE = re.compile(
     r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$"
 )
 BRANCH_RE = re.compile(r"^(?![./])(?!.*(?:\.\.|//|@\{|\\|[ ~^:?*\[]))(?!.*[/.]$)[A-Za-z0-9._/-]+$")
+
+
+def _native_workflow_skills() -> tuple[dict[str, Path], list[str]]:
+    skills = {
+        "jhw-pr": Path.home() / ".codex/skills/jhw-pr/SKILL.md",
+        "pre-pr-tribunal": Path.home() / ".codex/skills/pre-pr-tribunal/SKILL.md",
+    }
+    missing = [name for name, path in skills.items()
+               if not path.is_file() or path.is_symlink()]
+    return skills, missing
 
 
 def _tool(name: str, title: str, description: str, properties: dict, required=(), *, read_only=False):
@@ -981,6 +988,7 @@ class GitWorkflows:
 
     def _prepare_native_handoff(self, project: str, root: Path, action: str, args: dict) -> dict:
         snapshot = self._snapshot(root)
+        skills, missing_prerequisites = _native_workflow_skills()
         artifact = None
         details: dict[str, object] = {}
         operation_id = secrets.token_hex(16)
@@ -1009,9 +1017,15 @@ class GitWorkflows:
             "preview": display, **details,
             "handoff": {
                 "code": "NATIVE_WORKFLOW_REQUIRED",
-                "jhw_pr_skill": str(JHW_PR_SKILL),
-                "pre_pr_tribunal_skill": str(PRE_PR_TRIBUNAL_SKILL),
-                "reason": "This MCP cannot prove or execute the required native review workflow.",
+                "jhw_pr_skill": str(skills["jhw-pr"]),
+                "pre_pr_tribunal_skill": str(skills["pre-pr-tribunal"]),
+                "missing_prerequisites": missing_prerequisites,
+                "reason": (
+                    "Install the listed current-user workflow prerequisites explicitly "
+                    "before continuing; this MCP does not download skills or create PRs."
+                    if missing_prerequisites else
+                    "This MCP cannot prove or execute the required native review workflow."
+                ),
             },
         }
         plan = {

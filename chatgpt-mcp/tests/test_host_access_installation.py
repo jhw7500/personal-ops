@@ -141,6 +141,31 @@ class HostAccessInstallationTests(unittest.TestCase):
         self.assertEqual(allowed["version"], 2)
         self.assertEqual(allowed["grant_state_revision"], 2)
 
+    def test_status_shows_only_selected_project_requests_but_grant_remains_global(self):
+        self.enable()
+        alpha_request = self.access.request("alpha")
+        beta_request = self.access.request("beta")
+
+        alpha_status = self.access.get("alpha")
+        beta_status = self.access.get("beta")
+
+        self.assertEqual(
+            [request["request_id"] for request in alpha_status["requests"]],
+            [alpha_request["request_id"]],
+        )
+        self.assertEqual(
+            [request["request_id"] for request in beta_status["requests"]],
+            [beta_request["request_id"]],
+        )
+        grant = self.access.approve_web(
+            "alpha", request_id=alpha_request["request_id"], lifetime="timed",
+            duration_seconds=60, allow_codex=False, confirmation="alpha",
+        )
+        self.assertEqual(
+            self.access.require("beta", grant_id=grant["grant_id"])["grant_id"],
+            grant["grant_id"],
+        )
+
     def test_grant_survives_restart_boot_runtime_and_policy_epoch_changes(self):
         self.enable()
         grant = self.approve("alpha", allow_codex=True)
@@ -440,7 +465,8 @@ class HostAccessInstallationTests(unittest.TestCase):
         self.assertEqual(durable_card["state"], "pending")
         self.assertEqual(durable_card["lifetime"], "until_revoked")
         self.assertIsNone(durable_card["duration_seconds"])
-        self.assertEqual(len(self.access.get("alpha")["requests"]), 1)
+        self.assertEqual(self.access.get("alpha")["requests"], [])
+        self.assertEqual(len(self.access.get("beta")["requests"]), 1)
 
     def test_revoke_invalidates_pending_card_update_and_confirmation(self):
         self.enable()

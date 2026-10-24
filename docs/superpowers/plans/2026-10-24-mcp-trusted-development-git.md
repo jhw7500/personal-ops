@@ -98,3 +98,10 @@ before mutation. Committed clean clone `a7cc4b4` used the private Python 3.11.14
 environment and passed 1,501 tests (skip 1, excluded Yocto fixtures 5). The historical
 host path and Python 3.12 runs are not the new clone compatibility contract. Windows/WSL
 hardware, native drivers and live ChatGPT/tunnel checks remain unrun.
+
+Final whole-branch review fix note: all four Important findings have focused regressions
+and implementation fixes. Pending requests are project-filtered without narrowing the
+installation grant; the pinned validator is part of the immutable ABI 3 inventory;
+ordinary-command WSL readiness prerequisites are explicit; and invalid root layouts are
+rejected before owner writes. The task-2 scratch report is no longer tracked. Step 5 stays
+open until the root lane completes the fresh clean-clone suite and feature-branch push.

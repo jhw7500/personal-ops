@@ -243,6 +243,40 @@ class BootstrapTest(unittest.TestCase):
         self.assertFalse(state_root.exists())
         self.assertFalse(self.library_root.exists())
 
+    def assert_project_layout_refused_without_owner_writes(self, projects):
+        arguments = ["--source", str(MODULE_DIR)]
+        for name, path in projects:
+            arguments.extend(("--project", f"{name}={path}"))
+        arguments.append("--apply")
+
+        with patch.dict(os.environ, self.environment, clear=False):
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "INVALID_PROJECT_LAYOUT"):
+                bootstrap.run(arguments)
+
+        self.assertFalse(self.config_home.exists())
+        self.assertFalse(self.state_home.exists())
+        self.assertFalse(self.library_root.exists())
+
+    def test_project_equal_to_base_is_refused_before_any_write(self):
+        self.assert_project_layout_refused_without_owner_writes([
+            ("personal-ops", self.projects_root),
+            ("pim-check", self.pim_check),
+        ])
+
+    def test_duplicate_project_root_is_refused_before_any_write(self):
+        self.assert_project_layout_refused_without_owner_writes([
+            ("personal-ops", self.personal_ops),
+            ("pim-check", self.personal_ops),
+        ])
+
+    def test_nested_project_roots_are_refused_before_any_write(self):
+        nested = self.personal_ops / "nested"
+        nested.mkdir()
+        self.assert_project_layout_refused_without_owner_writes([
+            ("personal-ops", self.personal_ops),
+            ("pim-check", nested),
+        ])
+
     def test_server_default_config_honors_xdg_config_home(self):
         environment = dict(os.environ, **self.environment, PYTHONPATH=str(MODULE_DIR))
         completed = subprocess.run(
@@ -259,6 +293,7 @@ class BootstrapTest(unittest.TestCase):
         self.assertIn("bootstrap.py", installer.FILES)
         self.assertTrue(ABI3_MANDATORY_RELEASE_FILES <= set(installer.FILES))
         self.assertTrue(ABI3_MANDATORY_RELEASE_FILES.isdisjoint(MANDATORY_RELEASE_FILES))
+        self.assertIn("validate_change_evidence.py", ABI3_MANDATORY_RELEASE_FILES)
 
 
 if __name__ == "__main__":

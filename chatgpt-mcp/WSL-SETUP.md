@@ -4,6 +4,46 @@ This procedure creates a new MCP installation for one WSL Linux user. It does
 not copy another machine's runtime, keys, Workspace authority, or host grants.
 Work under the Linux home filesystem rather than `/mnt/c`.
 
+## 0. Verify ordinary-command prerequisites
+
+Configuration alone does not prove that ordinary host commands can run. Before
+the first command, verify WSL 2 with WSL version 0.67.6 or newer, a functioning
+systemd user manager for the intended Linux user, and a C toolchain that can
+link the small static native launcher. These checks are read-only:
+
+```bash
+# Run the first two commands from Windows PowerShell.
+wsl.exe --version
+wsl.exe --list --verbose
+
+# Run the remaining commands as the intended WSL Linux user.
+cat /proc/1/comm
+test -x /usr/bin/systemd-run
+systemctl --user --no-pager status
+test -x /usr/bin/cc
+dpkg-query -W build-essential gcc libc6-dev
+cat /sys/fs/cgroup/cgroup.controllers
+```
+
+PID 1 being systemd and the presence of cgroup v2 do not by themselves prove
+that the user's manager is reachable or that application delegation works.
+Do not use `systemd-run` as a readiness probe because it creates a unit.
+
+On Ubuntu 24.04 and Debian 13, `build-essential` pulls in GCC and development
+tools, while `libc6-dev` supplies the static C library and startup objects used
+by the launcher build. Install missing packages separately using the chosen
+distribution's package procedure. Enabling systemd requires merging
+`[boot] systemd=true` into `/etc/wsl.conf` and restarting WSL. Be aware that
+`wsl.exe --shutdown` stops all distributions and the WSL 2 VM, so schedule it
+around other work. This repository does not perform either host-changing step.
+
+References: [Microsoft WSL systemd](https://learn.microsoft.com/windows/wsl/systemd/),
+[systemctl](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html),
+[systemd-run](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html),
+[Ubuntu build-essential](https://packages.ubuntu.com/noble/build-essential),
+[Debian libc6-dev file list](https://packages.debian.org/trixie/amd64/libc6-dev/filelist),
+and [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html).
+
 ## 1. Clone both repositories
 
 Install Git, CA certificates, and `uv` using their official instructions, then
@@ -91,6 +131,15 @@ An optional Codex profile can be configured later with the installed
 `configure-agent-profile.py` after you decide its account and delegation
 scope. Bootstrap does not call Codex or create external credentials.
 
+GitHub CLI, its authentication, and the current user's `jhw-pr` and
+`pre-pr-tribunal` skills are optional prerequisites for later PR workflows.
+The runtime reports them explicitly when absent; it does not download skills,
+authenticate GitHub, or create a PR. See the
+[GitHub CLI Linux installation guide](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian)
+and [GitHub CLI authentication guide](https://docs.github.com/en/github-cli/github-cli/authenticating-with-github-cli).
+When supported by the installed version, `gh auth status --no-refresh` avoids
+refreshing expiring tokens during a readiness check; never use `--show-token`.
+
 ## 5. Connect a distinct tunnel after local verification
 
 Choose a PC-specific alias such as `personal-ops-coding-wsl-pc1`. Create a new
@@ -102,8 +151,10 @@ command to `tunnel-client runtimes connect`, then inspect:
 tunnel-client runtimes status personal-ops-coding-wsl-pc1 --json
 ```
 
-Only environment-local completion is covered here: private files, complete
-manifest, ABI 3 admission, and an empty installation grant state. Windows
+Bootstrap output covers only configuration state: private files, complete
+manifest, ABI 3 admission, and an empty installation grant state. It does not
+claim that systemd, the compiler/static link path, or command execution was
+verified on the target. Windows
 native drivers, WSL restart persistence, the live tunnel, ChatGPT discovery,
 browser approval behavior, and real `pim-check` or target-board tests require
 separate checks on the intended PC.

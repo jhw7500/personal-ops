@@ -58,6 +58,7 @@ MANDATORY_RELEASE_FILES = frozenset({
 })
 ABI3_MANDATORY_RELEASE_FILES = frozenset({
     "host_access.py", "host_access_installation.py",
+    "validate_change_evidence.py",
 })
 ENFORCEMENT_ABI = 3
 HOST_ACCESS_CAPABILITY_GENERATION = 1

@@ -806,7 +806,8 @@ class HostAccess:
                 "lifetime": request["lifetime"],
                 "grant_state_revision": request["grant_state_revision"],
             } for request in state["requests"].values()
-                if _timestamp(request["expires_at"]) > now]
+                if (request["project"] == project
+                    and _timestamp(request["expires_at"]) > now)]
             base = {
                 "version": 2,
                 "project": project,

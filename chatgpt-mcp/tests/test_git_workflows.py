@@ -158,6 +158,30 @@ class GitWorkflowTest(unittest.TestCase):
         message_path.write_text(self.message(), encoding="utf-8")
         _default_message_validator(message_path)
 
+    def test_vendored_commit_validator_is_original_checkout_independent(self):
+        message_path = self.base / "portable-message.md"
+        message_path.write_text(self.message(), encoding="utf-8")
+
+        self.assertEqual(
+            git_workflows.CHANGE_EVIDENCE_VALIDATOR,
+            MODULE_DIR / "validate_change_evidence.py",
+        )
+        _default_message_validator(message_path)
+
+    def test_missing_or_tampered_vendored_validator_is_refused(self):
+        message_path = self.base / "message.md"
+        message_path.write_text(self.message(), encoding="utf-8")
+        missing = self.base / "missing-validator.py"
+        with mock.patch.object(git_workflows, "CHANGE_EVIDENCE_VALIDATOR", missing):
+            with self.assertRaisesRegex(ValueError, "unavailable or unsafe"):
+                _default_message_validator(message_path)
+
+        tampered = self.base / "tampered-validator.py"
+        tampered.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        with mock.patch.object(git_workflows, "CHANGE_EVIDENCE_VALIDATOR", tampered):
+            with self.assertRaisesRegex(ValueError, "changed"):
+                _default_message_validator(message_path)
+
     def test_subprocess_capture_and_runtime_are_bounded(self):
         with self.assertRaisesRegex(ValueError, "512 KiB"):
             _run([sys.executable, "-c", "import sys; sys.stdout.write('x' * 600000)"])
@@ -401,6 +425,22 @@ class GitWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(merge["status"], "waiting_native_workflow")
         self.assertIn("https://github.com/jhw7500/personal-ops/pull/2", self.checked_references)
+
+    def test_native_handoff_reports_missing_current_user_workflow_skills(self):
+        missing_home = self.base / "fresh-home"
+        missing_home.mkdir()
+        with mock.patch.object(Path, "home", return_value=missing_home):
+            pr = self.workflows.prepare({
+                "project": "repo", "action": "pr", "title": "Test PR",
+                "body": "PR body\n", "base": "main",
+            })
+
+        self.assertEqual(pr["code"], "NATIVE_WORKFLOW_REQUIRED")
+        self.assertEqual(
+            pr["handoff"]["missing_prerequisites"],
+            ["jhw-pr", "pre-pr-tribunal"],
+        )
+        self.assertIn(str(missing_home), pr["handoff"]["jhw_pr_skill"])
 
     def test_state_is_outside_projects_and_owner_only(self):
         with self.assertRaisesRegex(ValueError, "outside"):

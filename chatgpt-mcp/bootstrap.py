@@ -183,8 +183,14 @@ def _parse_projects(values: list[str], source: Path, home: Path) -> dict[str, Pa
     if "personal-ops" not in projects or "pim-check" not in projects:
         raise BootstrapError("REQUIRED_PROJECT_MISSING")
     projects_root = home / "projects"
+    if any(path == projects_root for path in projects.values()):
+        raise BootstrapError("INVALID_PROJECT_LAYOUT")
     if any(not path.is_relative_to(projects_root) for path in projects.values()):
         raise BootstrapError("PROJECT_OUTSIDE_HOME_PROJECTS")
+    roots = list(projects.values())
+    if any(left == right or left.is_relative_to(right) or right.is_relative_to(left)
+           for index, left in enumerate(roots) for right in roots[index + 1:]):
+        raise BootstrapError("INVALID_PROJECT_LAYOUT")
     return projects
 
 
