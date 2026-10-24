@@ -46,6 +46,7 @@ FILES = ("server.py", "bootstrap.py", "catalog_refresh.py", "serena_backend.py",
          "workspace_paths.py", "workspace_policy.py", "workspace_authority.py",
          "workspace_activation.py", "workspace_activation_cli.py",
          "workspace_activation_host.py", "workspace_activation_legacy.py",
+         "workspace_upgrade.py",
          "rollout_admin.py", "rollout_tunnel.py", "rollout_diagnostics.py",
          "workspace_files.py", "workspace_jobs.py", "workspace_tools.py", "workspace_host.py",
          "workspace_control.py", "workspace-launcher.py", "workspace-access-approval.html")

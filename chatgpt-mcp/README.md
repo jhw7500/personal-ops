@@ -1335,6 +1335,28 @@ worker·lease가 모두 없는 경우에만 새 boot의 관측값을 journal에 
 실제 MCP 연결의 정책 동작과 기존 산출물 조회(T14)는 서비스 시작 뒤 별도 smoke로
 확인하며, 프로세스 실행만으로 이 검증까지 완료됐다고 보고하지 않는다.
 
+ABI 2로 이미 활성화된 설치는 먼저 일반 rollout으로 같은 설치에 admission된 ABI 3
+release를 floor 2에서 실행·검증한 뒤, 그 설치된 release의 `workspace_upgrade.py`를
+사용한다. 이 명령은 서비스를 중지하거나 시작하거나 unit wiring을 바꾸지 않는다.
+
+```bash
+python -B workspace_upgrade.py prepare \
+  --transaction-id <32자 hex> --target-release <현재 설치 release 절대 경로>
+# 별도 owner 절차로 personal-ops-tunnel/admin 두 서비스를 중지한다.
+python -B workspace_upgrade.py apply --transaction-id <같은 ID>
+# 중단됐다면 같은 release, ID, 설정에서만 재개한다.
+python -B workspace_upgrade.py resume --transaction-id <같은 ID>
+python -B workspace_upgrade.py status --transaction-id <같은 ID>
+```
+
+`apply`/`resume`은 rollout lock과 activation maintenance를 유지한 채 두 서비스와
+실제 tunnel/MCP/admin 프로세스, 여섯 worker 종류, lease가 모두 비었는지 새로
+확인한다. 기존 installation ID와 policy digest를 보존하고 epoch를 정확히 한 번
+증가시키며, 허용 release를 해당 ABI 3 하나로 제한한 뒤 ABI floor를 3으로 올린다.
+HostAccess v2는 revision 1, 요청 없음, grant 없음으로 시작한다. 웹 승인 전에는 host
+권한이 발급되지 않는다. Journal은
+`$XDG_STATE_HOME/chatgpt-coding-mcp/workspace-upgrade`에 별도로 보관한다.
+
 ## 검증
 
 ```bash

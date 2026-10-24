@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -64,8 +65,26 @@ class BootstrapTest(unittest.TestCase):
         arguments = [*self.arguments]
         if apply:
             arguments.append("--apply")
-        with patch.dict(os.environ, self.environment, clear=False):
+        # These cases exercise configuration/filesystem behavior after the
+        # supported-version precondition. Keep the real executable and test
+        # version rejection separately, including on existing Python 3.12 hosts.
+        runtime = SimpleNamespace(version_info=(3, 11), executable=sys.executable)
+        with patch.dict(os.environ, self.environment, clear=False), \
+                patch.object(bootstrap, "sys", runtime):
             return bootstrap.run(arguments)
+
+    def test_unsupported_python_is_refused_before_owner_writes(self):
+        for version in ((3, 10), (3, 12), (3, 13)):
+            with self.subTest(version=version):
+                runtime = SimpleNamespace(version_info=version, executable=sys.executable)
+                with patch.dict(os.environ, self.environment, clear=False), \
+                        patch.object(bootstrap, "sys", runtime):
+                    with self.assertRaisesRegex(
+                            bootstrap.BootstrapError, "PYTHON_3_11_REQUIRED"):
+                        bootstrap.run([*self.arguments, "--apply"])
+                self.assertFalse(self.config_home.exists())
+                self.assertFalse(self.state_home.exists())
+                self.assertFalse(self.library_root.exists())
 
     def test_default_plan_validates_inputs_without_writing_owner_paths(self):
         result = self.run_bootstrap()
@@ -249,7 +268,9 @@ class BootstrapTest(unittest.TestCase):
             arguments.extend(("--project", f"{name}={path}"))
         arguments.append("--apply")
 
-        with patch.dict(os.environ, self.environment, clear=False):
+        runtime = SimpleNamespace(version_info=(3, 11), executable=sys.executable)
+        with patch.dict(os.environ, self.environment, clear=False), \
+                patch.object(bootstrap, "sys", runtime):
             with self.assertRaisesRegex(bootstrap.BootstrapError, "INVALID_PROJECT_LAYOUT"):
                 bootstrap.run(arguments)
 
