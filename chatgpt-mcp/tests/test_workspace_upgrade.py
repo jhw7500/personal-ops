@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -15,16 +16,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from host_access import HostAccess  # noqa: E402
 from workspace_tools import WorkspaceTools  # noqa: E402
 from workspace_host import host_operation_lane  # noqa: E402
-from workspace_control import activation_paths  # noqa: E402
+from workspace_control import MANDATORY_RELEASE_FILES, activation_paths  # noqa: E402
 from workspace_upgrade import (  # noqa: E402
     ExistingUpgradeHost, UpgradeCoordinator, UpgradeError,
+    _verify_installed_self,
 )
 from tests.test_workspace_activation_host import HostFixture  # noqa: E402
 
 
 TARGET = "2" * 64
-SOURCE = "3" * 64
 TX = "4" * 32
+
+
+def _installed_release(root, *, dependency):
+    releases = (root / ".local/lib/chatgpt-coding-mcp/releases")
+    releases.mkdir(parents=True, mode=0o700)
+    contents = {}
+    for name in MANDATORY_RELEASE_FILES | {"workspace_upgrade.py"}:
+        if name == "workspace_upgrade.py":
+            payload = Path(__file__).resolve().parents[1].joinpath(name).read_bytes()
+        elif name == "workspace_control.py":
+            payload = b"ENFORCEMENT_ABI = 3\n"
+        elif name == "server.py":
+            payload = dependency
+        else:
+            payload = (name + "\n").encode()
+        contents[name] = payload
+    manifest = {name: hashlib.sha256(payload).hexdigest()
+                for name, payload in contents.items()}
+    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    release = releases / digest[:20]
+    release.mkdir(mode=0o700)
+    for name, payload in contents.items():
+        path = release / name
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path.write_bytes(payload)
+        path.chmod(0o600)
+    manifest_path = release / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+    manifest_path.chmod(0o600)
+    return release, digest
 
 
 class FakeHost:
@@ -95,7 +126,11 @@ class WorkspaceUpgradeTests(unittest.TestCase):
             self.projects, authority=self.authority, host_access=self.access,
             host=self.host, journal_dir=self.journal_dir,
             rollout_lock=lambda: _NullContext(), workspace=self.workspace,
-            source_digest=SOURCE,
+            source_identity={
+                "release_digest": TARGET,
+                "release_abi": 3,
+                "runtime": str(self.root / "release"),
+            },
         )
 
     def tearDown(self):
@@ -207,6 +242,47 @@ class WorkspaceUpgradeTests(unittest.TestCase):
         self.authority.advance(self.policy_digest, {TARGET: 3})
         self.authority.advance(self.policy_digest, {TARGET: 3})
         self.assert_upgrade_error("UPGRADE_BINDING_CHANGED", lambda: self.coordinator.apply(TX))
+
+    def test_apply_rejects_legacy_single_file_source_pin(self):
+        self.prepare()
+        path = self.journal_dir / (TX + ".json")
+        legacy = json.loads(path.read_text())
+        legacy["plan"].pop("source", None)
+        path.write_text(json.dumps(legacy, sort_keys=True, separators=(",", ":")))
+        path.chmod(0o600)
+        seal = self.coordinator.journal._plan_seal(
+            TX, legacy["source_digest"], legacy["plan"])
+        seal_path = self.journal_dir / (TX + ".plan.json")
+        seal_path.write_text(json.dumps(seal, sort_keys=True, separators=(",", ":")))
+        seal_path.chmod(0o600)
+
+        self.assert_upgrade_error(
+            "UPGRADE_SOURCE_CHANGED", lambda: self.coordinator.apply(TX))
+
+    def test_apply_rejects_execution_from_a_different_release(self):
+        first, _ = _installed_release(
+            self.root / "first", dependency=b"dependency-a\n")
+        second, _ = _installed_release(
+            self.root / "second", dependency=b"dependency-b\n")
+        first_identity = _verify_installed_self(first)
+        second_identity = _verify_installed_self(second)
+        self.authority.advance(
+            self.policy_digest, {first_identity["release_digest"]: 3})
+        first_coordinator = UpgradeCoordinator(
+            self.projects, authority=self.authority, host_access=self.access,
+            host=self.host, journal_dir=self.journal_dir,
+            rollout_lock=lambda: _NullContext(), workspace=self.workspace,
+            source_identity=first_identity,
+        )
+        first_coordinator.prepare(TX, target=first_identity)
+        other = UpgradeCoordinator(
+            self.projects, authority=self.authority, host_access=self.access,
+            host=self.host, journal_dir=self.journal_dir,
+            rollout_lock=lambda: _NullContext(), workspace=self.workspace,
+            source_identity=second_identity,
+        )
+
+        self.assert_upgrade_error("UPGRADE_SOURCE_CHANGED", lambda: other.apply(TX))
 
     def test_same_binding_with_changed_authority_state_rejects_stale_preparation(self):
         self.prepare()
@@ -373,6 +449,39 @@ class WorkspaceUpgradeTests(unittest.TestCase):
         completed = self.coordinator.journal.read(TX)
         self.assertEqual(completed["phase"], "complete")
         self.assertEqual(completed["evidence"], {"result": result})
+
+
+class InstalledReleaseIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def test_full_release_digest_distinguishes_equal_entrypoints(self):
+        first, first_digest = _installed_release(
+            self.root / "first", dependency=b"dependency-a\n")
+        second, second_digest = _installed_release(
+            self.root / "second", dependency=b"dependency-b\n")
+
+        first_identity = _verify_installed_self(first)
+        second_identity = _verify_installed_self(second)
+
+        self.assertNotEqual(first_digest, second_digest)
+        self.assertEqual(first_identity["release_digest"], first_digest)
+        self.assertEqual(second_identity["release_digest"], second_digest)
+        self.assertEqual(first_identity["runtime"], str(first))
+        self.assertEqual(second_identity["runtime"], str(second))
+
+    def test_installed_identity_rejects_dependency_tampering(self):
+        release, _ = _installed_release(
+            self.root, dependency=b"original dependency\n")
+        _verify_installed_self(release)
+        (release / "server.py").write_bytes(b"tampered dependency\n")
+
+        with self.assertRaises(UpgradeError) as caught:
+            _verify_installed_self(release)
+
+        self.assertEqual(caught.exception.code, "UPGRADE_SOURCE_UNADMITTED")
 
 
 class ExistingUpgradeHostTests(unittest.TestCase):

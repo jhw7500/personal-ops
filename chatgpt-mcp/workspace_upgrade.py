@@ -539,7 +539,7 @@ class UpgradeCoordinator:
 
     def __init__(self, projects, *, authority, host_access, host, journal_dir,
                  rollout_lock, workspace=None, source_digest=None,
-                 target_verify=None):
+                 source_identity=None, target_verify=None):
         self.projects = {name: Path(root).absolute() for name, root in projects.items()}
         self.authority = authority
         self.host_access = host_access
@@ -547,8 +547,21 @@ class UpgradeCoordinator:
         self.workspace = workspace
         self.journal = ActivationJournal(journal_dir, self.projects)
         self.rollout_lock = rollout_lock
-        self.source_digest = source_digest or hashlib.sha256(
-            Path(__file__).read_bytes()).hexdigest()
+        if source_identity is not None:
+            if (not isinstance(source_identity, dict)
+                    or set(source_identity) != {
+                        "release_digest", "release_abi", "runtime"}
+                    or not isinstance(source_identity.get("release_digest"), str)
+                    or _DIGEST.fullmatch(source_identity["release_digest"]) is None
+                    or source_identity.get("release_abi") != 3
+                    or not isinstance(source_identity.get("runtime"), str)):
+                _fail("UPGRADE_SOURCE_UNADMITTED")
+            self.source_identity = dict(source_identity)
+            self.source_digest = source_identity["release_digest"]
+        else:
+            self.source_identity = None
+            self.source_digest = source_digest or hashlib.sha256(
+                Path(__file__).read_bytes()).hexdigest()
         self.target_verify = target_verify
         self.crash_after = None
 
@@ -600,6 +613,10 @@ class UpgradeCoordinator:
             _fail("UPGRADE_BINDING_CHANGED")
         if authority["allowed_releases"].get(target["release_digest"]) != 3:
             _fail("UPGRADE_TARGET_UNADMITTED")
+        if (self.source_digest != target["release_digest"]
+                or (self.source_identity is not None
+                    and self.source_identity != target)):
+            _fail("UPGRADE_INSTALLED_RUNTIME_REQUIRED")
         if self._minimum_abi() != 2:
             _fail("UPGRADE_ABI_FLOOR_REQUIRED")
         initial_access = self._initial_access()
@@ -624,6 +641,7 @@ class UpgradeCoordinator:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         plan = {
+            "source": dict(target),
             "target": dict(target),
             "original_binding": authority["binding"],
             "final_binding": final_binding,
@@ -635,6 +653,21 @@ class UpgradeCoordinator:
             "v2_state": v2_state,
         }
         return self.journal.create(transaction_id, self.source_digest, plan)
+
+    def _validate_execution_identity(self, state):
+        plan = state.get("plan")
+        if not isinstance(plan, dict):
+            _fail("UPGRADE_SOURCE_CHANGED")
+        source = plan.get("source")
+        target = plan.get("target")
+        if (not isinstance(source, dict)
+                or set(source) != {"release_digest", "release_abi", "runtime"}
+                or source != target
+                or source.get("release_digest") != self.source_digest
+                or state.get("source_digest") != source.get("release_digest")
+                or (self.source_identity is not None
+                    and source != self.source_identity)):
+            _fail("UPGRADE_SOURCE_CHANGED")
 
     @staticmethod
     def _same_binding(actual, first, second):
@@ -648,6 +681,7 @@ class UpgradeCoordinator:
             _fail("UPGRADE_JOURNAL_INVALID", exc)
 
     def _validate_plan(self, state):
+        self._validate_execution_identity(state)
         plan = state["plan"]
         if self.target_verify is not None:
             observed = self.target_verify(plan["target"]["runtime"])
@@ -808,11 +842,11 @@ class UpgradeCoordinator:
 
     def apply(self, transaction_id):
         observed = self.journal.read(transaction_id)
-        if observed["source_digest"] != self.source_digest:
-            _fail("UPGRADE_SOURCE_CHANGED")
+        self._validate_execution_identity(observed)
         try:
             with self.rollout_lock(), self.journal.locked(
                     transaction_id, self.source_digest) as current:
+                self._validate_execution_identity(current.state)
                 plan = current.state["plan"]
                 if current.state["phase"] == "complete":
                     with publication_lane(self.workspace):
@@ -930,17 +964,22 @@ def _target_release(path):
 
 def _verify_installed_self(source):
     source = Path(source).absolute()
-    try:
-        manifest = json.loads(read_owner_file(source / "manifest.json").data)
-    except (WorkspaceError, OSError, UnicodeError, ValueError) as exc:
-        _fail("UPGRADE_SOURCE_UNADMITTED", exc)
     if (re.fullmatch(r"[0-9a-f]{20}", source.name) is None
             or source.parent.parts[-4:] != (
-                ".local", "lib", "chatgpt-coding-mcp", "releases")
+                ".local", "lib", "chatgpt-coding-mcp", "releases")):
+        _fail("UPGRADE_SOURCE_UNADMITTED")
+    try:
+        identity = _target_release(source)
+        manifest = json.loads(read_owner_file(source / "manifest.json").data)
+    except (WorkspaceControlError, WorkspaceError, OSError,
+            UnicodeError, ValueError) as exc:
+        _fail("UPGRADE_SOURCE_UNADMITTED", exc)
+    if (identity["release_abi"] != 3
             or manifest.get("workspace_upgrade.py") != hashlib.sha256(
                 Path(__file__).read_bytes()).hexdigest()):
         _fail("UPGRADE_SOURCE_UNADMITTED")
-    return manifest
+    return {key: identity[key] for key in (
+        "release_digest", "release_abi", "runtime")}
 
 
 def build_parser():
@@ -954,7 +993,7 @@ def build_parser():
     return parser
 
 
-def _coordinator(projects, roots, source):
+def _coordinator(projects, roots, source, source_identity):
     from runtime_rollout_web import rollout_lock
     workspace = WorkspaceTools(projects, state_dir=roots.authority,
                                config_path=roots.config_root / "workspace-policy.json")
@@ -971,7 +1010,8 @@ def _coordinator(projects, roots, source):
     return UpgradeCoordinator(
         projects, authority=workspace.authority, host_access=access, host=host,
         journal_dir=roots.state_root / "workspace-upgrade", rollout_lock=rollout_lock,
-        workspace=workspace, target_verify=_target_release,
+        workspace=workspace, source_identity=source_identity,
+        target_verify=_target_release,
     )
 
 
@@ -983,7 +1023,7 @@ def main(argv=None, *, environ=None, stdout=None):
             _fail("UPGRADE_ID_INVALID")
         roots = OwnerRoots.from_environment(environ)
         source = Path(__file__).resolve().parent
-        _verify_installed_self(source)
+        source_identity = _verify_installed_self(source)
         if args.command == "status":
             result = ActivationJournal(
                 roots.state_root / "workspace-upgrade", {}).read(args.transaction_id)
@@ -991,7 +1031,7 @@ def main(argv=None, *, environ=None, stdout=None):
             projects_path = (Path(args.projects_json).absolute()
                              if args.projects_json else roots.config_root / "projects.json")
             projects = load_projects(projects_path)
-            coordinator = _coordinator(projects, roots, source)
+            coordinator = _coordinator(projects, roots, source, source_identity)
             if args.command == "prepare":
                 target = _target_release(Path(args.target_release).absolute())
                 if Path(target["runtime"]) != source:
