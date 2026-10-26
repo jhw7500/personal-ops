@@ -358,6 +358,12 @@ MCP 래퍼와 작업 메타데이터에서 출력하거나 저장하지 않고 �
 
 ## 허용할 저장소
 
+WSL 새 설치의 기본 목록은 `personal-ops`, `pim-check`, `tossApp`이다.
+`bootstrap.py --project NAME=ABSOLUTE_PATH`를 반복하면 원하는 프로젝트 목록 전체를
+선택할 수 있으며, 특정 프로젝트 이름은 필수가 아니다. 설치 후에는 기존 목록을 보존해
+항목을 추가한다. [WSL 프로젝트 추가 절차](./WSL-SETUP.md#7-add-projects-after-installation)와
+[tossApp 환경 준비](./WSL-SETUP.md#6-prepare-tossapp-dependencies-on-the-wsl-pc)를 참고한다.
+
 기본 설정은 `~/.config/chatgpt-coding-mcp/projects.json`이다.
 사용자가 허용한 레포만 명시적으로 등록한다. 폴더 안의 레포를 자동 추가하지 않는다.
 

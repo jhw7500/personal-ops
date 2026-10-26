@@ -100,6 +100,104 @@ class BootstrapTest(unittest.TestCase):
         self.assertFalse(self.state_home.exists())
         self.assertFalse(self.library_root.exists())
 
+    def test_default_projects_include_tossapp_without_discovering_other_repositories(self):
+        tossapp = self.projects_root / "tossApp"
+        tossapp.mkdir()
+        (self.projects_root / "unselected-repo").mkdir()
+
+        projects = bootstrap._parse_projects(
+            [], self.personal_ops / "chatgpt-mcp", self.home,
+        )
+
+        self.assertEqual(projects, {
+            "personal-ops": self.personal_ops,
+            "pim-check": self.pim_check,
+            "tossApp": tossapp,
+        })
+
+    def test_custom_projects_install_without_pim_check_or_personal_ops_registration(self):
+        project = self.projects_root / "another-repo"
+        project.mkdir()
+        self.arguments = ["--source", str(MODULE_DIR),
+                          "--project", f"another-repo={project}"]
+
+        result = self.run_bootstrap(apply=True)
+
+        self.assertEqual(result["projects"], {"another-repo": str(project)})
+        from server import load_projects
+        from workspace_tools import WorkspaceTools
+        projects = load_projects(Path(result["projects_config"]))
+        policy_path = self.config_home / "chatgpt-coding-mcp/workspace-policy.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        self.assertEqual(policy["artifacts"], [])
+        workspace = WorkspaceTools(projects, state_dir=Path(result["authority"]),
+                                   config_path=policy_path)
+        self.assertTrue(workspace.enabled)
+        self.assertEqual(result["launch"]["status"], "launch_allowed")
+        self.assertFalse(result["host_grant_issued"])
+
+    def test_later_project_additions_preserve_installation_and_existing_v2_grant(self):
+        tossapp = self.projects_root / "tossApp"
+        future = self.projects_root / "future-project"
+        tossapp.mkdir()
+        future.mkdir()
+        result = self.run_bootstrap(apply=True)
+        self.assertEqual(set(result["projects"]), {"personal-ops", "pim-check"})
+        program = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from server import load_projects
+from workspace_tools import WorkspaceTools
+from host_access import HostAccess
+projects = load_projects(Path(sys.argv[2]))
+workspace = WorkspaceTools(projects)
+access = HostAccess(projects, Path(sys.argv[3]), workspace=workspace)
+assert access.installation_scope_enabled()
+if sys.argv[4] == 'approve':
+    request = access.request('personal-ops')
+    result = access.approve_web('personal-ops', request_id=request['request_id'],
+        duration_seconds=600, allow_codex=False, confirmation='personal-ops')
+else:
+    result = {name: access.get(name) for name in ('tossApp', 'future-project')}
+print(json.dumps(result))
+"""
+        command = [sys.executable, "-B", "-c", program, result["runtime"],
+                   result["projects_config"], str(self.state_home / "chatgpt-coding-mcp")]
+        approved = subprocess.run(
+            [*command, "approve"],
+            cwd=self.root, env=dict(os.environ, **self.environment),
+            text=True, capture_output=True, check=True,
+        )
+        grant = json.loads(approved.stdout)
+        authority = Path(result["authority"]) / "authority.json"
+        access_state = (self.state_home /
+                        "chatgpt-coding-mcp/host-access/installation-scope-v2.json")
+        before = (authority.read_bytes(), access_state.read_bytes())
+        mapping = Path(result["projects_config"])
+        document = json.loads(mapping.read_text(encoding="utf-8"))
+        document["projects"].update({"tossApp": str(tossapp), "future-project": str(future)})
+        mapping.write_text(json.dumps(document), encoding="utf-8")
+
+        # A fresh process reloads the additive map, using the original runtime
+        # and v2 state. No bootstrap, new profile, or second approval occurs.
+        completed = subprocess.run(
+            [*command, "inspect"],
+            cwd=self.root, env=dict(os.environ, **self.environment),
+            text=True, capture_output=True, check=True,
+        )
+        statuses = json.loads(completed.stdout)
+        for name in ("tossApp", "future-project"):
+            with self.subTest(project=name):
+                status = statuses[name]
+                self.assertEqual(status.get("version"), 2)
+                self.assertEqual(status["scope"], "installation")
+                self.assertTrue(status["active"])
+                self.assertEqual(status["grant_id"], grant["grant_id"])
+                self.assertEqual(status["requests"], [])
+        self.assertEqual(before, (authority.read_bytes(), access_state.read_bytes()))
+        self.assertFalse((access_state.parent / "host-access").exists())
+
     def test_apply_creates_private_admitted_setup_without_issuing_grant(self):
         result = self.run_bootstrap(apply=True)
 

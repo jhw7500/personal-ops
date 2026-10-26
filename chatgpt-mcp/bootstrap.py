@@ -164,7 +164,9 @@ def _existing_directory(path: Path) -> bool:
 
 def _parse_projects(values: list[str], source: Path, home: Path) -> dict[str, Path]:
     if not values:
-        values = [f"personal-ops={source.parent}", f"pim-check={home / 'projects/pim-check'}"]
+        values = [f"personal-ops={source.parent}",
+                  f"pim-check={home / 'projects/pim-check'}",
+                  f"tossApp={home / 'projects/tossApp'}"]
     projects = {}
     for value in values:
         name, separator, raw_path = value.partition("=")
@@ -180,8 +182,6 @@ def _parse_projects(values: list[str], source: Path, home: Path) -> dict[str, Pa
         if not resolved.is_dir():
             raise BootstrapError("INVALID_PROJECT")
         projects[name] = resolved
-    if "personal-ops" not in projects or "pim-check" not in projects:
-        raise BootstrapError("REQUIRED_PROJECT_MISSING")
     projects_root = home / "projects"
     if any(path == projects_root for path in projects.values()):
         raise BootstrapError("INVALID_PROJECT_LAYOUT")
@@ -194,7 +194,7 @@ def _parse_projects(values: list[str], source: Path, home: Path) -> dict[str, Pa
     return projects
 
 
-def _policy(projects_root: Path) -> dict:
+def _policy(projects_root: Path, projects: dict[str, Path]) -> dict:
     return {
         "version": 2,
         "base_root": str(projects_root),
@@ -210,6 +210,7 @@ def _policy(projects_root: Path) -> dict:
                 "content_mode": "text",
             }
             for name in REPORT_DIRECTORIES
+            if "pim-check" in projects
         ],
         "protected_paths": [],
     }
@@ -311,7 +312,9 @@ def run(argv=None) -> dict:
     parser.add_argument("--apply", action="store_true",
                         help="Create the owner-local configuration and installed runtime")
     parser.add_argument("--source", type=Path, default=MODULE_DIR)
-    parser.add_argument("--project", action="append", default=[], metavar="NAME=ABSOLUTE_PATH")
+    parser.add_argument("--project", action="append", default=[], metavar="NAME=ABSOLUTE_PATH",
+                        help="Repeat to select the complete project set; defaults to "
+                             "personal-ops, pim-check, and tossApp")
     options = parser.parse_args(argv)
 
     if sys.version_info[:2] != (3, 11):
@@ -352,7 +355,7 @@ def run(argv=None) -> dict:
     projects_payload = _json_bytes({
         "projects": {name: str(path) for name, path in projects.items()},
     })
-    policy_payload = _json_bytes(_policy(projects_root))
+    policy_payload = _json_bytes(_policy(projects_root, projects))
     runtime = releases_dir / snapshot
     expected_controller = {
         name: hashlib.sha256((source / name).read_bytes()).hexdigest()
