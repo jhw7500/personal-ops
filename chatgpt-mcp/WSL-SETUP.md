@@ -55,6 +55,15 @@ Install Git, CA certificates, and `uv` using their official instructions, then
 clone the delivery branch and the projects it will operate on. Existing clones
 can be reused; do not replace their working changes.
 
+The tossApp repository is private (checked on 2026-10-26). Authenticate on the
+WSL PC with a GitHub account that can access it before cloning. Public clones
+can succeed without this authentication. Use the GitHub CLI browser login and
+Git credential setup described in the official links below; keep credentials
+local to this PC instead of copying the build server's credentials.
+
+References: [Browser login](https://cli.github.com/manual/gh_auth_login) and
+[Git credential setup](https://cli.github.com/manual/gh_auth_setup-git).
+
 ```bash
 mkdir -p "$HOME/projects"
 cd "$HOME/projects"
