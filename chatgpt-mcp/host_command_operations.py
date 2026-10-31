@@ -27,11 +27,15 @@ from host_runtime_operations import (
     _timestamp, _verified_installation, acquire_flock,
     operation_path,
 )
+from workspace_host import (
+    acquire_host_operation_lane, complete_host_operation, resolve_workspace,
+)
+from workspace_control import WorkspaceControlError, activation_admission
 
 REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
 HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
-PLAN_TTL = 600
+PLAN_TTL = 7 * 24 * 60 * 60
 HISTORY_LIMIT = 500
 PENDING = frozenset({"pending_host_approval", "approved"})
 ACTIVE = frozenset({"queued", "running"})
@@ -55,7 +59,7 @@ def _source_digest(frozen: dict) -> str:
 class HostCommandOperations:
     def __init__(self, projects: dict, *, config_path: Path, state_dir: Path,
                  runner=None, test_only: bool = False, scope_inspector=None,
-                 scope_finisher=None):
+                 scope_finisher=None, workspace=None):
         self.projects = {name: Path(value) for name, value in projects.items()}
         self.profiles = HostCommandProfiles(self.projects, config_path)
         self.state_dir = Path(state_dir).absolute()
@@ -70,10 +74,18 @@ class HostCommandOperations:
         self.executions_dir = private_dir(self.state_dir / "executions")
         self.lock_path = self.state_dir / "operations.lock"
         self.runner = runner or run_host_profile
+        self.workspace = resolve_workspace(projects, workspace)
+        authority = getattr(self.workspace, "authority", None)
+        overall_state = (self.state_dir.parents[1]
+                         if self.state_dir.parts[-2:] == ("host-runtime", "commands")
+                         else self.state_dir.parent)
+        self.activation_authority_dir = Path(
+            getattr(authority, "state_dir", overall_state / "workspace-authority")
+        ).absolute()
         self._native_runner = runner is None
         self._scope_inspector = scope_inspector
         self._scope_finisher = scope_finisher
-        self._retained_leases: dict[str, int] = {}
+        self._retained_leases: dict[str, tuple[int, ...]] = {}
         # Fake-runner injection is permitted only for isolated unit tests.
         self._trusted = _verified_installation() or bool(test_only and runner is not None)
         self._workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
@@ -140,10 +152,17 @@ class HostCommandOperations:
             ident = state["operation_id"]
             if ident in self._workers or ident in self._retained_leases:
                 return state
+            leases = []
             try:
-                lease = acquire_flock(self._project_lock_path(state["project"]))
+                workspace_fd = acquire_host_operation_lane(
+                    self.workspace, operation_id=ident, kind="host-command", recovery=True)
+                if workspace_fd is not None:
+                    leases.append(workspace_fd)
+                leases.append(acquire_flock(self._project_lock_path(state["project"])))
             except HostRuntimeError as exc:
-                if exc.code == "TARGET_BUSY":
+                for lease in reversed(leases):
+                    os.close(lease)
+                if exc.code in {"TARGET_BUSY", "WORKSPACE_HOST_LANE_BUSY"}:
                     return state
                 raise
             try:
@@ -160,8 +179,15 @@ class HostCommandOperations:
                              termination_verified=verified,
                              finished_at=_now().isoformat())
                 self._save(state)
+                if verified:
+                    complete_host_operation(
+                        self.workspace, ident, "host-command", termination_verified=True)
+                if not verified:
+                    self._retained_leases[ident] = tuple(leases)
+                    leases = []
             finally:
-                os.close(lease)
+                for lease in reversed(leases):
+                    os.close(lease)
         return state
 
     def _inspect_scope(self, identity) -> bool:
@@ -196,6 +222,23 @@ class HostCommandOperations:
                 state["state"] == "outcome_unknown"
                 and state.get("termination_verified") is not True)
 
+    def _retire_stale_unstarted_approval(self, state):
+        if state["state"] != "approved":
+            return False
+        try:
+            self.profiles.verify_frozen(state["frozen"])
+        except HostRuntimeError as exc:
+            if exc.code not in {
+                    "HOST_COMMAND_INPUT_CHANGED", "HOST_COMMAND_EXECUTABLE_CHANGED",
+                    "HOST_COMMAND_PLAN_STALE"}:
+                raise
+            state.update(state="expired", phase="APPROVAL", code=exc.code,
+                         finished_at=_now().isoformat())
+            self._save(state)
+            self._receipt_path(state["operation_id"]).unlink(missing_ok=True)
+            return True
+        return False
+
     @staticmethod
     def _numeric_result(value):
         names = ("exit_code", "duration_ms", "stdout_bytes", "stderr_bytes")
@@ -221,6 +264,13 @@ class HostCommandOperations:
         return self.profiles.list_profiles(project)
 
     def prepare(self, project: str, profile_id: str, request_id: str) -> dict:
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._prepare_admitted(project, profile_id, request_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _prepare_admitted(self, project: str, profile_id: str, request_id: str) -> dict:
         self._require_trusted()
         if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
             raise HostRuntimeError("INVALID_HOST_COMMAND_REQUEST")
@@ -234,6 +284,9 @@ class HostCommandOperations:
                     if existing["request_digest"] != request_digest:
                         raise HostRuntimeError("REQUEST_ID_CONFLICT")
                     return self._public(self._refresh(existing))
+            for existing in states:
+                if existing["project"] == project:
+                    self._retire_stale_unstarted_approval(self._refresh(existing))
             if any(x["project"] == project and self._blocked(self._refresh(x))
                    for x in states):
                 raise HostRuntimeError("HOST_COMMAND_PROJECT_BUSY")
@@ -334,8 +387,23 @@ class HostCommandOperations:
         return self.locks_dir / (_digest(project) + ".lock")
 
     def _begin(self, project: str, operation_id: str) -> dict:
-        held_fd = None
         try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._begin_admitted(project, operation_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _begin_admitted(self, project: str, operation_id: str) -> dict:
+        with _lock(self.lock_path):
+            state = self._refresh(self._load(operation_id, project))
+            if state["state"] == "pending_host_approval":
+                raise HostRuntimeError("HOST_COMMAND_APPROVAL_REQUIRED")
+            if state["state"] != "approved":
+                return self._public(state)
+        held_fd = workspace_fd = None
+        try:
+            workspace_fd = acquire_host_operation_lane(
+                self.workspace, operation_id=operation_id, kind="host-command")
             with _lock(self.lock_path):
                 state = self._refresh(self._load(operation_id, project))
                 if state["state"] == "pending_host_approval":
@@ -348,7 +416,7 @@ class HostCommandOperations:
                 receipt.unlink()
                 cancel = threading.Event()
                 worker = threading.Thread(
-                    target=self._work, args=(operation_id, held_fd, cancel),
+                    target=self._work, args=(operation_id, held_fd, workspace_fd, cancel),
                     name="approved-host-command-" + operation_id[:8], daemon=True)
                 state.update(state="queued", phase="QUEUED",
                              started_at=_now().isoformat())
@@ -363,16 +431,23 @@ class HostCommandOperations:
                     self._save(state)
                     raise HostRuntimeError("EXECUTOR_UNAVAILABLE") from None
                 held_fd = None  # handed over to the worker thread
+                workspace_fd = None
                 return self._public(state)
         finally:
             if held_fd is not None:
                 os.close(held_fd)
+            if workspace_fd is not None:
+                complete_host_operation(
+                    self.workspace, operation_id, "host-command",
+                    termination_verified=True)
+                os.close(workspace_fd)
 
     async def execute(self, project: str, operation_id: str) -> dict:
         self._require_trusted()
         return await asyncio.to_thread(self._begin, project, operation_id)
 
-    def _work(self, operation_id: str, held_fd: int, cancel: threading.Event) -> None:
+    def _work(self, operation_id: str, held_fd: int, workspace_fd: int | None,
+              cancel: threading.Event) -> None:
         effect_started = False
         termination_verified = True
         safe_result = None
@@ -440,10 +515,15 @@ class HostCommandOperations:
                              result=safe_result, termination_verified=termination_verified)
                 self._save(state)
         finally:
+            leases = tuple(fd for fd in (workspace_fd, held_fd) if fd is not None)
             if termination_verified:
-                os.close(held_fd)
+                complete_host_operation(
+                    self.workspace, operation_id, "host-command",
+                    termination_verified=True)
+                for lease in reversed(leases):
+                    os.close(lease)
             else:
-                self._retained_leases[operation_id] = held_fd
+                self._retained_leases[operation_id] = leases
             self._workers.pop(operation_id, None)
 
     def _record_identity(self, operation_id, identity):
@@ -471,26 +551,39 @@ class HostCommandOperations:
                     state["state"] == "outcome_unknown"
                     and state.get("termination_verified") is not True):
                 return self._public(state)
-            lease = self._retained_leases.get(operation_id)
-            borrowed = lease is None
+            leases = self._retained_leases.get(operation_id)
+            borrowed = leases is None
             if borrowed:
+                acquired = []
                 try:
-                    lease = acquire_flock(self._project_lock_path(project))
+                    workspace_fd = acquire_host_operation_lane(
+                        self.workspace, operation_id=operation_id, kind="host-command",
+                        recovery=True)
+                    if workspace_fd is not None:
+                        acquired.append(workspace_fd)
+                    acquired.append(acquire_flock(self._project_lock_path(project)))
                 except HostRuntimeError as exc:
-                    if exc.code == "TARGET_BUSY":
+                    for lease in reversed(acquired):
+                        os.close(lease)
+                    if exc.code in {"TARGET_BUSY", "WORKSPACE_HOST_LANE_BUSY"}:
                         raise HostRuntimeError("HOST_COMMAND_PROCESS_NOT_OWNED") from None
                     raise
+                leases = tuple(acquired)
             try:
                 self._finish_scope(state.get("execution_identity"))
                 state.update(state="outcome_unknown", phase="COMPLETE",
                              code="HOST_COMMAND_WORKER_OWNER_LOST", termination_verified=True,
                              finished_at=_now().isoformat())
                 self._save(state)
+                complete_host_operation(
+                    self.workspace, operation_id, "host-command", termination_verified=True)
             except Exception:
                 if borrowed:
-                    os.close(lease)
+                    for lease in reversed(leases):
+                        os.close(lease)
                 raise
-            os.close(lease)
+            for lease in reversed(leases):
+                os.close(lease)
             self._retained_leases.pop(operation_id, None)
             return self._public(state)
 

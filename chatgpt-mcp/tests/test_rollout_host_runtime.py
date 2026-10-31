@@ -4,7 +4,9 @@ from contextlib import contextmanager
 from functools import partial
 import io
 import json
+import os
 from pathlib import Path
+import site
 import tempfile
 import types
 import unittest
@@ -30,7 +32,11 @@ class RolloutTest(unittest.TestCase):
         for path in ("tests/check_host_access_approval_ui.py",
                      "tests/check_schema014_approval_ui.py",
                      "tests/check_host_command_approval_ui.py",
-                     "tests/test_runtime_rollout_ui.py"):
+                     "tests/test_runtime_rollout_ui.py",
+                     "tests/test_workspace_approval_browser.py",
+                     "tests/test_git_commit_access_browser.py",
+                     "tests/test_workspace_approval_ui.mjs",
+                     "rollout_test_runner.py"):
             with self.subTest(path=path):
                 self.assertIn(path, module.control_inventory())
 
@@ -39,23 +45,365 @@ class RolloutTest(unittest.TestCase):
         for stage, filename in (("checks_approval_ui", "check_host_access_approval_ui.py"),
                                 ("checks_schema014_ui", "check_schema014_approval_ui.py"),
                                 ("checks_host_command_ui", "check_host_command_approval_ui.py"),
-                                ("checks_runtime_rollout_ui", "test_runtime_rollout_ui.py")):
+                                ("checks_runtime_rollout_ui", "test_runtime_rollout_ui.py"),
+                                ("checks_workspace_approval_browser", "test_workspace_approval_browser.py"),
+                                ("checks_git_commit_access_browser", "test_git_commit_access_browser.py"),
+                                ("checks_workspace_ui", "test_workspace_approval_ui.mjs"),
+                                ("checks_targeted", "rollout_test_runner.py"),
+                                ("checks_full", "rollout_test_runner.py")):
             with self.subTest(stage=stage):
                 def checks(argv, **options):
                     return subprocess.CompletedProcess(argv, 1 if options["stage"] == stage else 0)
-                with patch.object(module, "run_command", side_effect=checks) as run:
+                with patch.object(module, "run_command", side_effect=checks) as run, \
+                     patch.object(module, "runtime_node", return_value="/fixture/node"):
                     with self.assertRaisesRegex(RuntimeError, "RUNTIME_TESTS_FAILED"):
                         module.run_checks()
                 browser = next(call for call in run.call_args_list
                                if call.kwargs["stage"] == stage)
-                self.assertEqual(browser.args[0][:2], ["/usr/bin/python3", "-B"])
-                self.assertIn(filename, browser.args[0][-1])
+                self.assertIn(filename, " ".join(browser.args[0]))
+
+    def test_official_stages_use_exact_filter_private_home_and_private_xdg(self):
+        import subprocess
+        calls = []
+        owner_home = Path.home()
+        owner_userbase = "/owner/userbase"
+        ambient = {
+            "HOME": str(owner_home),
+            "PYTHONUSERBASE": "/ambient/userbase",
+            "XDG_CONFIG_HOME": "/ambient/config",
+            "XDG_STATE_HOME": "/ambient/state",
+            "XDG_CACHE_HOME": "/ambient/cache",
+        }
+
+        def checks(argv, **options):
+            assignments = dict(item.split("=", 1) for item in argv[1:10])
+            home = Path(assignments["HOME"])
+            xdg = [Path(assignments[name]) for name in ambient if name.startswith("XDG_")]
+            private = home.parent
+            self.assertTrue(private.name.startswith("runtime-preflight-"))
+            self.assertEqual(home.name, "home")
+            self.assertNotEqual(home, owner_home)
+            self.assertEqual([path.parent for path in xdg], [private] * 3)
+            self.assertEqual([path.name for path in xdg], ["config", "state", "cache"])
+            self.assertEqual(len(set(xdg)), 3)
+            for path in (private, home, *xdg):
+                self.assertTrue(path.is_dir())
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+            self.assertTrue(all(
+                str(path) != ambient[name]
+                for path, name in zip(xdg, ("XDG_CONFIG_HOME", "XDG_STATE_HOME",
+                                           "XDG_CACHE_HOME"))
+            ))
+            self.assertEqual(
+                assignments["PLAYWRIGHT_BROWSERS_PATH"],
+                str(owner_home / ".cache/ms-playwright"),
+            )
+            self.assertEqual(assignments["PYTHONDONTWRITEBYTECODE"], "1")
+            self.assertEqual(assignments["PYTHONUSERBASE"], owner_userbase)
+            self.assertEqual(assignments["UV_OFFLINE"], "1")
+            self.assertEqual(
+                assignments["PATH"],
+                "/fixture:" + str(owner_home / ".local/bin")
+                + ":/usr/local/bin:/usr/bin:/bin",
+            )
+            self.assertEqual(os.environ["HOME"], str(owner_home))
+            self.assertEqual(os.environ["PYTHONUSERBASE"], "/ambient/userbase")
+            calls.append((argv, options))
+            return subprocess.CompletedProcess(argv, 0)
+
+        with patch.dict(os.environ, ambient), \
+             patch.object(module, "run_command", side_effect=checks), \
+             patch.object(module, "runtime_interpreter", return_value="/fixture/python"), \
+             patch.object(module, "runtime_node", return_value="/fixture/node"), \
+             patch.object(site, "getuserbase", return_value=owner_userbase), \
+             patch("sys.stdout", new_callable=io.StringIO) as output:
+            module.run_checks()
+
+        stages = {options["stage"]: argv for argv, options in calls}
+        for stage in ("checks_targeted", "checks_full"):
+            argv = stages[stage]
+            self.assertIn(str(module.HERE / "rollout_test_runner.py"), argv)
+            self.assertIn("HOME=" , argv[1])
+            self.assertIn("XDG_CONFIG_HOME=" , argv[2])
+            self.assertIn("XDG_STATE_HOME=" , argv[3])
+            self.assertIn("XDG_CACHE_HOME=" , argv[4])
+            self.assertIn("PLAYWRIGHT_BROWSERS_PATH=" , argv[5])
+            self.assertEqual(argv[6], "PYTHONDONTWRITEBYTECODE=1")
+            self.assertEqual(argv[7], "PYTHONUSERBASE=" + owner_userbase)
+        self.assertIn("--modules", stages["checks_targeted"])
+        self.assertIn("tests.test_execution", stages["checks_targeted"])
+        self.assertIn("--discover", stages["checks_full"])
+        self.assertEqual(stages["checks_workspace_ui"][10:12], ["/fixture/node", "--test"])
+        node_inputs = stages["checks_workspace_ui"][12:]
+        self.assertEqual(Path(node_inputs[0]).name, "test_workspace_approval_ui.mjs")
+        self.assertEqual(sum(Path(path).name == "test_workspace_approval_ui.mjs"
+                             for path in node_inputs), 1)
+        diagnostics = output.getvalue()
+        self.assertIn("excluded unittest IDs (5)", diagnostics)
+        for method in module.EXCLUDED_TEST_METHODS:
+            self.assertIn(method, diagnostics)
+
+    def test_checks_link_private_serena_path_to_approved_owner_venv_and_clean_up(self):
+        import subprocess
+        private_homes = []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            owner_home = Path(temporary) / "owner"
+            approved = owner_home / ".local/share/uv/tools/serena-agent"
+            interpreter = approved / "bin/python"
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_text("fixture\n")
+            interpreter.chmod(0o700)
+            owner_userbase = str(owner_home / ".local")
+
+            def checks(argv, **_options):
+                assignments = dict(item.split("=", 1) for item in argv[1:10])
+                home = Path(assignments["HOME"])
+                linked = home / ".local/share/uv/tools/serena-agent"
+                self.assertTrue(linked.is_symlink())
+                self.assertEqual(linked.readlink(), approved)
+                self.assertEqual(linked.resolve(), approved.resolve())
+                self.assertEqual(assignments["PYTHONDONTWRITEBYTECODE"], "1")
+                self.assertEqual(assignments["PYTHONUSERBASE"], owner_userbase)
+                self.assertEqual(assignments["UV_OFFLINE"], "1")
+                self.assertIn(str(owner_home / ".local/bin"), assignments["PATH"])
+                private_homes.append(home)
+                return subprocess.CompletedProcess(argv, 0)
+
+            with patch.object(module.Path, "home", return_value=owner_home), \
+                 patch.object(module, "runtime_node", return_value="/fixture/node"), \
+                 patch.object(module, "run_command", side_effect=checks), \
+                 patch.object(site, "getuserbase", return_value=owner_userbase), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                module.run_checks()
+
+            self.assertEqual(len(private_homes), 10)
+            self.assertTrue(all(not home.exists() for home in private_homes))
+
+    def test_checks_fail_closed_when_pinned_node_is_unavailable(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(module.Path, "home", return_value=Path(temporary)), \
+             patch.object(module.shutil, "which", return_value="/usr/bin/node") as which, \
+             patch.object(module, "run_command", return_value=subprocess.CompletedProcess([], 0)) as run:
+            with self.assertRaisesRegex(RuntimeError, "ROLLOUT_NODE_UNAVAILABLE"):
+                module.run_checks()
+
+        which.assert_not_called()
+        run.assert_not_called()
+
+    def test_runtime_node_accepts_only_the_executable_pinned_version(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(module.Path, "home", return_value=Path(temporary)):
+            node = Path(temporary) / ".nvm/versions/node/v24.12.0/bin/node"
+            node.parent.mkdir(parents=True)
+            node.write_text("fixture\n")
+            node.chmod(0o700)
+            self.assertEqual(module.runtime_node(), str(node))
+            node.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "ROLLOUT_NODE_UNAVAILABLE"):
+                module.runtime_node()
+
+    def test_workspace_node_gate_fails_closed_when_required_input_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tests = Path(temporary) / "tests"
+            tests.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "RUNTIME_TEST_INPUT_MISSING"):
+                module.node_ui_test_inputs(tests)
+            optional = tests / "test_optional_ui.mjs"
+            optional.write_text("// optional fixture\n")
+            with self.assertRaisesRegex(RuntimeError, "RUNTIME_TEST_INPUT_MISSING"):
+                module.node_ui_test_inputs(tests)
+            required = tests / "test_workspace_approval_ui.mjs"
+            required.write_text("// required fixture\n")
+            self.assertEqual(
+                tuple(path.name for path in module.node_ui_test_inputs(tests)),
+                ("test_workspace_approval_ui.mjs", "test_optional_ui.mjs"),
+            )
+
+    def test_workspace_node_gate_rejects_symlink_and_nonregular_required_input(self):
+        for kind in ("symlink", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                tests = Path(temporary) / "tests"
+                tests.mkdir()
+                required = tests / "test_workspace_approval_ui.mjs"
+                if kind == "symlink":
+                    target = tests / "target.mjs"
+                    target.write_text("// fixture\n")
+                    required.symlink_to(target)
+                else:
+                    required.mkdir()
+                with self.assertRaisesRegex(RuntimeError, "RUNTIME_TEST_INPUT_UNSAFE"):
+                    module.node_ui_test_inputs(tests)
+
+    def test_exact_filter_excludes_both_module_prefixes_and_propagates_other_failure(self):
+        runner_path = module.HERE / "rollout_test_runner.py"
+        runner_spec = importlib.util.spec_from_file_location("rollout_test_runner", runner_path)
+        runner = importlib.util.module_from_spec(runner_spec)
+        runner_spec.loader.exec_module(runner)
+        executed = []
+
+        class Synthetic(unittest.TestCase):
+            def __init__(self, test_id, *, fails=False):
+                super().__init__("runTest")
+                self.test_id = test_id
+                self.fails = fails
+
+            def id(self):
+                return self.test_id
+
+            def runTest(self):
+                executed.append(self.test_id)
+                if self.fails:
+                    self.fail("synthetic unrelated failure")
+
+        forbidden = []
+        cases = []
+        for prefix in ("test_execution", "tests.test_execution"):
+            for method in module.EXCLUDED_TEST_METHODS:
+                test_id = f"{prefix}.ExecutionPolicyTest.{method}"
+                forbidden.append(test_id)
+                cases.append(Synthetic(test_id))
+        passing_id = "tests.test_other.OtherTest.test_passes"
+        failing_id = "tests.test_other.OtherTest.test_fails"
+        near_miss_ids = [
+            f"tests.test_other.ExecutionPolicyTest.{module.EXCLUDED_TEST_METHODS[0]}",
+            f"tests.test_execution.OtherTest.{module.EXCLUDED_TEST_METHODS[0]}",
+        ]
+        cases.extend(Synthetic(test_id) for test_id in near_miss_ids)
+        cases.extend((Synthetic(passing_id), Synthetic(failing_id, fails=True)))
+        stream = io.StringIO()
+        result = runner.run_suite(unittest.TestSuite(cases), stream=stream)
+
+        self.assertEqual(executed, [*near_miss_ids, passing_id, failing_id])
+        self.assertFalse(result.wasSuccessful())
+        self.assertIn("excluded unittest IDs (10)", stream.getvalue())
+        for test_id in forbidden:
+            self.assertIn(test_id, stream.getvalue())
+
+        executed.clear()
+        boundary = runner.run_suite(
+            unittest.TestSuite([Synthetic(passing_id)]),
+            stream=io.StringIO(),
+            required_excluded_count=5,
+        )
+        self.assertEqual(executed, [passing_id])
+        self.assertTrue(boundary.wasSuccessful())
+        self.assertFalse(boundary.rollout_exclusion_count_ok)
+
+    def test_runner_main_enforces_success_count_and_unrelated_failures(self):
+        runner_path = module.HERE / "rollout_test_runner.py"
+        runner_spec = importlib.util.spec_from_file_location("rollout_test_runner_main", runner_path)
+        runner = importlib.util.module_from_spec(runner_spec)
+        runner_spec.loader.exec_module(runner)
+
+        class Synthetic(unittest.TestCase):
+            def __init__(self, test_id, *, fails=False):
+                super().__init__("runTest")
+                self.test_id = test_id
+                self.fails = fails
+
+            def id(self):
+                return self.test_id
+
+            def runTest(self):
+                if self.fails:
+                    self.fail("synthetic unrelated failure")
+
+        def suite(excluded_count=5, *, fails=False):
+            cases = [Synthetic(
+                f"tests.test_execution.ExecutionPolicyTest.{method}"
+            ) for method in module.EXCLUDED_TEST_METHODS[:excluded_count]]
+            cases.append(Synthetic("tests.test_other.OtherTest.test_result", fails=fails))
+            return unittest.TestSuite(cases)
+
+        scenarios = ((5, False, 0), (4, False, 1), (5, True, 1))
+        original_run_suite = runner.run_suite
+        for excluded_count, fails, expected in scenarios:
+            with self.subTest(excluded_count=excluded_count, fails=fails):
+                loader = types.SimpleNamespace(
+                    loadTestsFromNames=lambda _names, count=excluded_count, failure=fails:
+                        suite(count, fails=failure),
+                    discover=lambda _path, count=excluded_count, failure=fails:
+                        suite(count, fails=failure),
+                )
+                with patch.object(runner.unittest, "defaultTestLoader", loader), \
+                     patch.object(
+                         runner,
+                         "run_suite",
+                         side_effect=lambda loaded, **kwargs: original_run_suite(
+                             loaded, stream=io.StringIO(), **kwargs
+                         ),
+                     ):
+                    self.assertEqual(runner.main(["--modules", "synthetic"]), expected)
+
+    def test_workspace_tools_are_expected_only_when_policy_surface_is_enabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = {"alpha": root / "alpha"}
+            projects["alpha"].mkdir()
+            policy = root / "config/workspace-policy.json"
+            authority = root / "state/workspace-authority"
+            legacy = module.expected_tool_names(projects, config_path=policy,
+                                                authority_dir=authority)
+            self.assertEqual(legacy, module.TOOL_NAMES)
+            policy.parent.mkdir()
+            policy.write_text("{}")
+            enabled = module.expected_tool_names(projects, config_path=policy,
+                                                 authority_dir=authority)
+        from workspace_tools import NAMES
+        self.assertEqual(
+            enabled,
+            module.TOOL_NAMES | NAMES | {"read_workspace_output", "publish_workspace_output"},
+        )
+
+    def test_workspace_catalog_requires_both_output_tools(self):
+        from rollout_tunnel import TunnelSwitchError
+
+        class Response(io.BytesIO):
+            status = 200
+
+        with tempfile.TemporaryDirectory() as temporary:
+            url_file = Path(temporary) / "runtime.url"
+            url_file.write_text("http://127.0.0.1:12345")
+            url_file.chmod(0o600)
+            expected = module.TOOL_NAMES | {
+                "read_workspace_output", "publish_workspace_output"
+            }
+
+            def getter(names):
+                body = {"details": {
+                    "channel": "main", "transport": "stdio",
+                    "child_state": "running", "evidence": "same_child",
+                    "tools_list": {
+                        "ok": True, "complete": True, "limited": False,
+                        "partial": False, "tool_names": sorted(names),
+                        "retained_count": len(names),
+                    },
+                }}
+                return lambda *_args, **_kwargs: Response(json.dumps(body).encode())
+
+            for missing in ("read_workspace_output", "publish_workspace_output"):
+                with self.subTest(missing=missing), self.assertRaisesRegex(
+                    TunnelSwitchError, "LIVE_TOOLS_MISMATCH"
+                ):
+                    module.observe_tools(
+                        expected,
+                        url_file=url_file,
+                        urlopen_fn=getter(expected - {missing}),
+                    )
+            observed = module.observe_tools(
+                expected, url_file=url_file, urlopen_fn=getter(expected)
+            )
+        self.assertTrue(observed["tools_registered"])
 
     def test_rollout_blocks_activation_until_all_legacy_predecessor_and_registered_tools_are_seen(self):
         expected = {
             "get_runtime_status", "compare_deployment", "get_db_migration_status",
             "get_predecessor_migration_status", "get_schema014_migration_status",
             "get_toss_test_console_status", "get_toss_ux019_test_console_status",
+            "get_toss_20261026_test_console_status",
             "prepare_schema014_migration", "execute_schema014_migration",
             "prepare_db_migration", "prepare_predecessor_migration",
             "execute_db_migration", "execute_predecessor_migration",
@@ -74,9 +422,17 @@ class RolloutTest(unittest.TestCase):
             "confirm_host_access_approval", "cancel_host_access_approval",
             "open_schema014_approval", "confirm_schema014_approval",
             "cancel_schema014_approval",
+            "open_test_plan_approval", "confirm_test_plan_approval",
+            "cancel_test_plan_approval",
+            "open_registered_host_approval", "confirm_registered_host_approval",
+            "cancel_registered_host_approval",
+            "open_git_approval", "confirm_git_approval", "cancel_git_approval",
+            "open_git_commit_access_approval", "get_git_commit_access",
+            "confirm_git_commit_access", "cancel_git_commit_access", "revoke_git_commit_access",
             "open_host_command_approval", "confirm_host_command_approval",
             "confirm_and_execute_host_command",
             "cancel_host_command_approval",
+            "get_project_resume", "compact_project_memory",
         }
         self.assertEqual(module.TOOL_NAMES, expected)
         self.assertIn("tests.test_toss_console_ux019", module.TESTS)
@@ -107,6 +463,24 @@ class RolloutTest(unittest.TestCase):
             "tests.test_agent_smoke",
             "tests.test_agent_profile_setup",
         } <= set(module.TESTS))
+
+    def test_service_command_pins_user_bus_environment(self):
+        import subprocess
+        completed = subprocess.CompletedProcess([], 0, stdout=b"unit")
+        with patch.object(module, "run_command", return_value=completed) as run:
+            output = module.service_command(
+                ["systemctl", "--user", "cat", "personal-ops-tunnel.service"],
+                stdout=subprocess.PIPE,
+            )
+        runtime = f"/run/user/{os.getuid()}"
+        self.assertEqual(output, b"unit")
+        self.assertEqual(run.call_args.kwargs["env"], {
+            "HOME": str(Path.home()),
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "XDG_RUNTIME_DIR": runtime,
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + runtime + "/bus",
+        })
 
     def test_existing_tunnel_id_is_discovered_without_terminal_arguments(self):
         self.assertEqual(module._find_id({"runtime": {"tunnel_id": "tunnel-123"}}),
@@ -157,6 +531,8 @@ class RolloutTest(unittest.TestCase):
                  patch.object(module, "tunnel_client", return_value="client"), \
                  patch.object(module, "_key_check"), \
                  patch.object(module, "runtime_interpreter", return_value="/fixture/python"), \
+                 patch.object(module, "expected_tool_names", return_value=module.TOOL_NAMES), \
+                 patch.object(module, "_authorize_workspace_rollout") as authorize, \
                  patch.object(module, "CliSessionObserver",
                               partial(module.CliSessionObserver, proc_root=proc)), \
                  patch("server.load_projects", return_value={}), \
@@ -174,12 +550,27 @@ class RolloutTest(unittest.TestCase):
                     verify_fn(after)
                     return dict(after, status="tunnel_ready")
                 switch.side_effect = activate
+                switch.authorize = authorize
                 yield switch, admin
 
     def healthy_status(self, _):
         return {"tunnel_id": "tunnel-123", "process": {"pid": 101},
                 "process_running": True, "healthy": True, "ready": True,
                 "target_value": "/fixture/new/server.py"}
+
+
+    def test_apply_authorizes_target_and_rollback_before_tunnel_switch(self):
+        with self.apply_fixture() as (switch, _admin):
+            result = module.rollout(
+                apply=True, status_fn=self.healthy_status,
+                command_fn=lambda *args, **kw: b"",
+            )
+        self.assertEqual(result["status"], "ready")
+        switch.authorize.assert_called_once()
+        projects, target_runtime, rollback_runtime = switch.authorize.call_args.args
+        self.assertEqual(projects, {})
+        self.assertEqual(Path(target_runtime).name, "c" * 20)
+        self.assertEqual(rollback_runtime, Path("/fixture/old"))
 
     def test_healthy_profile_target_cannot_hide_old_actual_mcp(self):
         with self.apply_fixture(live_after=OLD_LIVE) as (switch, admin):
@@ -212,6 +603,20 @@ class RolloutTest(unittest.TestCase):
         self.assertFalse(result["schema_013_applied"])
         switch.assert_called_once()
         admin.assert_called_once()
+
+    def test_apply_verification_observes_the_policy_aware_catalog(self):
+        policy_tools = module.TOOL_NAMES | {"policy-aware-sentinel"}
+        observed = {
+            "catalog_status": "observed", "tools_registered": True,
+            "connector_schemas_verified": True, "tool_count": len(policy_tools),
+        }
+        with self.apply_fixture(), \
+             patch.object(module, "expected_tool_names", return_value=policy_tools) as expected, \
+             patch.object(module, "observe_tools", return_value=observed) as observe:
+            module.rollout(apply=True, status_fn=self.healthy_status,
+                           command_fn=lambda *args, **kw: b"")
+        expected.assert_called_once_with({})
+        observe.assert_called_once_with(policy_tools)
 
     def test_success_receipt_contains_cli_observations_at_each_switch_boundary(self):
         from rollout_diagnostics import RolloutReceipt

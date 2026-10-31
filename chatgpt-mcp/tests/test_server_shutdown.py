@@ -51,6 +51,7 @@ class ServerShutdownTest(unittest.IsolatedAsyncioTestCase):
                         "    def __init__(self, *args, **kwargs): pass\n"
                         "    async def get_provider(self): return None\n"
                         "    async def get_ux019_provider(self): return None\n"
+                        "    async def get_test_20261026_provider(self): return None\n"
                         "    async def close(self):\n"
                         f"        Path({str(root / 'console-close-failed')!r}).touch()\n"
                         "        raise RuntimeError('private console close failure')\n"

@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
+const html=readFileSync(new URL('../git-commit-access-approval.html',import.meta.url),'utf8');
+const section=html.split('// VALIDATION_START')[1]?.split('// VALIDATION_END')[0];
+assert.ok(section,'validation section exists');
+const valid=vm.runInNewContext(section+'; validCard', {Date,Number,Array});
+const good={component:'git_commit_access',project:'repo',card_id:'a'.repeat(32),state:'pending',repository:'/tmp/repo',branch:'feature/test',head:'b'.repeat(40),operations:['commit'],duration_seconds:86400,expires_at:'2030-01-01T00:00:00Z',executes_on_approval:false};
+assert.equal(valid(good),true);
+for(const patch of [{operations:['push']},{operations:['commit','push']},{duration_seconds:0},{duration_seconds:86401},{duration_seconds:true},{state:'executed'},{branch:'main'},{branch:'master'},{repository:'../repo'},{card_id:'x'},{executes_on_approval:true},{expires_at:'bad'}]) assert.equal(valid({...good,...patch}),false,JSON.stringify(patch));
+assert.equal(valid({...good,state:'active',grant_id:'c'.repeat(32),grant_expires_at:'2030-01-01T00:00:00Z'}),true);
+assert.ok(html.includes('event.source!==window.parent'));
+assert.ok(html.includes('git_commit_access_confirmation'));
+assert.ok(!html.includes('innerHTML'));
+console.log('GIT_COMMIT_ACCESS_UI_VALIDATION_PASS 16 assertions');
+
+const sameScope=vm.runInNewContext(section+'; sameScope',{Date,Number,Array});
+assert.equal(sameScope(good,{...good}),true);
+for(const patch of [{project:'different'},{repository:'/tmp/another'},{branch:'feature/other'},{head:'c'.repeat(40)},{duration_seconds:3600},{expires_at:'2031-01-01T00:00:00Z'}])assert.equal(sameScope(good,{...good,...patch}),false);
+console.log('IMMUTABLE_UI_SCOPE_PASS 7 assertions');

@@ -21,6 +21,7 @@ HOST_TOOLS = {
     "get_predecessor_migration_status", "prepare_predecessor_migration",
     "execute_predecessor_migration", "execute_db_migration",
     "get_toss_test_console_status", "get_toss_ux019_test_console_status",
+    "get_toss_20261026_test_console_status",
 }
 
 

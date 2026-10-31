@@ -211,16 +211,16 @@ class AdminBrowserTest(unittest.TestCase):
             (self.root / 'config' / 'token').read_text().strip())
         return duration
 
-    def test_host_access_duration_allows_eight_hours(self):
+    def test_host_access_duration_allows_thirty_days(self):
         duration = self.prepare_host_access_duration_form()
-        expect(duration).to_have_attribute('max', '480')
-        expect(duration).to_have_value('240')
-        duration.fill('480')
+        expect(duration).to_have_attribute('max', '43200')
+        expect(duration).to_have_value('43200')
+        duration.fill('43200')
         expect(self.page.locator('#host-access-approve')).to_be_enabled()
 
-    def test_host_access_duration_blocks_over_eight_hours(self):
+    def test_host_access_duration_blocks_over_thirty_days(self):
         duration = self.prepare_host_access_duration_form()
-        duration.fill('481')
+        duration.fill('43201')
         expect(self.page.locator('#host-access-approve')).to_be_disabled()
 
     def test_rpg_default_map_and_mission_fit_first_viewport(self):

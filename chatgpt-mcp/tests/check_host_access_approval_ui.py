@@ -21,7 +21,7 @@ const future = '2099-01-01T00:00:00Z';
 const cards = window.cards = {
   one: {project: 'personal-ops', scope: 'installation', card_id: '11111111111111111111111111111111',
     revision: 1, state: 'pending', expires_at: future, project_root: '/srv/personal-ops',
-    duration_seconds: 14400, allow_codex: true,
+    duration_seconds: 2592000, allow_codex: true,
     host_identity: {hostname: 'cantopsbuildserver', user: 'jhw', uid: 1000,
       groups: ['jhw', 'docker'], filesystem_isolated: false,
       effective_access: 'host_user_filesystem_network_groups'},
@@ -267,6 +267,7 @@ class HostAccessApprovalBrowserTest(unittest.TestCase):
         expect(frame.get_by_text("jhw (UID 1000)")).to_be_visible()
         expect(frame.get_by_text("jhw, docker", exact=True)).to_be_visible()
         expect(frame.get_by_text("/srv/personal-ops")).to_be_visible()
+        expect(frame.locator("#duration")).to_have_text("30일")
         expect(frame.get_by_text("설치 전체 · 호스트 사용자 파일·네트워크·그룹 권한")).to_be_visible()
         expect(frame.get_by_text(
             "이 MCP 설치의 선택 프로젝트 호출자와 대화가 권한을 공유합니다.", exact=True
@@ -322,12 +323,24 @@ class HostAccessApprovalBrowserTest(unittest.TestCase):
         self.assertEqual(calls[0]["params"]["name"], "update_host_access_approval")
         self.assertEqual(calls[0]["params"]["arguments"]["duration_seconds"], 28800)
 
-    def test_over_eight_hour_result_fails_closed(self):
+    def test_thirty_day_option_updates_card_and_can_be_approved(self):
+        frame = self.open()
+        frame.get_by_role("button", name="옵션 변경").click()
+        frame.get_by_label("권한 유지 시간").select_option("2592000", timeout=2000)
+        frame.get_by_role("button", name="변경 적용").click()
+        expect(frame.locator("#duration")).to_have_text("30일")
+        frame.get_by_role("button", name="승인", exact=True).click()
+        expect(frame.get_by_role("status")).to_contain_text("승인되었습니다")
+        calls = self.tool_calls()
+        self.assertEqual(calls[0]["params"]["arguments"]["duration_seconds"], 2592000)
+        self.assertEqual(self.page.evaluate("cards.one.grant.allow_codex"), True)
+
+    def test_over_thirty_day_result_fails_closed(self):
         frame = self.open()
         over_limit = self.page.evaluate("""() => {
           const result = resultFor(cards.one);
           result.structuredContent.revision += 1;
-          result.structuredContent.duration_seconds = 28801;
+          result.structuredContent.duration_seconds = 2592001;
           return result;
         }""")
         self.page.evaluate("""value => document.querySelector('#one').contentWindow.postMessage({

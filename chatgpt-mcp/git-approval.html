@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git 작업 승인</title>
+<style>
+:root{color-scheme:light dark;font:14px/1.55 system-ui,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;color:light-dark(#202124,#f1f1f1);background:light-dark(#fff,#202020)}
+main{max-width:610px;margin:auto}
+h1{font-size:20px;margin:0}
+p{margin:7px 0 13px}
+.lead,.footnote{color:light-dark(#535962,#c3c6cc)}
+dl{border:1px solid light-dark(#d8dce2,#535962);border-radius:12px;padding:13px;margin:12px 0;background:light-dark(#f8f9fa,#2a2c30);display:grid;gap:8px}
+dt{font-size:12px;color:light-dark(#666a70,#b9bdc2)}
+dd{margin:0;font-weight:600;overflow-wrap:anywhere}
+code{font:12px/1.5 ui-monospace,monospace}
+.notice{padding:12px;margin:12px 0;border-radius:9px;background:light-dark(#f0f2f5,#35373c)}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+button{min-height:44px;padding:10px 16px;border-radius:9px;font:inherit;font-weight:700;cursor:pointer;border:1px solid light-dark(#9da2a9,#888)}
+button:disabled{opacity:.55;cursor:default}
+.primary{background:light-dark(#202124,#eee);color:light-dark(#fff,#202124)}
+.secondary{background:transparent;color:inherit}
+#status{min-height:26px}
+#status[data-error="true"]{color:light-dark(#a51d24,#ffadae)}
+.footnote{font-size:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>Git 커밋·푸시 계획 승인</h1>
+<p class="lead">정확한 저장소·브랜치·작업 범위를 확인하고 승인하세요.</p>
+<dl>
+<div><dt>저장소</dt><dd id="project">불러오는 중…</dd></div>
+<div><dt>작업</dt><dd id="action">불러오는 중…</dd></div>
+<div><dt>고정 대상</dt><dd id="head">불러오는 중…</dd></div>
+<div><dt>실행할 Git 명령</dt><dd><code id="command">불러오는 중…</code></dd></div>
+<div><dt>선택 파일 / 브랜치</dt><dd id="scope">불러오는 중…</dd></div>
+<div><dt>커밋 메시지 SHA-256</dt><dd><code id="message">해당 없음</code></dd></div>
+<div><dt>작업 ID</dt><dd><code id="operation">불러오는 중…</code></dd></div>
+<div><dt>계획 SHA-256</dt><dd><code id="plan">불러오는 중…</code></dd></div>
+<div><dt>작업 트리 스냅샷 SHA-256</dt><dd><code id="snapshot">불러오는 중…</code></dd></div>
+<div><dt>만료</dt><dd id="expiry">불러오는 중…</dd></div>
+</dl>
+<div class="notice">승인은 <strong>이 작업 ID에만 유효한 1회용 영수증</strong>을 발급합니다. 이 카드는 커밋·푸시를 실행하지 않습니다. PR/병합은 별도의 리뷰 절차입니다. 전체 차이는 Git 계획 및 diff에서 검토하세요.</div>
+<div class="actions">
+<button type="button" class="primary" id="approve" disabled>이 Git 계획 승인</button>
+<button type="button" class="secondary" id="cancel" disabled>취소</button>
+</div>
+<p id="status" role="status" aria-live="polite">ChatGPT에 연결 중…</p>
+<p class="footnote">고정된 HEAD·작업 트리·메시지가 바뀌면 승인이 거부됩니다.</p>
+</main>
+<script>
+"use strict";
+const el=Object.fromEntries(["project","action","head","command","scope","message",
+"operation","plan","snapshot","expiry","approve","cancel","status"].map(id=>[id,document.getElementById(id)]));
+const pending=new Map();let seq=0,card=null,token=null,busy=false,locked=false,frame=null,lastSize=null;
+const id32=/^[0-9a-f]{32}$/,hex64=/^[0-9a-f]{64}$/;
+function resize(){
+ if(frame!==null)return;
+ frame=requestAnimationFrame(()=>{
+  frame=null;
+  const root=document.documentElement,prior=root.style.height;
+  root.style.height="max-content";
+  const height=Math.ceil(root.getBoundingClientRect().height),width=Math.ceil(innerWidth);
+  root.style.height=prior;
+  if(height>0&&width>0&&(lastSize?.height!==height||lastSize?.width!==width)){
+   lastSize={height,width};
+   window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/size-changed",
+     params:lastSize},"*");
+  }
+ });
+}
+function status(value,error=false){el.status.textContent=value;el.status.dataset.error=String(error);resize();}
+function request(method,params){
+ if(method==="tools/call"&&typeof window.openai?.callTool==="function")
+  return window.openai.callTool(params.name,params.arguments);
+ return new Promise((resolve,reject)=>{
+  const id=++seq;
+  const timer=setTimeout(()=>{pending.delete(id);reject(new Error("timeout"));},
+    method==="tools/call"?60000:15000);
+  pending.set(id,{resolve,reject,timer});
+  window.parent.postMessage({jsonrpc:"2.0",id,method,params},"*");
+ });
+}
+function valid(x){
+ return x&&typeof x.project==="string"&&x.project.length>0&&
+  id32.test(x.operation_id||"")&&id32.test(x.card_id||"")&&
+  x.component==="git_operation"&&["commit","push"].includes(x.action)&&
+  ["pending","approved","cancelled"].includes(x.state)&&
+  hex64.test(x.plan_digest||"")&&hex64.test(x.snapshot_digest||"")&&
+  typeof x.display_command==="string"&&Array.isArray(x.paths)&&
+  x.executes_on_approval===false&&typeof x.expires_at==="string"&&
+  !Number.isNaN(Date.parse(x.expires_at));
+}
+function sync(){
+ const expired=card?Date.now()>=Date.parse(card.expires_at):true;
+ if(expired&&card?.state==="pending"){
+  locked=true;token=null;status("승인 카드가 만료됐습니다. 정확한 계획 상태를 다시 확인하세요.",true);
+ }
+ const disabled=!card||card.state!=="pending"||!token||busy||locked||expired;
+ el.approve.disabled=disabled;el.cancel.disabled=disabled;
+}
+function render(){
+ if(!card){sync();return;}
+ el.project.textContent=card.project;
+ el.action.textContent=card.action==="commit"?"Git 커밋":"원격 브랜치 푸시";
+ el.head.textContent=card.head_target||"고정 계획";
+ el.command.textContent=card.display_command;
+ el.scope.textContent=card.paths.length?card.paths.join(", "):card.branch||"정확한 원격 브랜치";
+ el.message.textContent=card.message_sha256||"해당 없음";
+ el.operation.textContent=card.operation_id;
+ el.plan.textContent=card.plan_digest;
+ el.snapshot.textContent=card.snapshot_digest;
+ el.expiry.textContent=new Date(card.expires_at).toLocaleString("ko-KR");
+ sync();resize();
+}
+function accept(value){
+ if(value?.isError||!valid(value?.structuredContent))throw new Error("invalid response");
+ const next=value.structuredContent;
+ if(card&&(card.operation_id!==next.operation_id||card.card_id!==next.card_id))return false;
+ const hidden=value?._meta?.git_confirmation;
+ if(next.state==="pending"&&!hex64.test(hidden||"")){
+  card=next;locked=true;token=null;render();
+  status("카드 확인 정보가 없습니다. 이 계획 카드를 다시 열어주세요.",true);
+  return true;
+ }
+ card=next;token=next.state==="pending"?hidden:null;
+ if(next.state!=="pending")locked=true;
+ render();return true;
+}
+async function publish(){
+ const receipt={project:card.project,operation_id:card.operation_id,
+  card_id:card.card_id,action:card.action,state:card.state,approved:card.approved===true};
+ const update={content:[{type:"text",text:"Git "+receipt.action+" 계획 "+
+  receipt.operation_id+": "+receipt.state}],structuredContent:{gitApproval:receipt}};
+ try{await request("ui/update-model-context",update);}
+ catch(_){try{window.openai?.setWidgetState?.({modelContent:update.structuredContent});}catch(_){}}
+}
+async function submit(action){
+ if(!card||!token||busy||locked)return;
+ busy=true;sync();status(action==="confirm"?"승인 영수증 발급 중…":"계획 취소 중…");
+ const arguments_={project:card.project,operation_id:card.operation_id,
+  card_id:card.card_id,confirmation_token:token};
+ try{
+  const outcome=await request("tools/call",{name:action+"_git_approval",arguments:arguments_});
+  if(!accept(outcome))throw new Error("card mismatch");
+  await publish();
+  status(card.state==="approved"?
+   "승인 기록이 확인됐습니다. 실제 커밋·푸시는 채팅에서 별도 실행합니다.":
+   "승인을 취소했습니다.");
+ }catch(_){
+  locked=true;token=null;
+  status("결과가 불확실합니다. 상태를 조회하거나 카드 다시 열기를 요청하세요.",true);
+ }finally{busy=false;sync();}
+}
+el.approve.addEventListener("click",()=>submit("confirm"));
+el.cancel.addEventListener("click",()=>submit("cancel"));
+window.addEventListener("message",event=>{
+ const data=event.data;if(data?.jsonrpc!=="2.0")return;
+ if(Object.hasOwn(data,"id")&&pending.has(data.id)){
+  const item=pending.get(data.id);pending.delete(data.id);clearTimeout(item.timer);
+  data.error?item.reject(new Error("host failed")):item.resolve(data.result);return;
+ }
+ if(data.method==="ui/notifications/tool-result"){
+  try{accept(data.params);status("정확한 Git 계획을 확인한 뒤 승인하세요.");}
+  catch(_){locked=true;sync();status("카드 내용을 확인할 수 없습니다.",true);}
+ }
+});
+if(typeof ResizeObserver==="function"){
+ const observer=new ResizeObserver(resize);
+ observer.observe(document.documentElement);observer.observe(document.body);
+}
+window.addEventListener("resize",resize);resize();
+try{
+ if(window.openai?.toolOutput){
+  accept({structuredContent:window.openai.toolOutput,
+    _meta:window.openai.toolResponseMetadata||{}});
+  status("정확한 Git 계획을 확인한 뒤 승인하세요.");
+ }else if(typeof window.openai?.callTool!=="function"&&window.parent===window){
+  locked=true;sync();status("ChatGPT 승인 카드에서만 열 수 있습니다.",true);
+ }
+}catch(_){locked=true;sync();status("카드 내용 오류",true);}
+</script>
+</body>
+</html>

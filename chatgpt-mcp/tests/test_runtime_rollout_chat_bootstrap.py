@@ -1,9 +1,12 @@
-"""Keep new approval UI pinned by the already-installed rollout control format."""
+"""Keep CLI and web rollout controls pinned to the same current inputs."""
 
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import unittest
+
+import runtime_rollout_web
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -18,30 +21,30 @@ def official():
 
 
 class BootstrapFormatTest(unittest.TestCase):
-    def test_control_inventory_matches_existing_installed_format(self):
-        names = (
-            "rollout-host-runtime.py",
-            "rollout_tunnel.py",
-            "rollout_admin.py",
-            "rollout_catalog.py",
-            "rollout_diagnostics.py",
-            "install-runtime.py",
-            "configure-host-runtime.py",
-        )
-        paths = [HERE / n for n in names] + sorted((HERE / "tests").glob("test_*.py"))
-        paths += [
-            HERE / "tests" / n
-            for n in (
-                "check_host_access_approval_ui.py",
-                "check_schema014_approval_ui.py",
-                "check_host_command_approval_ui.py",
-            )
-        ]
-        expected = {
-            str(p.relative_to(HERE)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in paths
+    def test_cli_and_web_control_inventories_match_current_format(self):
+        inventory = official().control_inventory()
+        for name, digest in inventory.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    digest,
+                    hashlib.sha256((HERE / name).read_bytes()).hexdigest(),
+                )
+
+        cli_digest = hashlib.sha256(
+            json.dumps(inventory, sort_keys=True).encode()
+        ).hexdigest()
+        _target, web_digest = runtime_rollout_web._expected_snapshots(HERE.parent)
+        self.assertEqual(cli_digest, web_digest)
+
+        self.assertIn("rollout_test_runner.py", inventory)
+        expected_mjs = {
+            f"tests/{path.name}" for path in (HERE / "tests").glob("test_*.mjs")
         }
-        self.assertEqual(official().control_inventory(), expected)
+        self.assertTrue(expected_mjs)
+        self.assertEqual(
+            {name for name in inventory if name.endswith(".mjs")},
+            expected_mjs,
+        )
 
     def test_new_ui_is_still_pinned_and_mandatory(self):
         module = official()

@@ -16,6 +16,9 @@ import subprocess
 import time
 import urllib.request
 
+from workspace_control import (DEFAULT_CONTROLLER_DIR, WorkspaceControlError,
+                               transition_release, verify_controller, verify_launch)
+
 SERVICE = "personal-ops-admin.service"
 ALLOWED_ARGS = {"--port", "--config", "--public-origin", "--lan-host"}
 
@@ -26,6 +29,36 @@ class AdminSwitchError(RuntimeError):
         self.cause_code = cause_code
         self.rollback_status = rollback_status
         super().__init__(code if cause_code is None else f"{code}:{cause_code}")
+
+
+def _verify_workspace_launch(runtime, authority_dir=None):
+    try:
+        return verify_launch(runtime, authority_dir)
+    except WorkspaceControlError as exc:
+        raise AdminSwitchError(exc.code) from exc
+
+
+def _transition_workspace_launch(runtime, authority_dir=None):
+    try:
+        return transition_release(runtime, authority_dir)
+    except WorkspaceControlError as exc:
+        raise AdminSwitchError(exc.code) from exc
+
+
+def _workspace_admin_command(admission, runtime, interpreter, authority_dir,
+                             application_args, controller_dir=None):
+    if not admission["authority_active"]:
+        return [str(interpreter), str(runtime / "admin_server.py"), *application_args]
+    try:
+        controller = verify_controller(controller_dir or DEFAULT_CONTROLLER_DIR)
+    except WorkspaceControlError as exc:
+        raise AdminSwitchError(exc.code) from exc
+    return [
+        str(interpreter), controller["launcher"],
+        "--authority-dir", admission["authority_dir"],
+        "--release", str(runtime), "--interpreter", str(interpreter),
+        "--entrypoint", "admin_server.py", "--", *application_args,
+    ]
 
 
 def _run(argv, *, stdout=subprocess.DEVNULL):
@@ -125,6 +158,22 @@ def parse_execstart(unit_text, root, releases):
         raise AdminSwitchError("UNRECOGNIZED_ADMIN_UNIT") from exc
     if len(argv) < 2 or not _safe_interpreter(Path(argv[0])):
         raise AdminSwitchError("UNRECOGNIZED_ADMIN_UNIT")
+    if Path(argv[1]).name == "workspace-launcher.py":
+        if (len(argv) < 11 or argv[2] != "--authority-dir"
+                or argv[4] != "--release" or argv[6] != "--interpreter"
+                or Path(argv[7]) != Path(argv[0])
+                or argv[8:11] != ["--entrypoint", "admin_server.py", "--"]):
+            raise AdminSwitchError("UNRECOGNIZED_ADMIN_UNIT")
+        try:
+            controller = verify_controller(Path(argv[1]).parent)
+            if controller["launcher"] != argv[1]:
+                raise WorkspaceControlError("UNSAFE_WORKSPACE_CONTROLLER")
+            admission = verify_launch(argv[5], argv[3])
+        except WorkspaceControlError as exc:
+            raise AdminSwitchError(exc.code) from exc
+        if not admission["authority_active"]:
+            raise AdminSwitchError("UNRECOGNIZED_ADMIN_UNIT")
+        argv = [argv[0], str(Path(argv[5]) / "admin_server.py"), *argv[11:]]
     script = Path(argv[1])
     if not _safe_script(script, root, releases):
         raise AdminSwitchError("UNRECOGNIZED_ADMIN_UNIT")
@@ -351,6 +400,30 @@ def _assert_process(command_fn, process_argv_fn, process_start_fn, allowed):
     return identity
 
 
+def _wait_process_exec(command_fn, process_argv_fn, process_start_fn,
+                       launch_argv, expected_argv, allowed_transient, sleep_fn,
+                       attempts=12):
+    launch_identity = None
+    for attempt in range(attempts):
+        identity, current_argv = _process_snapshot(
+            command_fn, process_argv_fn, process_start_fn)
+        if current_argv == expected_argv:
+            if launch_identity is not None and identity != launch_identity:
+                raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
+            return identity
+        if current_argv == launch_argv:
+            if launch_identity is None:
+                launch_identity = identity
+            elif identity != launch_identity:
+                raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
+        elif (launch_identity is not None or identity not in allowed_transient
+              or current_argv != allowed_transient[identity]):
+            raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
+        if attempt < attempts - 1:
+            sleep_fn(0.5)
+    raise AdminSwitchError("ADMIN_MAINPID_MISMATCH")
+
+
 def _assert_effective_unit(unit_fn, command_fn, expected):
     if _read_unit(unit_fn, command_fn) != expected:
         raise AdminSwitchError("ADMIN_UNIT_CHANGED")
@@ -395,7 +468,14 @@ def _poll_ui(getter, url, marker, *, attempts=12, sleep_fn=time.sleep):
 
 def _rollback_admin(*, override, previous, deployed_stamp, old_unit, deployed_unit,
                     old_argv, port, command_fn, unit_fn, process_argv_fn,
-                    process_start_fn, getter, sleep_fn, allowed_processes):
+                    process_start_fn, getter, sleep_fn, allowed_processes,
+                    authority_dir, controller_dir):
+    old_runtime = Path(old_argv[1]).parent
+    old_admission = _verify_workspace_launch(old_runtime, authority_dir)
+    old_launch_argv = _workspace_admin_command(
+        old_admission, old_runtime, Path(old_argv[0]), authority_dir,
+        old_argv[2:], controller_dir,
+    )
     _assert_override(override, deployed_stamp)
     _assert_effective_unit(unit_fn, command_fn, deployed_unit)
     inactive_recovery = False
@@ -435,13 +515,22 @@ def _rollback_admin(*, override, previous, deployed_stamp, old_unit, deployed_un
     else:
         _assert_process(command_fn, process_argv_fn, process_start_fn, allowed_processes)
     _assert_override(override, restored_stamp)
+    if old_admission["authority_active"]:
+        _transition_workspace_launch(old_runtime, authority_dir)
+    else:
+        _verify_workspace_launch(old_runtime, authority_dir)
     command_fn(["systemctl", "--user", "restart", SERVICE])
     _assert_override(override, restored_stamp)
     _assert_effective_unit(unit_fn, command_fn, old_unit)
-    restored_identity, restored_argv = _process_snapshot(
-        command_fn, process_argv_fn, process_start_fn)
-    if restored_argv != old_argv:
-        raise AdminSwitchError("ADMIN_ROLLBACK_MAINPID_MISMATCH")
+    try:
+        restored_identity = _wait_process_exec(
+            command_fn, process_argv_fn, process_start_fn,
+            old_launch_argv, old_argv, allowed_processes, sleep_fn,
+        )
+    except AdminSwitchError as exc:
+        if exc.code in {"ADMIN_MAINPID_MISMATCH", "ADMIN_SERVICE_CHANGED"}:
+            raise AdminSwitchError("ADMIN_ROLLBACK_MAINPID_MISMATCH") from exc
+        raise
     _assert_override(override, restored_stamp)
     command_fn(["systemctl", "--user", "is-active", "--quiet", SERVICE])
     _assert_override(override, restored_stamp)
@@ -480,7 +569,7 @@ def preflight_admin(*, unit_fn=None, command_fn=_run, root=None, releases=None,
 
 def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
                  process_argv_fn=_process_argv, process_start_fn=_process_start,
-                 sleep_fn=time.sleep):
+                 sleep_fn=time.sleep, authority_dir=None, controller_dir=None):
     """Switch only a recognizable existing user unit to the new immutable release."""
     root = Path(__file__).resolve().parent
     releases = Path.home() / ".local/lib/chatgpt-coding-mcp/releases"
@@ -500,6 +589,7 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
     if (not stat.S_ISREG(script_info.st_mode) or script_info.st_uid != os.getuid()
             or stat.S_IMODE(script_info.st_mode) != 0o600 or script_info.st_nlink != 1):
         raise AdminSwitchError("UNSAFE_NEW_RUNTIME")
+    target_admission = _verify_workspace_launch(runtime_path, authority_dir)
     previous, previous_stamp = _validate_override_shape(_override_path())
     old_unit = _read_unit(unit_fn, command_fn)
     old_argv, port = parse_execstart(old_unit, root, releases)
@@ -511,6 +601,10 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
     _assert_effective_unit(unit_fn, command_fn, old_unit)
     argv = list(old_argv)
     argv[1] = str(script)
+    launch_argv = _workspace_admin_command(
+        target_admission, runtime_path, Path(argv[0]), authority_dir, argv[2:],
+        controller_dir,
+    )
     override = _override_path()
     override.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent = override.parent
@@ -519,7 +613,7 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
     except AdminSwitchError:
         raise AdminSwitchError("UNSAFE_ADMIN_OVERRIDE")
     _assert_override(override, previous_stamp)
-    value = ("[Service]\nExecStart=\nExecStart=" + shlex.join(argv) + "\n").encode()
+    value = ("[Service]\nExecStart=\nExecStart=" + shlex.join(launch_argv) + "\n").encode()
     deployed_stamp = _atomic_override(override, value, previous_stamp)
     getter = urlopen_fn or urllib.request.urlopen
     deployed_unit = None
@@ -547,13 +641,23 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
         _assert_effective_unit(unit_fn, command_fn, deployed_unit)
         _assert_process(command_fn, process_argv_fn, process_start_fn,
                         {old_identity: old_argv})
+        current_admission = _verify_workspace_launch(runtime_path, authority_dir)
+        if (_workspace_admin_command(
+                current_admission, runtime_path, Path(argv[0]), authority_dir,
+                argv[2:], controller_dir) != launch_argv):
+            raise AdminSwitchError("WORKSPACE_AUTHORITY_CHANGED")
+        if current_admission["authority_active"]:
+            _transition_workspace_launch(runtime_path, authority_dir)
         command_fn(["systemctl", "--user", "restart", SERVICE])
         _assert_override(override, deployed_stamp)
         _assert_effective_unit(unit_fn, command_fn, deployed_unit)
         identity, current_argv = _process_snapshot(
             command_fn, process_argv_fn, process_start_fn)
+        launch_identity = None
         if current_argv == argv:
             new_identity = identity
+        elif current_argv == launch_argv and current_argv != argv:
+            launch_identity = identity
         elif identity != old_identity or current_argv != old_argv:
             raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
         _assert_effective_unit(unit_fn, command_fn, deployed_unit)
@@ -566,10 +670,21 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
             try:
                 identity, current_argv = _process_snapshot(
                     command_fn, process_argv_fn, process_start_fn)
-                if current_argv != argv:
-                    if identity != old_identity or current_argv != old_argv:
+                if current_argv == launch_argv and current_argv != argv:
+                    if new_identity is not None:
+                        raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
+                    if launch_identity is None:
+                        launch_identity = identity
+                    elif identity != launch_identity:
                         raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
                     raise AdminSwitchError("ADMIN_MAINPID_MISMATCH")
+                if current_argv != argv:
+                    if (launch_identity is not None or identity != old_identity
+                            or current_argv != old_argv):
+                        raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
+                    raise AdminSwitchError("ADMIN_MAINPID_MISMATCH")
+                if launch_identity is not None and identity != launch_identity:
+                    raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
                 if new_identity is None:
                     new_identity = identity
                 elif identity != new_identity:
@@ -607,7 +722,8 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
                 old_unit=old_unit, deployed_unit=deployed_unit, old_argv=old_argv,
                 port=port, command_fn=command_fn, unit_fn=unit_fn,
                 process_argv_fn=process_argv_fn, process_start_fn=process_start_fn,
-                getter=getter, sleep_fn=sleep_fn, allowed_processes=allowed)
+                getter=getter, sleep_fn=sleep_fn, allowed_processes=allowed,
+                authority_dir=authority_dir, controller_dir=controller_dir)
         except BaseException as rollback_error:
             if _is_interruption(cause):
                 cause.rollback_status = "failed"

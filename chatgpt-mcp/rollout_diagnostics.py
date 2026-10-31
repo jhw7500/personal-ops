@@ -35,16 +35,22 @@ _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _TEST_ID = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){2,}\Z")
 _UNITTEST_FAILURE = re.compile(
-    rb"(?:FAIL|ERROR): [A-Za-z_][A-Za-z0-9_]{0,127} "
-    rb"\(([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){2,})\)\r?\Z")
+    rb"(?:FAIL|ERROR): ([A-Za-z_][A-Za-z0-9_]{0,127}) "
+    rb"\(([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\)\r?\Z")
 _UNITTEST_STAGES = frozenset({"checks_targeted", "checks_full", "checks_approval_ui",
+                              "checks_workspace_approval_browser",
                               "checks_schema014_ui", "checks_runtime_rollout_ui",
                               "checks_host_command_ui"})
+_NODE_TEST_STAGE = "checks_workspace_ui"
+_NODE_TEST_FILE = re.compile(r"test_[a-z0-9_]{1,118}\.mjs\Z")
+_NODE_TAP_NOT_OK = re.compile(rb"not ok [1-9][0-9]{0,5} - [^\r\n]{1,300}\r?\Z")
+_NODE_LOCATION_SUFFIX = re.compile(rb":[1-9][0-9]{0,9}:[1-9][0-9]{0,9}\Z")
 _LABEL_FIELDS = {"status", "admin_status", "rollback_status", "catalog_status"}
 _CODE_FIELDS = {"code", "cause_code", "output_code"}
 _DIGEST_FIELDS = {"snapshot", "previous_snapshot", "live_snapshot"}
 _HASH_FIELDS = {"stdout_sha256", "stderr_sha256", "control_sha256", "cgroup_sha256"}
 _TEST_LIST_FIELDS = {"failed_tests"}
+_TEST_FILE_LIST_FIELDS = {"failed_test_files"}
 _BOOL_FIELDS = {"installed", "switched", "tunnel_healthy", "tunnel_id_available",
                 "profile_aligned", "service_aligned", "runtime_verified",
                 "schema_013_applied", "tools_registered", "connector_schemas_verified",
@@ -114,6 +120,11 @@ def _safe_fields(values):
             valid = (isinstance(value, list) and 0 < len(value) <= 32
                      and all(isinstance(item, str) and len(item) <= 300
                              and _TEST_ID.fullmatch(item) for item in value)
+                     and len(value) == len(set(value)))
+        elif key in _TEST_FILE_LIST_FIELDS:
+            valid = (isinstance(value, list) and 0 < len(value) <= 32
+                     and all(isinstance(item, str) and _NODE_TEST_FILE.fullmatch(item)
+                             for item in value)
                      and len(value) == len(set(value)))
         else:
             valid = False
@@ -429,8 +440,53 @@ def _wait_unreaped(process, deadline):
         time.sleep(0.01)
 
 
+def _node_test_inputs(argv):
+    """Return safe basenames keyed by the exact Node --test input bytes."""
+    try:
+        first_input = argv.index("--test") + 1
+    except (AttributeError, ValueError):
+        return {}
+    inputs = {}
+    for value in argv[first_input:]:
+        if not isinstance(value, str) or value.startswith("-"):
+            continue
+        name = Path(value).name
+        encoded = os.fsencode(value)
+        if _NODE_TEST_FILE.fullmatch(name) and len(encoded) <= 480:
+            inputs[encoded] = name
+    return inputs
+
+
+def _node_location_input(line, inputs, *, tap):
+    """Match a Node failure location only to an exact, reviewed argv input."""
+    if tap:
+        prefix, suffix = b"  location: '", b"'"
+    else:
+        prefix, suffix = b"test at ", b""
+    if not line.startswith(prefix) or (suffix and not line.endswith(suffix)):
+        return None
+    location = line[len(prefix):len(line) - len(suffix) if suffix else None]
+    for encoded, name in inputs.items():
+        if location.startswith(encoded):
+            remainder = location[len(encoded):]
+            if _NODE_LOCATION_SUFFIX.fullmatch(remainder):
+                return name
+    return None
+
+
+def _unittest_failure_id(line):
+    match = _UNITTEST_FAILURE.fullmatch(line)
+    if not match:
+        return None
+    method = match.group(1)
+    identifier = match.group(2)
+    if identifier.rsplit(b".", 1)[-1] != method:
+        identifier += b"." + method
+    return identifier.decode("ascii")
+
+
 def run_command(argv, *, stage, timeout, cwd=None, capture=False,
-                max_output=4 * 1024 * 1024, receipt=None):
+                max_output=4 * 1024 * 1024, receipt=None, env=None):
     """Drain both pipes with a size/time bound; persist only safe metadata."""
     if not _LABEL.fullmatch(stage) or timeout <= 0 or max_output <= 0:
         raise ValueError("Invalid bounded rollout command")
@@ -447,13 +503,26 @@ def run_command(argv, *, stage, timeout, cwd=None, capture=False,
     failed_tests = set()
     unittest_tail = b""
     unittest_line_oversize = False
+    node_inputs = _node_test_inputs(argv) if stage == _NODE_TEST_STAGE else {}
+    failed_test_files = set()
+    node_tail = b""
+    node_line_oversize = False
+    node_tap_failure = False
+    node_spec_failures = False
     code = None
     original_error = None
     with selectors.DefaultSelector() as selector:
         try:
-            process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       start_new_session=True)
+            popen_options = {
+                "cwd": cwd,
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "start_new_session": True,
+            }
+            if env is not None:
+                popen_options["env"] = env
+            process = subprocess.Popen(argv, **popen_options)
             for name in sizes:
                 stream = getattr(process, name)
                 os.set_blocking(stream.fileno(), False)
@@ -485,13 +554,33 @@ def run_command(argv, *, stage, timeout, cwd=None, capture=False,
                         while b"\n" in unittest_tail:
                             line, unittest_tail = unittest_tail.split(b"\n", 1)
                             if not unittest_line_oversize and len(line) <= 512:
-                                match = _UNITTEST_FAILURE.fullmatch(line)
-                                if match and len(failed_tests) < 32:
-                                    failed_tests.add(match.group(1).decode("ascii"))
+                                failed_test = _unittest_failure_id(line)
+                                if failed_test and len(failed_tests) < 32:
+                                    failed_tests.add(failed_test)
                             unittest_line_oversize = False
                         if len(unittest_tail) > 512:
                             unittest_tail = b""
                             unittest_line_oversize = True
+                    if node_inputs and name == "stdout":
+                        node_tail += chunk
+                        while b"\n" in node_tail:
+                            line, node_tail = node_tail.split(b"\n", 1)
+                            if not node_line_oversize and len(line) <= 512:
+                                if _NODE_TAP_NOT_OK.fullmatch(line):
+                                    node_tap_failure = True
+                                elif line == b"  ...":
+                                    node_tap_failure = False
+                                elif line == b"\xe2\x9c\x96 failing tests:":
+                                    node_spec_failures = True
+                                elif node_tap_failure or node_spec_failures:
+                                    failed_input = _node_location_input(
+                                        line, node_inputs, tap=node_tap_failure)
+                                    if failed_input and len(failed_test_files) < 32:
+                                        failed_test_files.add(failed_input)
+                            node_line_oversize = False
+                        if len(node_tail) > 512:
+                            node_tail = b""
+                            node_line_oversize = True
                     for marker, category in _OUTPUT_ERRORS:
                         if marker in probe:
                             output_code = category
@@ -504,9 +593,14 @@ def run_command(argv, *, stage, timeout, cwd=None, capture=False,
             returncode = _wait_unreaped(process, deadline)
             if (stage in _UNITTEST_STAGES
                     and unittest_tail and not unittest_line_oversize):
-                match = _UNITTEST_FAILURE.fullmatch(unittest_tail)
-                if match and len(failed_tests) < 32:
-                    failed_tests.add(match.group(1).decode("ascii"))
+                failed_test = _unittest_failure_id(unittest_tail)
+                if failed_test and len(failed_tests) < 32:
+                    failed_tests.add(failed_test)
+            if node_inputs and node_tail and not node_line_oversize:
+                failed_input = _node_location_input(
+                    node_tail, node_inputs, tap=node_tap_failure)
+                if failed_input and len(failed_test_files) < 32:
+                    failed_test_files.add(failed_input)
             return subprocess.CompletedProcess(stage, returncode, bytes(output), b"")
         except BaseException as exc:
             original_error = exc
@@ -532,6 +626,9 @@ def run_command(argv, *, stage, timeout, cwd=None, capture=False,
                 if (failed_tests and process is not None
                         and process.returncode is not None and process.returncode != 0):
                     details["failed_tests"] = sorted(failed_tests)
+                if (failed_test_files and process is not None
+                        and process.returncode is not None and process.returncode != 0):
+                    details["failed_test_files"] = sorted(failed_test_files)
                 failed = code is not None or (process is not None and process.returncode != 0)
                 try:
                     receipt.event(stage, "failed" if failed else "completed", **details)

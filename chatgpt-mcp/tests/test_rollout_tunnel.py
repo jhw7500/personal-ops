@@ -12,6 +12,8 @@ from unittest.mock import patch
 import rollout_tunnel as module
 from rollout_tunnel import (TunnelSwitchError, freeze_live_runtime,
                             preflight_tunnel, switch_tunnel)
+from workspace_authority import WorkspaceAuthority
+from workspace_control import MANDATORY_RELEASE_FILES, install_controller
 
 
 ALIAS = "personal-ops-coding"
@@ -23,6 +25,12 @@ class TunnelRolloutTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name)
+        authority_default = patch(
+            "workspace_control._default_authority_dir",
+            return_value=self.home / "inactive-workspace-authority",
+        )
+        authority_default.start()
+        self.addCleanup(authority_default.stop)
         self.releases = self.home / ".local/lib/chatgpt-coding-mcp/releases"
         self.releases.mkdir(parents=True, mode=0o700)
         self.releases.chmod(0o700)
@@ -55,15 +63,41 @@ class TunnelRolloutTest(unittest.TestCase):
         self.write_profile(self.new)
 
     def make_release(self, server_content):
-        manifest = {"server.py": hashlib.sha256(server_content).hexdigest()}
+        contents = {
+            name: ((server_content if name == "server.py" else
+                    ("fixture:" + name).encode()))
+            for name in MANDATORY_RELEASE_FILES
+        }
+        manifest = {name: hashlib.sha256(content).hexdigest()
+                    for name, content in contents.items()}
         digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:20]
         release = self.releases / digest
         release.mkdir(mode=0o700)
-        (release / "server.py").write_bytes(server_content)
-        (release / "server.py").chmod(0o600)
+        for name, content in contents.items():
+            path = release / name
+            path.write_bytes(content)
+            path.chmod(0o600)
         (release / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
         (release / "manifest.json").chmod(0o600)
         return release
+
+    def activate_authority(self, allowed_releases):
+        project = self.home / "projects/demo"
+        project.mkdir(parents=True, exist_ok=True)
+        authority_dir = self.home / "workspace-authority"
+        authority = WorkspaceAuthority({"demo": project}, authority_dir)
+        authority.initialize("a" * 64, allowed_releases)
+        self.controller_dir = self.home / "workspace-controller"
+        install_controller(
+            self.controller_dir, Path(__file__).resolve().parents[1],
+            projects={"demo": project},
+        )
+        return authority_dir
+
+    @staticmethod
+    def release_digest(release):
+        manifest = json.loads((release / "manifest.json").read_text())
+        return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 
     def write_process(self, pid, ppid, started, argv):
         folder = self.proc / str(pid)
@@ -174,6 +208,35 @@ class TunnelRolloutTest(unittest.TestCase):
         self.assertEqual(plan["profile_data"]["mcp"]["commands"][0]["channel"], "main")
         self.assertFalse(plan["profile_aligned"])
         self.assertFalse(plan["service_aligned"])
+
+    def test_profile_parser_rejects_duplicate_keys_and_nonfinite_values(self):
+        original = self.profile.read_bytes()
+        ambiguous = {
+            "duplicate": original.replace(
+                b'{"config_version": 1',
+                b'{"config_version": 1, "config_version": 1',
+                1,
+            ),
+            "nonfinite": original.replace(
+                b'"config_version": 1', b'"config_version": NaN', 1),
+        }
+        for name, raw in ambiguous.items():
+            with self.subTest(name=name):
+                self.profile.write_bytes(raw)
+                self.profile.chmod(0o600)
+                with self.assertRaisesRegex(
+                        TunnelSwitchError, "UNRECOGNIZED_TUNNEL_PROFILE"):
+                    self.plan()
+
+    def test_profile_semantics_distinguish_boolean_from_integer(self):
+        plan = self.plan()
+        changed = json.loads(self.profile.read_text())
+        changed["config_version"] = True
+        self.profile.write_text(json.dumps(changed, indent=2) + "\n")
+        self.profile.chmod(0o600)
+        state = {"profile": plan["profile_bytes"], "override": plan["override_bytes"]}
+        with self.assertRaisesRegex(TunnelSwitchError, "TUNNEL_CONFIGURATION_CHANGED"):
+            module._assert_resources(plan, state)
 
     def test_preflight_accepts_the_owned_tunnel_client_symlink(self):
         target = self.home / ".local/share/openai-tunnel/v1/tunnel-client"
@@ -428,6 +491,50 @@ class TunnelRolloutTest(unittest.TestCase):
         self.assertEqual(raised.exception.rollback_status, "failed")
         self.assertEqual(self.profile.read_bytes(), operator_profile)
 
+    def test_semantic_profile_reserialization_allows_discovery_failure_rollback(self):
+        plan = self.plan()
+        starts = 0
+
+        def command(argv, **kwargs):
+            nonlocal starts
+            if argv[2:4] == ["stop", SERVICE]:
+                for pid in (4101, 4100, 4201, 4200, 4301, 4300):
+                    if (self.proc / str(pid)).exists():
+                        self.remove_process(pid)
+            elif argv[2:4] == ["start", SERVICE]:
+                starts += 1
+                runtime = self.new if starts == 1 else self.old
+                pid = 4200 if starts == 1 else 4300
+                self.write_process(pid, 1, 300 + starts, [str(self.client), "daemon"])
+                self.write_process(pid + 1, pid, 400 + starts,
+                                   [str(self.interpreter), str(runtime / "server.py")])
+                self.status["process"]["pid"] = pid
+                profile = json.loads(self.profile.read_text())
+                self.profile.write_text(json.dumps(profile, indent=2) + "\n")
+                self.profile.chmod(0o600)
+            return b""
+
+        def discovery_failure(_):
+            raise TunnelSwitchError("DISCOVERY_FAILED")
+
+        with self.assertRaises(TunnelSwitchError) as raised:
+            switch_tunnel(
+                self.new, interpreter=self.interpreter,
+                status_fn=lambda: self.status, command_fn=command, plan=plan,
+                releases=self.releases, proc_root=self.proc,
+                approved_interpreters=(self.interpreter,), sleep_fn=lambda _: None,
+                attempts=1, poll_timeout=5, verify_fn=discovery_failure,
+            )
+        self.assertEqual(raised.exception.code, "TUNNEL_SWITCH_FAILED")
+        self.assertEqual(raised.exception.cause_code, "DISCOVERY_FAILED")
+        self.assertEqual(raised.exception.rollback_status, "succeeded")
+        self.assertEqual(starts, 2)
+        restored = json.loads(self.profile.read_text())
+        self.assertEqual(
+            restored["mcp"]["commands"][0]["command"],
+            f"{self.interpreter} {self.old / 'server.py'}",
+        )
+
     def test_operator_override_change_during_failure_is_not_overwritten(self):
         plan = self.plan()
         operator_override = None
@@ -611,6 +718,10 @@ class TunnelRolloutTest(unittest.TestCase):
 
     def test_verification_callback_failure_rolls_back_before_returning(self):
         plan = self.plan()
+        authority_dir = self.activate_authority({
+            self.release_digest(self.old): 1,
+            self.release_digest(self.new): 2,
+        })
         starts = 0
 
         def command(argv, **kwargs):
@@ -641,12 +752,75 @@ class TunnelRolloutTest(unittest.TestCase):
                 releases=self.releases, proc_root=self.proc,
                 approved_interpreters=(self.interpreter,), sleep_fn=lambda _: None,
                 attempts=1, poll_timeout=5,
+                authority_dir=authority_dir, controller_dir=self.controller_dir,
                 verify_fn=lambda actual: (_ for _ in ()).throw(
                     RuntimeError("TOOL_CATALOG_MISMATCH")))
         self.assertEqual(raised.exception.code, "TUNNEL_SWITCH_FAILED")
         self.assertEqual(raised.exception.cause_code, "TOOL_CATALOG_MISMATCH")
         self.assertEqual(raised.exception.rollback_status, "succeeded")
         self.assertEqual(starts, 2)
+        authority = WorkspaceAuthority(
+            {"demo": self.home / "projects/demo"}, authority_dir,
+        )
+        self.assertEqual(authority.binding("a" * 64)["authority_epoch"], 3)
+
+    def test_active_authority_blocks_unreviewed_target_before_service_actions(self):
+        plan = self.plan()
+        authority_dir = self.activate_authority({self.release_digest(self.old): 1})
+        calls = []
+
+        with self.assertRaises(TunnelSwitchError) as raised:
+            switch_tunnel(
+                self.new, interpreter=self.interpreter,
+                status_fn=lambda: self.status, command_fn=lambda argv, **_: calls.append(argv),
+                plan=plan, releases=self.releases, proc_root=self.proc,
+                approved_interpreters=(self.interpreter,), authority_dir=authority_dir,
+                controller_dir=self.controller_dir)
+        self.assertEqual(raised.exception.code, "WORKSPACE_RELEASE_UNLISTED")
+        self.assertEqual(calls, [])
+
+    def test_active_launcher_command_pins_admitted_authority_path(self):
+        authority_dir = self.activate_authority({self.release_digest(self.new): 1})
+        command = module._workspace_command(
+            {"authority_active": True, "authority_dir": str(authority_dir)},
+            self.new, self.interpreter, None, self.controller_dir,
+        )
+
+        index = command.index("--authority-dir")
+        self.assertEqual(command[index + 1], str(authority_dir))
+
+    def test_active_authority_never_starts_prohibited_rollback_runtime(self):
+        plan = self.plan()
+        authority_dir = self.activate_authority({self.release_digest(self.new): 2})
+        starts = 0
+
+        def command(argv, **kwargs):
+            nonlocal starts
+            if argv[2:4] == ["stop", SERVICE]:
+                for pid in (4101, 4201, 4100, 4200):
+                    if (self.proc / str(pid)).exists():
+                        self.remove_process(pid)
+            elif argv[2:4] == ["start", SERVICE]:
+                starts += 1
+                self.write_process(4200, 1, 500, [str(self.client), "daemon"])
+                self.write_process(4201, 4200, 501,
+                                   [str(self.interpreter), str(self.new / "server.py")])
+                self.status["process"]["pid"] = 4200
+            return b""
+
+        with self.assertRaises(TunnelSwitchError) as raised:
+            switch_tunnel(
+                self.new, interpreter=self.interpreter,
+                status_fn=lambda: self.status, command_fn=command, plan=plan,
+                releases=self.releases, proc_root=self.proc,
+                approved_interpreters=(self.interpreter,), sleep_fn=lambda _: None,
+                attempts=1, poll_timeout=5, authority_dir=authority_dir,
+                controller_dir=self.controller_dir,
+                verify_fn=lambda _: (_ for _ in ()).throw(
+                    RuntimeError("TOOL_CATALOG_MISMATCH")))
+        self.assertEqual(raised.exception.code, "TUNNEL_ROLLBACK_FAILED")
+        self.assertEqual(raised.exception.cause_code, "TOOL_CATALOG_MISMATCH")
+        self.assertEqual(starts, 1)
 
     def test_same_snapshot_successor_after_verification_is_not_stopped(self):
         plan = self.plan()

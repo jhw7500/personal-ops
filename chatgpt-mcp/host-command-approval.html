@@ -67,7 +67,7 @@
     const HEX32 = /^[0-9a-f]{32}$/;
     const HEX64 = /^[0-9a-f]{64}$/;
     const PROFILE = /^[a-z][a-z0-9_-]{0,62}$/;
-    const EFFECTS = new Set(["read_only", "build", "external_publish"]);
+    const EFFECTS = new Set(["read_only", "build", "external_publish", "external_call"]);
     const STATES = new Set(["pending", "approved", "cancelled"]);
     const FORBIDDEN_PLAN_KEYS = new Set([
       "argv", "cwd", "cwd_relative", "executable", "approval_url", "approval_command",
@@ -222,6 +222,7 @@
 
     function effectText(effect) {
       if (effect === "external_publish") return "TEST 업로드 · 외부 게시";
+      if (effect === "external_call") return "외부 API 호출 · 비용 발생 가능";
       if (effect === "build") return "빌드 · 로컬 산출물 생성";
       return "읽기 전용";
     }
@@ -233,6 +234,7 @@
         element["warning-title"].textContent = "승인하면 고정된 명령 실행을 시작합니다.";
         element["warning-detail"].textContent = card.effect === "external_publish" ?
           "한 번의 클릭으로 승인 후 TEST 업로드와 외부 게시를 즉시 시작합니다." :
+          card.effect === "external_call" ? "한 번의 클릭으로 승인 후 외부 API 호출을 시작하며 비용이 발생할 수 있습니다." :
           card.effect === "build" ? "한 번의 클릭으로 승인 후 빌드와 로컬 산출물 생성을 즉시 시작합니다." :
           "한 번의 클릭으로 승인 후 읽기 전용 명령을 즉시 시작합니다.";
       } else {

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -30,13 +31,19 @@ from host_runtime_config import (
     validate_state_root, extended_enabled, predecessor_enabled, is_registered_config,
     read_config,
 )
+from workspace_host import (
+    acquire_host_operation_lane, complete_host_operation, resolve_workspace,
+)
+from workspace_control import WorkspaceControlError, activation_admission
 
-PLAN_TTL_SECONDS = 10 * 60
+PLAN_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_OPERATIONS = 1000
 ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 REQUEST_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
 TERMINAL = {"succeeded", "failed", "rejected", "expired", "outcome_unknown"}
 TARGET_AUTHORIZATION_COMPONENTS = ("api", "worker", "migration", "predecessor_migration")
+_LOGGER = logging.getLogger(__name__)
+_RESERVATION_RELEASE_FAILED = "WORKSPACE_HOST_RESERVATION_RELEASE_FAILED"
 
 
 # Every module the host managers import plus the approval web assets, pinned against the
@@ -64,7 +71,14 @@ VERIFIED_RUNTIME_FILES = (
     "host_access.py", "host_execution.py", "host_execution_tools.py", "host_agent.py",
     "host-access-admin.js", "host_access_ui.py", "host-access-approval.html",
     "host_operation_ui.py", "host-operation-approval.html",
+    "host_test_approval_ui.py", "host-test-plan-approval.html",
+    "host_registered_approval_ui.py", "host-registered-approval.html",
+    "git_approval_ui.py", "git-approval.html",
+          "git_commit_access.py", "git_commit_access_policy.py", "git-commit-access-approval.html",
     "host_command_ui.py", "host-command-approval.html",
+    "workspace_paths.py", "workspace_policy.py", "workspace_authority.py",
+    "workspace_files.py", "workspace_jobs.py", "workspace_tools.py", "workspace_host.py",
+    "workspace_control.py", "workspace-launcher.py", "workspace-access-approval.html",
     "work-dashboard/model.js", "work-dashboard/motion.js", "work-dashboard/pixels.js",
     "work-dashboard/visualizer.js", "work-dashboard/visualizer.css",
 )
@@ -253,7 +267,7 @@ def _identity(snapshot):
 
 class HostRuntimeOperations:
     def __init__(self, projects, *, state_dir=None, config_path=None, runtime=None,
-                 approval_script=None):
+                 approval_script=None, workspace=None):
         self.projects = projects
         self.state_dir = validate_state_root(state_dir or default_state_dir(), projects)
         self.operations_dir = private_dir(self.state_dir / "operations")
@@ -264,6 +278,11 @@ class HostRuntimeOperations:
         self.target_lock_path = self.state_dir / "target.lock"
         self.attestation_path = self.state_dir / "deployed-attestation.json"
         self.runtime = runtime or HostRuntime(projects, config_path=config_path)
+        self.workspace = resolve_workspace(projects, workspace)
+        authority = getattr(self.workspace, "authority", None)
+        self.activation_authority_dir = Path(
+            getattr(authority, "state_dir", self.state_dir.parent / "workspace-authority")
+        ).absolute()
         self.approval_script = Path(approval_script or Path(__file__).with_name("approve-host-operation.py"))
         # Test fixtures may inject BOTH a fake runtime and a synthetic
         # approval helper. Passing approval_script alone (as the real host
@@ -813,7 +832,46 @@ class HostRuntimeOperations:
             raise HostRuntimeError("PLAN_EXPIRED")
         return context
 
+    def _retire_static_stale_pending(self, state, root):
+        if state["state"] != "pending_host_approval":
+            return False
+        context = self.context_dir / state["operation_id"]
+        if state["immutable"].get("source_review") is not None:
+            context /= "source"
+        expected = state["immutable"]["source_digest"]
+        current = source_inventory(root)
+        pinned = source_inventory(context)
+        if current["digest"] == expected and pinned["digest"] == expected:
+            if git_state(root)["head"] == state["immutable"]["git_head"]:
+                return False
+        state.update(state="expired", phase="APPROVAL", code="STALE_PLAN",
+                     finished_at=utc_now())
+        self._save(state)
+        (self.operations_dir / (state["operation_id"] + ".approval.json")).unlink(
+            missing_ok=True)
+        return True
+
+    def _verify_pending_or_retire(self, state):
+        try:
+            return self._verify(state["immutable"])
+        except HostRuntimeError as exc:
+            if exc.code == "STALE_PLAN" and state["state"] == "pending_host_approval":
+                state.update(state="expired", phase="APPROVAL", code="STALE_PLAN",
+                             finished_at=utc_now())
+                self._save(state)
+                (self.operations_dir / (state["operation_id"] + ".approval.json")).unlink(
+                    missing_ok=True)
+            raise
+
     def prepare(self, project, target, component, mode, request_id):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._prepare_activation_admitted(
+                    project, target, component, mode, request_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _prepare_activation_admitted(self, project, target, component, mode, request_id):
         self._require_trusted_runtime()
         root = self.runtime.guard(project, target)
         reviewed = self._registered_reviewed_snapshot(project, target)
@@ -860,6 +918,9 @@ class HostRuntimeOperations:
                         existing.update(state="expired", code="PLAN_EXPIRED",
                                         phase="APPROVAL", finished_at=utc_now())
                         _save_private_json(path, existing)
+                    elif (status == "pending_host_approval"
+                          and self._retire_static_stale_pending(existing, root)):
+                        continue
                     elif status in {"approved", "queued", "running"} and not self._target_lock_busy():
                         existing.update(state="outcome_unknown", code="PROCESS_INTERRUPTED",
                                         phase="RECOVER", finished_at=utc_now())
@@ -1016,7 +1077,7 @@ class HostRuntimeOperations:
             state = self._load(project, target, operation_id)
             if state["state"] != "pending_host_approval":
                 raise HostRuntimeError("NOT_PENDING_APPROVAL")
-            self._verify(state["immutable"])
+            self._verify_pending_or_retire(state)
             immutable = state["immutable"]
             expected_digest = state["plan_digest"]
 
@@ -1067,7 +1128,7 @@ class HostRuntimeOperations:
             if (state["state"] != "pending_host_approval"
                     or state["plan_digest"] != expected_digest):
                 raise HostRuntimeError("STALE_PLAN")
-            self._verify(immutable)
+            self._verify_pending_or_retire(state)
             receipt = self.operations_dir / (operation_id + ".approval.json")
             fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "w") as stream:
@@ -1093,6 +1154,16 @@ class HostRuntimeOperations:
         receipt.unlink()
 
     async def execute(self, project, target, operation_id, *, expected_component=None):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return await self._execute_activation_admitted(
+                    project, target, operation_id,
+                    expected_component=expected_component)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    async def _execute_activation_admitted(self, project, target, operation_id, *,
+                                           expected_component=None):
         self._require_trusted_runtime()
         with _lock(self.lock_path):
             state = self._load(project, target, operation_id)
@@ -1102,13 +1173,29 @@ class HostRuntimeOperations:
             if state["state"] in {"queued", "running", "succeeded", "failed",
                                   "outcome_unknown", "rejected", "expired"}:
                 return self._result(state)
-        with host_admission(self.state_dir.parent):
-            return await self._execute_admitted(
-                project, target, operation_id, expected_component=expected_component)
+        workspace_fd = await asyncio.to_thread(
+            acquire_host_operation_lane, self.workspace,
+            operation_id=operation_id, kind="host-runtime")
+        handed_to_worker = False
+        try:
+            with host_admission(self.state_dir.parent):
+                result = await self._execute_admitted(
+                    project, target, operation_id, expected_component=expected_component,
+                    workspace_fd=workspace_fd)
+                handed_to_worker = result.get("state") == "queued"
+                return result
+        finally:
+            if not handed_to_worker:
+                complete_host_operation(
+                    self.workspace, operation_id, "host-runtime",
+                    termination_verified=True)
+            if workspace_fd is not None:
+                os.close(workspace_fd)
 
-    async def _execute_admitted(self, project, target, operation_id, *, expected_component=None):
+    async def _execute_admitted(self, project, target, operation_id, *, expected_component=None,
+                                workspace_fd=None):
         self._require_trusted_runtime()
-        target_fd = None
+        target_fd = worker_workspace_fd = None
         try:
             with _lock(self.lock_path):
                 state = self._load(project, target, operation_id)
@@ -1123,7 +1210,9 @@ class HostRuntimeOperations:
                 # Own the cross-process target lock before declaring the job
                 # queued. Another MCP process must not mark it interrupted.
                 target_fd = self._acquire_target_lock()
-                self._verify(state["immutable"])
+                self._verify_pending_or_retire(state)
+                if workspace_fd is not None:
+                    worker_workspace_fd = os.dup(workspace_fd)
                 target_authorized = (state["immutable"].get(
                     "authorization", {"mode": "per_operation"}).get("mode") == "target")
                 if target_authorized:
@@ -1140,15 +1229,20 @@ class HostRuntimeOperations:
                                  started_at=utc_now())
                     self._save(state)
             work = asyncio.create_task(
-                asyncio.to_thread(self._run_deploy, operation_id, target_fd))
+                asyncio.to_thread(
+                    self._run_deploy_with_lanes,
+                    operation_id, target_fd, worker_workspace_fd))
             work.operation_id = operation_id
             self._tasks.add(work)
             work.add_done_callback(self._tasks.discard)
             target_fd = None  # The worker owns this file descriptor.
+            worker_workspace_fd = None
             return self._result(state)
         finally:
             if target_fd is not None:
                 os.close(target_fd)
+            if worker_workspace_fd is not None:
+                os.close(worker_workspace_fd)
 
     def _record(self, operation_id, **updates):
         with _lock(self.lock_path):
@@ -1162,6 +1256,32 @@ class HostRuntimeOperations:
             self._run_deploy_body(operation_id)
         finally:
             os.close(target_lock_fd)
+
+    def _run_deploy_with_lanes(self, operation_id, target_lock_fd, workspace_fd):
+        try:
+            self._run_deploy(operation_id, target_lock_fd)
+        finally:
+            try:
+                try:
+                    terminal = self._load(PROJECT, TARGET, operation_id)
+                    if terminal["state"] in {"succeeded", "failed", "rejected"}:
+                        complete_host_operation(
+                            self.workspace, operation_id, "host-runtime",
+                            termination_verified=True)
+                except (HostRuntimeError, OSError):
+                    self._record_reservation_release_failure(operation_id)
+            finally:
+                if workspace_fd is not None:
+                    os.close(workspace_fd)
+
+    def _record_reservation_release_failure(self, operation_id):
+        _LOGGER.error(_RESERVATION_RELEASE_FAILED)
+        try:
+            self._record(
+                operation_id, state="outcome_unknown", phase="RECOVER",
+                code=_RESERVATION_RELEASE_FAILED, finished_at=utc_now())
+        except (HostRuntimeError, OSError):
+            _LOGGER.error("WORKSPACE_HOST_RESERVATION_STATE_WRITE_FAILED")
 
     def _run_deploy_body(self, operation_id):
         phase = "PRECHECK"
@@ -1295,7 +1415,12 @@ class HostRuntimeOperations:
             phase = "POSTCHECK"
             self._record(operation_id, phase=phase)
             after = self.runtime.identities()
-            self.runtime._verify_identity(after, expected_mode=immutable["mode"], health=True)
+            # Worker-only plans use disabled for Compose admission but preserve the
+            # existing API (possibly toss-demo). The unchanged API container identity
+            # is checked below; do not mistake that API mode for a Worker failure.
+            self.runtime._verify_identity(
+                after, expected_mode=immutable["mode"] if component == "api" else None,
+                health=True)
             if (after[component]["image_id"] != built_image
                     or any(_identity(after)[key] != immutable["identities"][key]
                            for key in ("api", "worker", "db") if key != component)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 from pathlib import Path
 import re
 
@@ -79,8 +80,8 @@ HOST_REGISTERED_TOOL_SPECS = [
           {"target": _TARGET, "area": {"type": "string", "enum": list(INSPECT_ADAPTERS)}},
           readonly=True),
     _tool("prepare_host_operation", "호스트 작업 승인 계획",
-          "Freeze inputs and target identity into a plan that expires in 10 minutes and "
-          "return its admin-web approval link. Runs no Docker or SQL. The same request_id "
+          "Freeze inputs and target identity into a plan that expires in 7 days and "
+          "return a frozen plan; open_registered_host_approval shows its in-chat card. Runs no Docker or SQL. The same request_id "
           "with the same input returns the same plan.",
           {"target": _TARGET, "action": {"type": "string", "enum": list(ACTIONS)},
            "parameters": _PARAMETERS, "request_id": _REQUEST},
@@ -99,11 +100,11 @@ HOST_REGISTERED_TOOL_SPECS = [
 ]
 
 
-def create_registered_manager(projects, state_dir=None):
+def create_registered_manager(projects, state_dir=None, workspace=None):
     """Production wiring: no injected runner or adapter, so trust requires the verified
     immutable installation."""
     return RegisteredHostOperations(projects, HostTargetRegistry(projects, CONFIG_PATH),
-                                    state_dir=state_dir)
+                                    state_dir=state_dir, workspace=workspace)
 
 
 def public_code(error) -> str:
@@ -161,16 +162,25 @@ class RegisteredHostTools:
     """Routes the registered tools. The manager is built lazily, so a broken host config
     closes only the registered scope and is retried on the next call."""
 
-    def __init__(self, projects, state_dir, project_locks):
+    def __init__(self, projects, state_dir, project_locks, workspace=None):
         self.projects = projects
         self.state_dir = Path(state_dir)
         self.project_locks = project_locks
         self.names = {spec["name"] for spec in HOST_REGISTERED_TOOL_SPECS}
         self._manager = None
+        self.workspace = workspace
 
     def manager(self):
         if self._manager is None:
-            self._manager = create_registered_manager(self.projects, self.state_dir)
+            factory_accepts_workspace = "workspace" in inspect.signature(
+                create_registered_manager).parameters
+            if self.workspace is None or not factory_accepts_workspace:
+                self._manager = create_registered_manager(self.projects, self.state_dir)
+                if self.workspace is not None:
+                    self._manager.workspace = self.workspace
+            else:
+                self._manager = create_registered_manager(
+                    self.projects, self.state_dir, workspace=self.workspace)
         return self._manager
 
     def registered_operation_path(self, operation_id) -> Path:

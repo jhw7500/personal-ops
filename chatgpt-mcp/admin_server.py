@@ -955,6 +955,11 @@ def create_server(projects, state_dir, token_path=TOKEN_PATH, port=8765, public_
 
 
 def main():
+    from workspace_control import WorkspaceControlError, verify_launch
+    try:
+        verify_launch(Path(__file__).resolve().parent)
+    except WorkspaceControlError:
+        raise SystemExit(126) from None
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=CONFIG)
     parser.add_argument('--port', type=int, default=8765)

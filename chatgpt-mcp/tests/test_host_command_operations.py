@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -16,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from host_command_operations import HostCommandOperations  # noqa: E402
 from host_runtime_operations import acquire_flock  # noqa: E402
 from host_runtime_config import HostRuntimeError  # noqa: E402
+from workspace_host import publication_lane  # noqa: E402
+from workspace_tools import WorkspaceTools  # noqa: E402
 
 
 def digest(data):
@@ -69,6 +72,22 @@ class HostCommandOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.config.write_text(json.dumps(self.config_data))
         self.config.chmod(0o600)
 
+    def active_workspace(self):
+        owner = self.root / "workspace-owner"
+        owner.mkdir(mode=0o700)
+        policy = owner / "policy.json"
+        policy.write_text(json.dumps({
+            "version": 1, "base_root": str(self.root),
+            "artifacts": [], "protected_paths": [],
+        }), encoding="utf-8")
+        policy.chmod(0o600)
+        workspace = WorkspaceTools(
+            {"tossApp": self.project}, state_dir=self.root / "workspace-authority",
+            config_path=policy)
+        snapshot = workspace.policy.load(required=True)
+        workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
+        return workspace
+
     def err(self, code, call):
         with self.assertRaises(HostRuntimeError) as x:
             call()
@@ -83,6 +102,27 @@ class HostCommandOperationsTests(unittest.IsolatedAsyncioTestCase):
             plan_digest=p["plan_digest"], source_digest=p["source_digest"],
             confirmation=p["operation_id"],
         )
+
+    def test_pending_plan_can_be_approved_six_days_after_creation(self):
+        import host_command_operations
+
+        plan = self.plan("six-day-approval")
+        created = datetime.fromisoformat(plan["created_at"])
+        with mock.patch.object(
+                host_command_operations, "_now", return_value=created + timedelta(days=6)):
+            approved = self.approve(plan)
+        self.assertTrue(approved["approved"])
+        self.assertEqual(self.ops.get("tossApp", plan["operation_id"])["state"], "approved")
+
+    def test_pending_plan_expires_exactly_seven_days_after_creation(self):
+        import host_command_operations
+
+        plan = self.plan("seven-day-expiry")
+        created = datetime.fromisoformat(plan["created_at"])
+        with mock.patch.object(
+                host_command_operations, "_now", return_value=created + timedelta(days=7)):
+            self.err("PLAN_EXPIRED", lambda: self.approve(plan))
+        self.assertFalse(self.ops._receipt_path(plan["operation_id"]).exists())
 
     async def terminal(self, op_id):
         for _ in range(100):
@@ -132,6 +172,52 @@ class HostCommandOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runner.calls, 1)
         self.assertFalse(self.ops._receipt_path(p["operation_id"]).exists())
 
+    async def test_workspace_lane_covers_runner_and_unverified_termination(self):
+        workspace = self.active_workspace()
+        entered = threading.Event()
+        release = threading.Event()
+        def unverified(_frozen, _cancel):
+            entered.set()
+            release.wait(3)
+            return {**self.runner.output, "termination_verified": False}
+        self.ops = HostCommandOperations(
+            {"tossApp": self.project}, config_path=self.config,
+            state_dir=self.root / "workspace-command-state", runner=unverified,
+            test_only=True, workspace=workspace)
+        p = self.plan("workspace-lane")
+        self.approve(p)
+        await self.ops.execute("tossApp", p["operation_id"])
+        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+        with self.assertRaises(HostRuntimeError) as caught:
+            with publication_lane(workspace):
+                pass
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+        release.set()
+        done = await self.terminal(p["operation_id"])
+        self.assertEqual(done["state"], "outcome_unknown")
+        with self.assertRaises(HostRuntimeError):
+            with publication_lane(workspace):
+                pass
+        self.ops._finish_scope = lambda _identity: None
+        self.ops.cancel("tossApp", p["operation_id"])
+        with publication_lane(workspace):
+            pass
+
+    async def test_busy_publication_lane_does_not_consume_command_approval(self):
+        workspace = self.active_workspace()
+        self.ops = HostCommandOperations(
+            {"tossApp": self.project}, config_path=self.config,
+            state_dir=self.root / "busy-command-state", runner=self.runner,
+            test_only=True, workspace=workspace)
+        plan = self.plan("busy-lane")
+        self.approve(plan)
+        with publication_lane(workspace):
+            with self.assertRaises(HostRuntimeError) as caught:
+                await self.ops.execute("tossApp", plan["operation_id"])
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+        self.assertTrue(self.ops._receipt_path(plan["operation_id"]).exists())
+        self.assertEqual(self.ops.get("tossApp", plan["operation_id"])["state"], "approved")
+
     def test_wrong_approval_digests_confirmation_and_source_drift(self):
         p = self.plan()
         kw = {"operation_id": p["operation_id"], "plan_digest": p["plan_digest"],
@@ -152,6 +238,46 @@ class HostCommandOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.err("HOST_COMMAND_INPUT_CHANGED", lambda: self.ops._begin("tossApp", p["operation_id"]))
         self.assertEqual(self.runner.calls, 0)
         self.assertEqual(self.ops.get("tossApp", p["operation_id"])["state"], "approved")
+
+    def test_new_prepare_retires_stale_unstarted_approved_command(self):
+        old = self.plan("stale-approved-command")
+        self.approve(old)
+        receipt = self.ops._receipt_path(old["operation_id"])
+        self.assertTrue(receipt.is_file())
+        self.artifact.write_bytes(b"CHANGED-BEFORE-EXECUTION")
+        self.config_data["profiles"]["test-upload"]["inputs"]["build/out.ait"] = digest(
+            self.artifact.read_bytes())
+        self.save_config()
+
+        replacement = self.plan("replacement-after-input-drift")
+
+        retired = self.ops.get("tossApp", old["operation_id"])
+        self.assertEqual((retired["state"], retired["phase"], retired["code"]),
+                         ("expired", "APPROVAL", "HOST_COMMAND_PLAN_STALE"))
+        self.assertFalse(receipt.exists())
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+        self.err("PLAN_EXPIRED", lambda: self.approve(old))
+        self.assertEqual(self.ops._begin("tossApp", old["operation_id"])["state"], "expired")
+        self.assertEqual(self.runner.calls, 0)
+
+    def test_new_prepare_keeps_unchanged_approved_command_blocking(self):
+        old = self.plan("unchanged-approved-command")
+        self.approve(old)
+        self.err("HOST_COMMAND_PROJECT_BUSY",
+                 lambda: self.plan("must-remain-blocked"))
+        self.assertEqual(self.ops.get("tossApp", old["operation_id"])["state"], "approved")
+
+    def test_new_prepare_does_not_retire_command_when_staleness_check_is_uncertain(self):
+        old = self.plan("uncertain-command-check")
+        self.approve(old)
+        receipt = self.ops._receipt_path(old["operation_id"])
+        with mock.patch.object(
+                self.ops.profiles, "verify_frozen",
+                side_effect=HostRuntimeError("HOST_COMMAND_CONFIG_UNAVAILABLE")):
+            self.err("HOST_COMMAND_CONFIG_UNAVAILABLE",
+                     lambda: self.plan("uncertain-command-replacement"))
+        self.assertEqual(self.ops.get("tossApp", old["operation_id"])["state"], "approved")
+        self.assertTrue(receipt.is_file())
 
     async def test_changed_input_after_effect_is_outcome_unknown(self):
         p = self.plan()

@@ -19,6 +19,9 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
+from workspace_control import (DEFAULT_CONTROLLER_DIR, WorkspaceControlError,
+                               transition_release, verify_controller, verify_launch)
+
 
 ALIAS = "personal-ops-coding"
 SERVICE = "personal-ops-tunnel.service"
@@ -155,6 +158,36 @@ def _verify_runtime(runtime, releases=RELEASE_ROOT) -> dict:
             raise TunnelSwitchError("RUNTIME_MANIFEST_MISMATCH")
     return {"snapshot": runtime.name, "runtime": runtime,
             "server": runtime / "server.py"}
+
+
+def _verify_workspace_launch(runtime, authority_dir=None) -> dict:
+    try:
+        return verify_launch(runtime, authority_dir)
+    except WorkspaceControlError as exc:
+        raise TunnelSwitchError(exc.code) from exc
+
+
+def _transition_workspace_launch(runtime, authority_dir=None) -> dict:
+    try:
+        return transition_release(runtime, authority_dir)
+    except WorkspaceControlError as exc:
+        raise TunnelSwitchError(exc.code) from exc
+
+
+def _workspace_command(admission, runtime, interpreter, authority_dir,
+                       controller_dir=None, entrypoint="server.py") -> list[str]:
+    if not admission["authority_active"]:
+        return [str(interpreter), str(runtime / entrypoint)]
+    try:
+        controller = verify_controller(controller_dir or DEFAULT_CONTROLLER_DIR)
+    except WorkspaceControlError as exc:
+        raise TunnelSwitchError(exc.code) from exc
+    return [
+        str(interpreter), controller["launcher"],
+        "--authority-dir", admission["authority_dir"],
+        "--release", str(runtime), "--interpreter", str(interpreter),
+        "--entrypoint", entrypoint,
+    ]
 
 
 def _process_identity(proc_root: Path, pid: int) -> tuple[int, int]:
@@ -332,8 +365,18 @@ def _parse_unit(unit_text: str, client: Path, profile_path: Path) -> dict:
 
 
 def _parse_profile(raw: bytes) -> dict:
+    def exact_object(pairs):
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError("duplicate JSON key")
+        return value
+
+    def reject_constant(_):
+        raise ValueError("non-finite JSON number")
+
     try:
-        data = json.loads(raw)
+        data = json.loads(
+            raw, object_pairs_hook=exact_object, parse_constant=reject_constant)
     except (UnicodeDecodeError, ValueError, TypeError) as exc:
         raise TunnelSwitchError("UNRECOGNIZED_TUNNEL_PROFILE") from exc
     if not isinstance(data, dict) or set(data) != _PROFILE_KEYS:
@@ -349,6 +392,13 @@ def _parse_profile(raw: bytes) -> dict:
             or not isinstance(commands[0]["command"], str)):
         raise TunnelSwitchError("UNRECOGNIZED_TUNNEL_PROFILE")
     return data
+
+
+def _canonical_profile(raw: bytes) -> bytes:
+    return json.dumps(
+        _parse_profile(raw), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    ).encode()
 
 
 def _validate_override(raw: bytes) -> None:
@@ -384,16 +434,33 @@ def _validate_mcp_command(command: str, releases: Path, approved_interpreters=No
         argv = shlex.split(command)
     except ValueError as exc:
         raise TunnelSwitchError("UNRECOGNIZED_MCP_COMMAND") from exc
-    if len(argv) != 2:
+    if not argv:
         raise TunnelSwitchError("UNRECOGNIZED_MCP_COMMAND")
     interpreter = Path(argv[0])
     if interpreter.is_absolute():
         _approved_interpreter(interpreter, approved_interpreters)
     elif not allow_bare or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", argv[0]):
         raise TunnelSwitchError("UNRECOGNIZED_MCP_COMMAND")
-    runtime = _verify_runtime(Path(argv[1]).parent, releases)
-    if Path(argv[1]) != runtime["server"]:
+    if len(argv) == 2:
+        runtime = _verify_runtime(Path(argv[1]).parent, releases)
+        if Path(argv[1]) != runtime["server"]:
+            raise TunnelSwitchError("UNRECOGNIZED_MCP_COMMAND")
+        return
+    if (len(argv) != 10 or argv[2] != "--authority-dir" or argv[4] != "--release"
+            or argv[6] != "--interpreter" or argv[8:]
+            != ["--entrypoint", "server.py"]
+            or Path(argv[7]) != interpreter):
         raise TunnelSwitchError("UNRECOGNIZED_MCP_COMMAND")
+    try:
+        controller = verify_controller(Path(argv[1]).parent)
+        if controller["launcher"] != argv[1]:
+            raise WorkspaceControlError("UNSAFE_WORKSPACE_CONTROLLER")
+        admission = verify_launch(argv[5], argv[3])
+    except WorkspaceControlError as exc:
+        raise TunnelSwitchError(exc.code) from exc
+    if not admission["authority_active"]:
+        raise TunnelSwitchError("UNRECOGNIZED_MCP_COMMAND")
+    _verify_runtime(Path(argv[5]), releases)
 
 
 def _read_unit(unit_fn) -> bytes:
@@ -487,8 +554,8 @@ def _cas_ok(plan) -> None:
         raise TunnelSwitchError("TUNNEL_CONFIGURATION_CHANGED")
 
 
-def _target_bytes(plan, interpreter: Path, server: Path) -> tuple[bytes, bytes, list[str]]:
-    command = shlex.join([str(interpreter), str(server)])
+def _target_bytes(plan, command_argv) -> tuple[bytes, bytes, list[str]]:
+    command = shlex.join(command_argv)
     profile = json.loads(json.dumps(plan["profile_data"]))
     profile["mcp"]["commands"][0]["command"] = command
     profile_bytes = json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
@@ -507,8 +574,8 @@ def _cas_write(path: Path, expected: bytes | None, value: bytes | None) -> None:
         _atomic_write(path, value)
 
 
-def _write_target(plan, state, interpreter: Path, server: Path) -> list[str]:
-    profile, override, argv = _target_bytes(plan, interpreter, server)
+def _write_target(plan, state, command_argv) -> list[str]:
+    profile, override, argv = _target_bytes(plan, command_argv)
     parent = plan["override_path"].parent
     if not parent.exists():
         parent.mkdir(mode=0o700)
@@ -633,9 +700,16 @@ def _wait_runtime(status_fn, snapshot: str, interpreter: Path, releases: Path,
 
 
 def _assert_resources(plan, state) -> None:
-    if (_current_file(plan["profile_path"]) != state["profile"]
-            or _current_override(plan) != state["override"]):
+    current_profile = _current_file(plan["profile_path"])
+    try:
+        profile_matches = (current_profile is not None
+                           and _canonical_profile(current_profile)
+                           == _canonical_profile(state["profile"]))
+    except (TunnelSwitchError, TypeError, ValueError):
+        profile_matches = False
+    if (not profile_matches or _current_override(plan) != state["override"]):
         raise TunnelSwitchError("TUNNEL_CONFIGURATION_CHANGED")
+    state["profile"] = current_profile
 
 
 def _assert_unit_argv(plan, expected) -> None:
@@ -684,12 +758,18 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
                   unit_fn=None, profile_path=PROFILE, override_path=OVERRIDE,
                   releases=RELEASE_ROOT, client=None, proc_root=Path("/proc"),
                   approved_interpreters=None, sleep_fn=time.sleep, attempts=40,
-                  poll_timeout=10.0, clock_fn=time.monotonic, verify_fn=None) -> dict:
+                  poll_timeout=10.0, clock_fn=time.monotonic, verify_fn=None,
+                  authority_dir=None, controller_dir=None) -> dict:
     """Activate a verified release or restore the actual prior live release."""
     releases = Path(releases).absolute()
     proc_root = Path(proc_root)
     interpreter = _approved_interpreter(Path(interpreter), approved_interpreters)
     target = _verify_runtime(new_runtime, releases)
+    target_admission = _verify_workspace_launch(target["runtime"], authority_dir)
+    target_command = _workspace_command(
+        target_admission, target["runtime"], interpreter, authority_dir,
+        controller_dir,
+    )
     if plan is None:
         live = freeze_live_runtime(status_fn(), releases, proc_root,
                                    approved_interpreters)
@@ -710,7 +790,7 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
     service_touched = False
     observed_new = None
     try:
-        new_argv = _write_target(plan, state, interpreter, target["server"])
+        new_argv = _write_target(plan, state, target_command)
         _assert_resources(plan, state)
         reload_attempted = True
         _run(command_fn, ["systemctl", "--user", "daemon-reload"])
@@ -722,6 +802,10 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
         _wait_stopped(old, proc_root, attempts, sleep_fn, deadline, clock_fn)
         _assert_resources(plan, state)
         _assert_unit_argv(plan, new_argv)
+        if target_admission["authority_active"]:
+            _transition_workspace_launch(target["runtime"], authority_dir)
+        else:
+            _verify_workspace_launch(target["runtime"], authority_dir)
         _run(command_fn, ["systemctl", "--user", "start", SERVICE])
         deadline = clock_fn() + poll_timeout
         actual = _wait_runtime(status_fn, target["snapshot"], interpreter, releases,
@@ -759,8 +843,14 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
             old_interpreter = _approved_interpreter(
                 Path(old["interpreter"]), approved_interpreters)
             old_runtime = _verify_runtime(Path(old["server"]).parent, releases)
-            old_argv = _write_target(plan, state, old_interpreter,
-                                     old_runtime["server"])
+            old_admission = _verify_workspace_launch(
+                old_runtime["runtime"], authority_dir,
+            )
+            old_command = _workspace_command(
+                old_admission, old_runtime["runtime"], old_interpreter,
+                authority_dir, controller_dir,
+            )
+            old_argv = _write_target(plan, state, old_command)
             _assert_resources(plan, state)
             _run(command_fn, ["systemctl", "--user", "daemon-reload"])
             _assert_resources(plan, state)
@@ -772,6 +862,10 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
                               deadline, clock_fn)
             _assert_resources(plan, state)
             _assert_unit_argv(plan, old_argv)
+            if old_admission["authority_active"]:
+                _transition_workspace_launch(old_runtime["runtime"], authority_dir)
+            else:
+                _verify_workspace_launch(old_runtime["runtime"], authority_dir)
             _run(command_fn, ["systemctl", "--user", "start", SERVICE])
             deadline = clock_fn() + poll_timeout
             _wait_runtime(status_fn, old_runtime["snapshot"], old_interpreter,

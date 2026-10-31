@@ -81,7 +81,7 @@
 
   function validMinutes() {
     const value = Number($('host-access-duration').value);
-    return Number.isInteger(value) && value >= 1 && value <= 480 ? value : null;
+    return Number.isInteger(value) && value >= 1 && value <= 43200 ? value : null;
   }
 
   function hasFreshApproval() {
@@ -218,7 +218,11 @@
     const local = localAccessStatus();
     const left = local.expiry - Date.now();
     if (local.active) {
-      const remaining = `${Math.floor(left / 60000)}분 ${Math.floor((left % 60000) / 1000)}초 남음`;
+      const remaining = left >= 86400000
+        ? `${Math.floor(left / 86400000)}일 ${Math.floor((left % 86400000) / 3600000)}시간 남음`
+        : left >= 3600000
+          ? `${Math.floor(left / 3600000)}시간 ${Math.floor((left % 3600000) / 60000)}분 남음`
+          : `${Math.floor(left / 60000)}분 ${Math.floor((left % 60000) / 1000)}초 남음`;
       state.textContent = `활성 · ${remaining}`;
       codex.textContent = access.allow_codex === true
         ? '호스트 Codex 허용 · 격리 준비 상태와 별개'

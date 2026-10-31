@@ -98,7 +98,7 @@ class FacadeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_descriptor_cannot_accept_id_or_raw_payload(self):
         specs = {spec["name"]: spec for spec in tools.TOSS_CONSOLE_TOOL_SPECS}
-        self.assertEqual(set(specs), {OLD_TOOL, NEW_TOOL})
+        self.assertEqual(set(specs), {OLD_TOOL, NEW_TOOL, "get_toss_20261026_test_console_status"})
         for spec in specs.values():
             self.assertEqual(set(spec["inputSchema"]["properties"]), {"project", "target"})
             self.assertFalse(spec["inputSchema"]["additionalProperties"])

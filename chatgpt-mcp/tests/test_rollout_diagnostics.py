@@ -299,6 +299,7 @@ class RolloutDiagnosticsTest(unittest.TestCase):
             "    def test_error(self):\n"
             f"        raise RuntimeError({secret!r})\n")
         for stage in ("checks_targeted", "checks_full", "checks_approval_ui",
+                      "checks_workspace_approval_browser",
                       "checks_schema014_ui", "checks_runtime_rollout_ui", "checks_host_command_ui"):
             with self.subTest(stage=stage):
                 receipt = RolloutReceipt(self.root / "receipts")
@@ -318,6 +319,14 @@ class RolloutDiagnosticsTest(unittest.TestCase):
                 self.assertNotIn("Traceback", saved_text)
                 self.assertEqual(receipt.path.stat().st_mode & 0o777, 0o600)
 
+    def test_unittest_failure_id_accepts_full_id_and_class_only_headers(self):
+        expected = "tests.test_example.ExampleTest.test_example"
+        for line in (
+                b"FAIL: test_example (tests.test_example.ExampleTest.test_example)",
+                b"FAIL: test_example (tests.test_example.ExampleTest)"):
+            with self.subTest(line=line):
+                self.assertEqual(diagnostics._unittest_failure_id(line), expected)
+
     def test_receipt_rejects_unbounded_or_non_identifier_failed_tests(self):
         receipt = RolloutReceipt(self.root)
         for value in (["test.safe"], [{}],
@@ -327,6 +336,70 @@ class RolloutDiagnosticsTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     receipt.event("checks_targeted", "failed", failed_tests=value)
+
+    def test_failed_node_input_survives_without_reporter_names_or_failure_output(self):
+        fixture = self.root / "test_workspace_fixture.mjs"
+        fixture.write_text("")
+        secret = "fixture-private-node-test-name-and-token"
+        tap = ("TAP version 13\n"
+               f"# Subtest: {secret}\n"
+               f"not ok 1 - {secret}\n"
+               "  ---\n"
+               f"  location: '{fixture}:1:1'\n"
+               f"  error: '{secret}'")
+        spec = (f"\u2716 {secret}\n"
+                "\u2139 tests 1\n"
+                "\u2139 fail 1\n\n"
+                "\u2716 failing tests:\n\n"
+                f"test at {fixture}:1:1")
+        for reporter, output in (("tap", tap), ("spec", spec)):
+            with self.subTest(reporter=reporter):
+                receipt = RolloutReceipt(self.root / (reporter + "-node-receipts"))
+                result = run_command(
+                    [sys.executable, "-c",
+                     "import sys; sys.stdout.write(sys.argv[1]); sys.exit(1)",
+                     output, "--test", str(fixture)],
+                    stage="checks_workspace_ui", timeout=3, receipt=receipt)
+                self.assertEqual(result.returncode, 1)
+                saved_text = receipt.path.read_text()
+                event = json.loads(saved_text)["events"][-1]
+                self.assertEqual(event["failed_test_files"], [fixture.name])
+                self.assertNotIn(secret, saved_text)
+                self.assertNotIn(str(fixture), saved_text)
+                self.assertEqual(receipt.path.stat().st_mode & 0o777, 0o600)
+
+    def test_node_diagnostics_reject_secret_oversize_and_malformed_locations(self):
+        fixture = self.root / "test_workspace_fixture.mjs"
+        fixture.write_text("")
+        secret = "fixture-private-node-secret"
+        output = ("not ok 1 - fixture\n"
+                  f"  location: '{secret}.mjs:1:1'\n"
+                  + "x" * 513 + f"  location: '{fixture}:2:1'\n"
+                  f"  location: '{fixture}:line:column'")
+        for stage in ("checks_workspace_ui", "checks_targeted"):
+            with self.subTest(stage=stage):
+                receipt = RolloutReceipt(self.root / (stage + "-receipts"))
+                result = run_command(
+                    [sys.executable, "-c",
+                     "import sys; sys.stdout.write(sys.argv[1]); sys.exit(1)",
+                     output, "--test", str(fixture)],
+                    stage=stage, timeout=3, receipt=receipt)
+                self.assertEqual(result.returncode, 1)
+                saved_text = receipt.path.read_text()
+                event = json.loads(saved_text)["events"][-1]
+                self.assertNotIn("failed_test_files", event)
+                self.assertNotIn(secret, saved_text)
+                self.assertNotIn(str(fixture), saved_text)
+
+    def test_receipt_rejects_unbounded_or_unsafe_failed_node_inputs(self):
+        receipt = RolloutReceipt(self.root)
+        for value in (["workspace_fixture.mjs"], [{}],
+                      ["test_safe.mjs", "private-secret.mjs"],
+                      ["test_" + "x" * 119 + ".mjs"],
+                      ["test_safe.mjs"] * 33):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    receipt.event("checks_workspace_ui", "failed", failed_test_files=value)
 
     def test_receipt_failure_does_not_replace_original_safe_error(self):
         receipt = RolloutReceipt(self.root)

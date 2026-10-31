@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
 from toss_console_evidence import (
-    APP_NAME, DEPLOYMENT_ID, UX019_DEPLOYMENT_ID, MINIAPP_ID, WORKSPACE_ID,
+    APP_NAME, DEPLOYMENT_ID, UX019_DEPLOYMENT_ID, TEST_20261026_DEPLOYMENT_ID, MINIAPP_ID, WORKSPACE_ID,
     ConsoleEvidenceError, project_bundle_list,
 )
 
@@ -29,6 +29,7 @@ CALL_TIMEOUT_SECONDS = 10
 _DEPLOYMENTS_BY_TOOL = {
     "get_toss_test_console_status": DEPLOYMENT_ID,
     "get_toss_ux019_test_console_status": UX019_DEPLOYMENT_ID,
+    "get_toss_20261026_test_console_status": TEST_20261026_DEPLOYMENT_ID,
 }
 
 TOSS_CONSOLE_TOOL_SPECS = [
@@ -67,6 +68,17 @@ TOSS_CONSOLE_TOOL_SPECS.append({
         "01a151bd-4015-75cf-8275-fa6b6aef9a47 via the owner-approved console connection. "
         "Preserves the legacy UX014 tool. No arbitrary IDs, raw responses, credentials, "
         "OAuth login, uploads, invitations or review actions are accepted."
+    ),
+})
+TOSS_CONSOLE_TOOL_SPECS.append({
+    **deepcopy(TOSS_CONSOLE_TOOL_SPECS[0]),
+    "name": "get_toss_20261026_test_console_status",
+    "title": "Toss 신규 TEST 콘솔 번들 읽기 전용 검증",
+    "description": (
+        "Read only the exactly pinned tarororo TEST deployment "
+        "01a17791-4979-736a-a132-6b0973fe7587 using the owner-authenticated "
+        "Toss bundle_list. No arbitrary ID or provider payload, credentials, "
+        "OAuth login, uploads, invitation, review or regular release."
     ),
 })
 
@@ -121,10 +133,12 @@ class TossConsoleReadOnlyTools:
 
     def __init__(self, provider: ReadOnlyBundleProvider | None = None, *,
                  provider_factory: ProviderFactory | None = None,
-                 ux019_provider_factory: ProviderFactory | None = None) -> None:
+                 ux019_provider_factory: ProviderFactory | None = None,
+                 test_20261026_provider_factory: ProviderFactory | None = None) -> None:
         self._provider = provider
         self._provider_factory = provider_factory
         self._ux019_provider_factory = ux019_provider_factory
+        self._test_20261026_provider_factory = test_20261026_provider_factory
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if type(name) is not str or name not in self.names or type(arguments) is not dict:
@@ -134,7 +148,8 @@ class TossConsoleReadOnlyTools:
         deployment_id = _DEPLOYMENTS_BY_TOOL[name]
         blocked = partial(_blocked, deployment_id=deployment_id)
         provider_factory = (self._provider_factory if deployment_id == DEPLOYMENT_ID
-                            else self._ux019_provider_factory)
+                            else self._ux019_provider_factory if deployment_id == UX019_DEPLOYMENT_ID
+                            else self._test_20261026_provider_factory)
         # The original injected provider authorizes only the legacy UX014 route.
         provider = self._provider if deployment_id == DEPLOYMENT_ID else None
         if provider is None and provider_factory is not None:

@@ -1,11 +1,16 @@
 """Systemd admin rollout tests; mocks all commands and network interactions."""
+import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import rollout_admin as module
 from rollout_admin import (AdminSwitchError, parse_execstart, preflight_admin,
                            switch_admin)
+from workspace_authority import WorkspaceAuthority
+from workspace_control import MANDATORY_RELEASE_FILES, install_controller
 
 
 class FakeResponse:
@@ -31,6 +36,26 @@ class AdminRolloutTest(unittest.TestCase):
         self.release.chmod(0o700)
         (self.release / "admin_server.py").write_text("fixture")
         (self.release / "admin_server.py").chmod(0o600)
+        contents = {
+            name: ((b"fixture" if name == "admin_server.py" else
+                    ("fixture:" + name).encode()))
+            for name in MANDATORY_RELEASE_FILES
+        }
+        for name, content in contents.items():
+            path = self.release / name
+            path.write_bytes(content)
+            path.chmod(0o600)
+        manifest = {name: hashlib.sha256(content).hexdigest()
+                    for name, content in contents.items()}
+        release_digest = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True).encode()
+        ).hexdigest()
+        (self.release / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        (self.release / "manifest.json").chmod(0o600)
+        renamed = self.release.with_name(release_digest[:20])
+        self.release.rename(renamed)
+        self.release = renamed
+        self.release_digest = release_digest
         self.source_script = Path(__file__).resolve().parents[1] / "admin_server.py"
         self.serena_python = (self.home
                               / ".local/share/uv/tools/serena-agent/bin/python")
@@ -55,6 +80,20 @@ class AdminRolloutTest(unittest.TestCase):
                      "--public-origin https://host.example.ts.net:8443\n")
         self.override = (self.home
                          / ".config/systemd/user/personal-ops-admin.service.d/20-runtime.conf")
+
+    def activate_authority(self, allowed):
+        project = self.home / "projects/demo"
+        project.mkdir(parents=True, exist_ok=True)
+        authority_dir = self.home / "workspace-authority"
+        WorkspaceAuthority({"demo": project}, authority_dir).initialize(
+            "a" * 64, allowed,
+        )
+        self.controller_dir = self.home / "workspace-controller"
+        install_controller(
+            self.controller_dir, Path(__file__).resolve().parents[1],
+            projects={"demo": project},
+        )
+        return authority_dir
 
     def effective_unit(self):
         if self.override.exists():
@@ -142,6 +181,145 @@ class AdminRolloutTest(unittest.TestCase):
         self.assertIn("--lan-host 192.168.2.70", contents)
         self.assertIn("--public-origin https://host.example.ts.net:8443", contents)
         self.assertTrue(any(cmd[-2:] == ["restart", "personal-ops-admin.service"] for cmd in calls))
+
+    def test_active_launcher_exec_converges_with_stable_process_identity(self):
+        authority_dir = self.activate_authority({self.release_digest: 1})
+        call, _ = self.fake_sysctl()
+        expected = self.process_argv(200)
+        launcher = module._workspace_admin_command(
+            {"authority_active": True, "authority_dir": str(authority_dir)},
+            self.release, self.serena_python, None, expected[2:], self.controller_dir,
+        )
+        reads = 0
+
+        def process_argv(pid):
+            nonlocal reads
+            if pid != 200:
+                return self.process_argv(pid)
+            reads += 1
+            return launcher if reads == 1 else expected
+
+        with patch("rollout_admin.Path.home", return_value=self.home):
+            result = switch_admin(
+                self.release, unit_fn=self.effective_unit, command_fn=call,
+                process_argv_fn=process_argv,
+                process_start_fn=self.process_start, sleep_fn=lambda _: None,
+                urlopen_fn=lambda *args, **kwargs:
+                FakeResponse(b'<section id="host-approval"></section>'),
+                authority_dir=authority_dir, controller_dir=self.controller_dir,
+            )
+        self.assertEqual(result, "admin_ready")
+        self.assertGreaterEqual(reads, 3)
+
+    def test_active_launcher_exec_converges_during_rollback(self):
+        authority_dir = self.activate_authority({self.release_digest: 1})
+        self.unit = self.unit.replace(
+            str(self.source_script), str(self.release / "admin_server.py"))
+        call, _ = self.fake_sysctl()
+        expected = [
+            str(self.serena_python), str(self.release / "admin_server.py"),
+            "--port", "8765", "--lan-host", "192.168.2.70",
+            "--public-origin", "https://host.example.ts.net:8443",
+        ]
+        launcher = module._workspace_admin_command(
+            {"authority_active": True, "authority_dir": str(authority_dir)},
+            self.release, self.serena_python, None, expected[2:], self.controller_dir,
+        )
+        reads = {200: 0, 300: 0}
+
+        def process_argv(pid):
+            if pid == 100:
+                return expected
+            reads[pid] += 1
+            return launcher if reads[pid] == 1 else expected
+
+        with patch("rollout_admin.Path.home", return_value=self.home):
+            with self.assertRaisesRegex(
+                    AdminSwitchError,
+                    "ADMIN_SWITCH_FAILED:ADMIN_UI_NOT_UPDATED") as raised:
+                switch_admin(
+                    self.release, unit_fn=self.effective_unit, command_fn=call,
+                    process_argv_fn=process_argv,
+                    process_start_fn=self.process_start, sleep_fn=lambda _: None,
+                    urlopen_fn=lambda *args, **kwargs:
+                    FakeResponse(b'<form id="login-form"></form>'),
+                    authority_dir=authority_dir, controller_dir=self.controller_dir,
+                )
+        self.assertEqual(raised.exception.rollback_status, "succeeded")
+        self.assertGreaterEqual(reads[200], 2)
+        self.assertGreaterEqual(reads[300], 2)
+
+    def test_launcher_exec_rejects_unrelated_argv(self):
+        authority_dir = self.activate_authority({self.release_digest: 1})
+        self.unit = self.unit.replace(
+            str(self.source_script), str(self.release / "admin_server.py"))
+        call, _ = self.fake_sysctl()
+        expected = self.process_argv(200)
+        launcher = module._workspace_admin_command(
+            {"authority_active": True, "authority_dir": str(authority_dir)},
+            self.release, self.serena_python, None, expected[2:], self.controller_dir,
+        )
+        reads = 0
+
+        def process_argv(pid):
+            nonlocal reads
+            if pid == 100:
+                return expected
+            if pid != 200:
+                return self.process_argv(pid)
+            reads += 1
+            if reads == 1:
+                return launcher
+            return [str(self.serena_python), "/unrelated/admin_server.py"]
+
+        with patch("rollout_admin.Path.home", return_value=self.home):
+            with self.assertRaises(AdminSwitchError) as raised:
+                switch_admin(
+                    self.release, unit_fn=self.effective_unit, command_fn=call,
+                    process_argv_fn=process_argv,
+                    process_start_fn=self.process_start, sleep_fn=lambda _: None,
+                    authority_dir=authority_dir, controller_dir=self.controller_dir,
+                )
+        self.assertIn("ADMIN_SERVICE_CHANGED", str(raised.exception))
+
+    def test_launcher_exec_rejects_changed_start_ticks(self):
+        authority_dir = self.activate_authority({self.release_digest: 1})
+        self.unit = self.unit.replace(
+            str(self.source_script), str(self.release / "admin_server.py"))
+        call, _ = self.fake_sysctl()
+        expected = self.process_argv(200)
+        launcher = module._workspace_admin_command(
+            {"authority_active": True, "authority_dir": str(authority_dir)},
+            self.release, self.serena_python, None, expected[2:], self.controller_dir,
+        )
+        argv_reads = 0
+        start_reads = 0
+
+        def process_argv(pid):
+            nonlocal argv_reads
+            if pid == 100:
+                return expected
+            if pid != 200:
+                return self.process_argv(pid)
+            argv_reads += 1
+            return launcher if argv_reads == 1 else expected
+
+        def process_start(pid):
+            nonlocal start_reads
+            if pid != 200:
+                return self.process_start(pid)
+            start_reads += 1
+            return 2000 if start_reads == 1 else 2001
+
+        with patch("rollout_admin.Path.home", return_value=self.home):
+            with self.assertRaises(AdminSwitchError) as raised:
+                switch_admin(
+                    self.release, unit_fn=self.effective_unit, command_fn=call,
+                    process_argv_fn=process_argv, process_start_fn=process_start,
+                    sleep_fn=lambda _: None, authority_dir=authority_dir,
+                    controller_dir=self.controller_dir,
+                )
+        self.assertIn("ADMIN_SERVICE_CHANGED", str(raised.exception))
 
     def test_manager_cached_unit_updates_only_after_daemon_reload(self):
         self.override.parent.mkdir(parents=True)
@@ -305,6 +483,51 @@ class AdminRolloutTest(unittest.TestCase):
                              process_start_fn=self.process_start,
                              sleep_fn=lambda _: None)
         self.assertEqual(calls, [])
+
+    def test_active_authority_rejects_unreviewed_admin_before_commands(self):
+        authority_dir = self.activate_authority({"f" * 64: 1})
+        call, calls = self.fake_sysctl()
+
+        with patch("rollout_admin.Path.home", return_value=self.home):
+            with self.assertRaisesRegex(AdminSwitchError, "WORKSPACE_RELEASE_UNLISTED"):
+                switch_admin(
+                    self.release, unit_fn=self.effective_unit, command_fn=call,
+                    process_argv_fn=self.process_argv,
+                    process_start_fn=self.process_start,
+                    authority_dir=authority_dir, controller_dir=self.controller_dir,
+                )
+        self.assertEqual(calls, [])
+
+    def test_active_admin_launcher_command_pins_admitted_authority_path(self):
+        authority_dir = self.activate_authority({self.release_digest: 1})
+        command = module._workspace_admin_command(
+            {"authority_active": True, "authority_dir": str(authority_dir)},
+            self.release, self.serena_python, None, ["--port", "8765"],
+            self.controller_dir,
+        )
+
+        index = command.index("--authority-dir")
+        self.assertEqual(command[index + 1], str(authority_dir))
+
+    def test_active_authority_does_not_restart_prohibited_admin_rollback(self):
+        authority_dir = self.activate_authority({self.release_digest: 2})
+        call, calls = self.fake_sysctl()
+
+        with patch("rollout_admin.Path.home", return_value=self.home):
+            with self.assertRaisesRegex(AdminSwitchError, "ADMIN_ROLLBACK_FAILED") as raised:
+                switch_admin(
+                    self.release, unit_fn=self.effective_unit, command_fn=call,
+                    process_argv_fn=self.process_argv,
+                    process_start_fn=self.process_start, sleep_fn=lambda _: None,
+                    urlopen_fn=lambda *args, **kwargs:
+                    FakeResponse(b'<form id="login-form"></form>'),
+                    authority_dir=authority_dir, controller_dir=self.controller_dir,
+                )
+        self.assertEqual(raised.exception.cause_code, "UNSAFE_WORKSPACE_RELEASE")
+        self.assertEqual(
+            sum(cmd[-2:] == ["restart", "personal-ops-admin.service"] for cmd in calls),
+            1,
+        )
 
     def test_preflight_rejects_unrelated_existing_override_without_commands(self):
         self.override.parent.mkdir(parents=True)

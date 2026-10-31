@@ -306,7 +306,7 @@ def approve_web(operations, *, operation_id, plan_digest, source_digest, confirm
                 or immutable["source_digest"] != source_digest
                 or _timestamp(immutable["expires_at"]) <= datetime.now(timezone.utc)):
             raise HostRuntimeError("STALE_PLAN")
-        operations._verify(immutable)
+        operations._verify_pending_or_retire(state)
         receipt = operations.operations_dir / (operation_id + ".approval.json")
         fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as stream:

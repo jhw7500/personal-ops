@@ -73,7 +73,7 @@ python3 chatgpt-mcp/server.py --project /absolute/project/path
 
 새 소스의 사용 흐름은 list_host_command_profiles → prepare_host_command의 채팅 카드에서 **승인하고 실행** → get_host_command / cancel_host_command다. 앱 전용 confirm_and_execute_host_command가 기존 일회용 승인을 발급하고 같은 콜백에서 고정된 명령 실행을 접수하므로, 웹 모델의 두 번째 execute_host_command 호출이 필요 없다. 관리자 페이지나 관리자 토큰 입력도 필요하지 않다.
 
-기존 계획은 open_host_command_approval로 다시 연다. 이미 승인된 계획을 열기만 해서는 실행하지 않는다. 예전 카드의 ‘이 계획 승인’은 승인만 하며, 사용자 실행 요청이 있을 때 기존 execute_host_command 경로로 이어간다. 계획은 생성부터 10분이며 카드 승인이 유효시간을 늘리지 않는다. 통신 오류로 결과가 불확실하면 get_host_command로 확인하고 자동 재실행하지 않는다. 외부 TEST 업로드 취소는 업로드를 되돌리지 않는다. 2026-10-20의 이 보완은 별도 서비스 전환 전까지 소스에만 적용된다.
+기존 계획은 open_host_command_approval로 다시 연다. 이미 승인된 계획을 열기만 해서는 실행하지 않는다. 예전 카드의 ‘이 계획 승인’은 승인만 하며, 사용자 실행 요청이 있을 때 기존 execute_host_command 경로로 이어간다. 새 소스의 계획은 생성부터 7일이며 카드 승인이 유효시간을 늘리지 않는다. 통신 오류로 결과가 불확실하면 get_host_command로 확인하고 자동 재실행하지 않는다. 외부 TEST 업로드 취소는 업로드를 되돌리지 않는다. 2026-10-20의 이 보완은 별도 서비스 전환 전까지 소스에만 적용된다.
 
 2026-10-16에 업로드 카드 보완본 `8c7a5aff0c75198c6c5d`를 운영에 반영했다. 전체 892개 검사, 설치본 도구 76개 등록·프로토콜 검사 3개, 실제 터널 프로필 조회와 관리 웹 HTTP 검증을 통과했다. ChatGPT 연결을 새로고침한 뒤 실제 업로드 카드 표시를 확인해야 한다. CLI 보존 검사에서는 전환 직전 살아 있던 Claude 프로세스 1개의 사후 종료가 관측됐으며 원인은 미확인이다. [업로드 채팅 승인 인계](../docs/handoffs/2026-10-16-host-command-inline-approval.md)를 참조한다.
 
@@ -90,12 +90,17 @@ python3 chatgpt-mcp/server.py --project /absolute/project/path
 
 ## 기간제 호스트 권한과 기존 Codex 호출
 
+2026-10-21 기간 연장 변경은 소스에만 적용했다. 카드·작업 계획은 생성부터 7일,
+호스트·workspace 권한은 승인 시점부터 기본·최대 30일이다. 기존 저장 기록의
+만료는 자동 연장하지 않는다. 철회, 재부팅·런타임·정책·입력 변경에 따른 무효화는
+계속 적용한다. 운영 반영과 실제 ChatGPT 연결 확인은 별도 단계다.
+
 호스트 명령 기능은 운영 런타임에 반영했다. 런타임 설치와 사용자 권한 부여는 별도이며,
 실제 허용 상태는 `get_host_access`로 확인한다.
 
 `request_host_access(project)`는 권한 요청만 만든다. 기존 관리 화면에서 호스트·사용자·UID·그룹,
 파일·네트워크·그룹 접근 범위, 유효 기간과 Codex 사용 동의를 확인하고 소유자가 승인한다.
-기본 기간은 4시간, 최대 기간은 8시간이며 자동 갱신하지 않는다. 관리 화면의 승인은 loopback 또는
+새 소스의 기본·최대 기간은 30일이며 자동 갱신하지 않는다. 관리 화면의 승인은 loopback 또는
 등록된 Tailscale HTTPS 주소에서 새 관리 토큰으로 인증한다. LAN HTTP 화면은 조회에 사용한다.
 `get_host_access`에서 실제 활성 상태를 확인한다.
 
@@ -103,12 +108,12 @@ python3 chatgpt-mcp/server.py --project /absolute/project/path
 `open_host_access_approval(project, duration_seconds?, allow_codex?)`가 카드를 열면
 호스트·사용자·작업 시작 위치·접근 범위·기간·Codex 동의를 확인하고 **승인**을 누른다.
 카드를 여는 요청이나 프롬프트의 “승인” 문장만으로 권한이 발급되지는 않는다.
-기본 기간은 4시간, 최대 8시간까지 선택할 수 있다. Codex 동의는 기본 꺼짐이며 카드에서 변경할 수 있다.
+새 소스의 기본·최대 기간은 30일이고 더 짧은 기간도 선택할 수 있다. Codex 동의는 기본 꺼짐이며 카드에서 변경할 수 있다.
 카드에는 관리 토큰을 넣지 않는다. 기존 관리 웹은 복구 경로로 유지한다.
 
 확인값은 결과 `_meta`로 신뢰한 MCP 호스트/컴포넌트에만 전달하며 모델용 응답·위젯 상태·
 로그에는 저장하지 않는다. 앱 전용 확인 도구는 이 일회용 값과 프로젝트·런타임·재부팅·
-사용자·작업 경로가 일치해야 동작한다. 카드 유효 기간은 10분이며 옵션 변경은 확인값을
+사용자·작업 경로가 일치해야 동작한다. 새 소스의 카드 유효 기간은 7일이며 옵션 변경은 확인값을
 교체하지만 유효 기간을 늘리지 않는다. 같은 프로젝트의 새 카드를 열면 이전 카드가
 무효화된다. 취소는 해당 요청을 없애며 이미 활성화된 권한을 철회하지 않는다.
 응답이 유실되면 자동 재승인하지 말고 `get_host_access`로 결과를 확인한다.
@@ -388,6 +393,8 @@ push는 현재 브랜치와 새 원격 브랜치 여부를 지정한다. 실제 
 직접 push, force push, 태그·브랜치 삭제는 제공하지 않는다. URL 재작성·외부 credential
 helper 등의 저장소 설정이 있으면 거부한다. SSH 키/에이전트는 전용 Git 경로에서만 사용한다.
 HTTPS 인증은 고정된 호스트 GitHub CLI helper와 기존 로그인을 사용한다.
+push 미리보기는 비교 커밋, 전체 변경 경로, 파일 모드와 변경 전후의 전체 blob ID를
+표시한다. 전송할 커밋에 내용을 고정하고 경로별 권한과 송신 이력을 모두 검사한다.
 
 계획의 `approval_command`를 **호스트의 실제 터미널**에서 실행하면 대상, diff,
 commit 메시지를 보고 작업 ID를 직접 입력해 한 번 승인할 수 있다. 이후 ChatGPT에서
@@ -517,7 +524,7 @@ UI는 단일 HTML MCP 리소스이며 외부 스크립트·서버·새 패키지
   사용자·주문/기타 업무 행은 조회하지 않는다.
 - `prepare_predecessor_migration`: 001~005 정확한 체크섬, 006~013 모두
   미적용, 기존 006~012 객체 충돌 없음, 추가 이력 없음, DB 세대와 소스 고정,
-  검토된 high-risk 입력이라는 조건을 충족할 때만 10분 유효 계획을 만든다.
+  검토된 high-risk 입력이라는 조건을 충족할 때만 7일 유효 계획을 만든다.
   백업·DDL·재시작·서비스 배포를 수행하지 않는다.
 - `execute_predecessor_migration`: 기본 작업별 승인 정책에서는 **별도 로컬 관리자 인증 후 작업 ID
   입력으로 발급받은 1회 승인 영수증**이 있어야 실행할 수 있다.
@@ -861,7 +868,7 @@ Claude의 `PreToolUse`는 호출 시작, `PostToolUse`는 호출 반환이다.
 |---|---|
 | `get_runtime_status` | tarororo-test의 API·Worker·DB 및 안전하게 분류된 설정·스키마 조회 |
 | `compare_deployment` | 빌드 입력 digest·Git 상태·이미지 ID 비교; 증빙 없으면 `UNKNOWN` |
-| `prepare_test_deploy` | 소스와 실제 Docker 대상 고정, 만료 10분의 승인 계획 생성 |
+| `prepare_test_deploy` | 소스와 실제 Docker 대상 고정, 만료 7일의 승인 계획 생성 |
 | `execute_test_deploy` | 호스트 **실제 TTY**에서 생성한 1회 영수증을 확인한 후 API만 빌드/재생성 |
 | `get_host_operation` | 작업 단계·상태 조회; 중단/결과 불명은 `outcome_unknown` |
 
@@ -935,7 +942,7 @@ admin HTTP 프로세스는 소스 파일 저장만으로 바뀌지 않는다.
   대상 DB 컨테이너 정체성만 반환한다. 읽기 전용 SQL이며 행 데이터/비밀번호는 반환하지 않는다.
 - `prepare_db_migration(request_id=...)`는 **013 하나만** 대상으로 하며
   선행 12개 마이그레이션 체크섬 완전 일치, 013 미적용 및 필수 테이블 부재를 요구한다.
-  소스/도커 정체성과 10분 승인 계획을 고정한다. 승인된 `execute_test_deploy`
+  소스/도커 정체성과 7일 승인 계획을 고정한다. 승인된 `execute_test_deploy`
   실행에서 별도 private 디렉터리에 `pg_dump -Fc`를 스트리밍 백업(최대 512MiB),
   `pg_restore --list` 검사에 이어 기존 `tarororo-test` PostgreSQL 인스턴스 안에
   작업 ID 전용 임시 DB(`tarororo_restore_<id>`)를 생성해 백업을 실제 복원한다.
@@ -1012,7 +1019,7 @@ python3 chatgpt-mcp/rollout-host-runtime.py --apply
 호출한다. 승인을 누르는 것만으로 설치나 재시작이 시작되지는 않는다.
 진행과 결과는 `get_runtime_rollout`으로 확인한다.
 
-승인은 10분 동안 한 번만 사용할 수 있다. 소스가 달라지면 기존 승인은 사용할 수 없다.
+승인은 계획 생성부터 7일 안에 한 번만 사용할 수 있다. 소스가 달라지면 기존 승인은 사용할 수 없다.
 실행기는 별도 사용자 systemd unit에서 동작하며, 터널과 관리 웹만 전환한다.
 DB·Docker·API·Worker·Toss 업로드는 이 승인의 대상이 아니다.
 중단 후 결과를 확정할 수 없는 작업은 `outcome_unknown`으로 남고 자동 재실행하지 않는다.
@@ -1072,7 +1079,7 @@ MCP Python의 테스트 탐색에서는 Playwright를 불러오지 않는다.
 유효한 새 계획의 MCP 응답은 `state=ready_to_execute`, `approval_required=false`와
 호출할 실행 도구·인자를 담은 `next_action`을 반환한다. 사용자가 실행을 요청했다면
 채팅에서 그 도구를 바로 호출하며 관리 웹의 추가 승인을 요구하지 않는다. 계획
-조회만 요청한 경우에는 실행하지 않는다. 10분이 지나 `PLAN_EXPIRED`가 된 계획은
+조회만 요청한 경우에는 실행하지 않는다. 7일이 지나 `PLAN_EXPIRED`가 된 계획은
 관리 웹의 대기 목록에서 빠진다. 새 `request_id`로 계획을 다시 만들면 되며,
 만료된 계획을 승인하거나 재사용하지 않는다.
 허용은 재부팅 뒤에도 보존되며 철회·대상 설정 변경·허용된 SQL 바이트 변경 시
@@ -1100,7 +1107,7 @@ LAN에서는 상태 조회만 가능하다. 등록형 Compose 작업의 개별 �
 |---|---|
 | `list_host_targets(project)` | 이 프로젝트에 등록된 대상, 허용 동작·실행 프로필, 제한 사유(`enabled`/`reason`) 조회 |
 | `inspect_host_target(project, target, area=docker)` | 등록 서비스의 컨테이너·이미지 ID·상태·health만 조회 (로그·env·mount 없음) |
-| `prepare_host_operation(project, target, action, parameters, request_id)` | 입력·대상 정체성을 고정한 10분 계획과 `approval_url` 반환. Docker·SQL 실행 없음 |
+| `prepare_host_operation(project, target, action, parameters, request_id)` | 입력·대상 정체성을 고정한 7일 계획과 `approval_url` 반환. Docker·SQL 실행 없음 |
 | `execute_host_operation(project, target, operation_id)` | 웹 승인 영수증을 1회 소비하고 비동기 실행. 재호출은 기존 상태만 조회 |
 | `read_host_operation_events(project, target, operation_id, cursor, limit)` | 상태·단계와 안전한 이벤트를 cursor로 조회 (기본 50, 최대 200, 64 KiB) |
 
@@ -1145,12 +1152,191 @@ endpoint가 없다. 후보 설정은 `python3 chatgpt-mcp/configure-host-runtime
 `tests/test_admin_registered_approval.py`(HTTP 승인 경계), `tests/test_runtime_install.py`(패키징·변조),
 `node --test chatgpt-mcp/tests/test_host_operations_ui.mjs`(textContent·빈/만료/오류 상태·링크).
 
+## MCP 도구 목록 갱신 요청
+
+`personal-ops` 프로젝트가 등록된 서버는 다음 두 모델용 도구를 제공한다.
+
+| Tool | Effect |
+| --- | --- |
+| `refresh_mcp_catalog(project="personal-ops")` | Send a tool-list change notification on this connection |
+| `get_mcp_catalog_refresh_status(project="personal-ops")` | Read same-session notification/refetch evidence |
+
+```text
+refresh_mcp_catalog
+  -> notification_sent
+  -> client tools/list
+  -> catalog_refetched
+```
+
+`catalog_refetched`는 같은 연결에서 요청 뒤 도구 목록 조회가 성공했다는 뜻이다.
+새 연결의 상태는 `idle`부터 시작한다. 상태는 메모리에만 있으며 서비스 재시작이나
+권한 발급을 수행하지 않는다. 전송 실패는 `CATALOG_REFRESH_NOTIFICATION_FAILED`로
+보고한다.
+
+`chatgpt_metadata_verified`는 항상 `false`다. MCP 알림에는 적용 완료 ACK가 없고,
+ChatGPT 도구 캐시나 승인 카드가 바뀌었는지는 이 서버가 확인할 수 없다.
+클라이언트가 알림을 처리하지 않거나 새 도구가 처음 등록되는 경우에는
+[ChatGPT 공식 metadata Refresh 절차](https://developers.openai.com/plugins/deploy/connect-chatgpt#refresh-metadata)와
+새 대화 확인이 필요하다. 설치 SDK 1.23.0의 2025-06-18 MCP 알림 API를 사용한다.
+
+## 선택형 workspace 정책 (소스 구현, 운영 미활성)
+
+현재 운영 설정에 이 정책을 자동 생성하거나 적용하지 않는다. 기본 작업 영역은
+`/home/jhw/ai/opencode/projects/`이며, 등록 project의 일반 소스에 적용한다.
+영역 밖 project를 등록해도 다른 project의 정책 로딩은 중단하지 않지만,
+영역 밖 파일은 정확한 경로와 작업이 일치하는 별도 접근 승인을 요구한다.
+
+정책은 `$XDG_CONFIG_HOME/chatgpt-coding-mcp/workspace-policy.json`
+(기본 `~/.config/chatgpt-coding-mcp/workspace-policy.json`)에 둔다. 부모는
+현재 사용자 소유 `0700`, 파일은 단일 링크 일반 파일 `0600`이어야 하며,
+모든 project 밖에 있어야 한다. 아래는 임시 project를 사용한 형식 예시다.
+실제 산출물의 경로·필드 허용 목록은 소유자가 별도로 확정한다.
+
+```json
+{
+  "version": 1,
+  "base_root": "/home/jhw/ai/opencode/projects",
+  "artifacts": [{
+    "project": "alpha",
+    "path": "build/results",
+    "kind": "directory",
+    "operations": ["list", "read"],
+    "fields": ["text", "usage"],
+    "recursive": false,
+    "max_file_bytes": 1048576
+  }],
+  "protected_paths": []
+}
+```
+
+`.gitignore`와 일반 소스 검색의 제외 규칙은 유지한다. 등록한 JSON만 별도 도구로
+읽으며, 지정한 최상위 필드만 반환한다. 파일 상한은 1 MiB, 응답 페이지는 64 KiB다.
+커서는 설치 ID·권한 세대·정책 digest·경로·원본 및 반환 내용 hash에 묶인다.
+중첩된 알려진 인증 키와 명백한 키/토큰 패턴은 거절하지만, 임의 문장의 모든 비밀을
+판별하는 기능으로 사용하지 않는다. 일반 read/search, Git diff와 명령 snapshot으로
+등록 산출물의 원문을 우회해서 읽을 수 없다.
+
+정책을 설정한 서버에서 다음 도구가 추가된다.
+
+| Tool | Contract |
+| --- | --- |
+| `read_registered_artifact` | Exact owner rule, projected JSON, signed pages |
+| `list_registered_artifacts` | Registered directory metadata; no implicit read |
+| `read_workspace_file` | Bounded source read; exact external read grant |
+| `list_workspace_files` | Bounded metadata; separate list permission |
+| `write_workspace_file` | One-file create or SHA-256 CAS replacement |
+| `open_workspace_access_approval` | Exact path, operations, purpose and duration |
+| `confirm_workspace_access_approval` | App-only, private one-use capability |
+| `cancel_workspace_access_approval` | App-only, private one-use capability |
+| `read_workspace_output` | Frozen completed output, signed pages |
+| `publish_workspace_output` | One verified output -> one target + receipt |
+
+승인은 현재 MCP 설치 범위이며 사람별 인증을 주장하지 않는다. 기본/최대 30일이고,
+목록·읽기·쓰기를 각각 검사한다. 승인 카드는 7일간 유효하며 모델 응답에 없는 private capability로
+확정하며, 모델에는 사용할 수 있는 공개 `grant_id`와 만료 시각을 전달한다.
+경로 승인은 명령·네트워크·Codex·배포·DB 실행 권한을 만들지 않는다.
+`.env`, 키·인증 디렉터리, 정책·권한 상태, 설치 runtime/controller는 경로 승인으로도
+읽거나 변경할 수 없다. 모든 파일 접근은 상위 디렉터리까지 no-follow FD로 열고,
+링크·특수 파일·범위 이탈과 stale 입력을 거절한다. 기존 파일 모드는 보존한다.
+
+정책이 없고 활성화 latch도 없는 설치의 기존 도구 계약은 유지한다. 활성화 후에는
+정책과 권한 디렉터리를 잃어도 독립 latch가 남아 legacy 접근으로 복귀하지 않는다.
+상태와 latch까지 과거 디스크 이미지로 복원하는 동일 UID 소유자의 행위를 로컬
+counter만으로 탐지한다고 주장하지 않는다.
+
+### 명령 실행과 결과 반영의 변경
+
+활성 정책에서 `start_command`는 호스트 원본을 직접 쓰지 않는다. 여과한 읽기 전용
+`/workspace`와 job별 `/scratch`, `/output`을 사용한다. 쓰기 가능한 cwd가 필요한
+명령은 `writable_cwd=true`로 사본에서 실행한다. 실제 결과는
+`WORKSPACE_OUTPUT_DIR=/output`에 저장한다. `workspace_inputs`에는 최대 16개의
+`{path, grant_id}`를 지정할 수 있다. 매 파일에 유효한 읽기 승인이 필요하며,
+원본 디렉터리를 mount하지 않고 `/inputs/<index>/input`으로 동결한다.
+입력 승인의 만료·철회는 해당 입력을 사용하는 작업을 중단시킨다.
+
+프로세스 종료와 출력 pipe 종료를 확인한 뒤 export 파일을 읽기 전용 사본으로
+고정한다. export는 최대 2,000개 항목/16 MiB이며 파일 하나는 1 MiB로 제한한다.
+`read_workspace_output`은 이 고정 사본을 읽는다. 성공한 작업만
+`publish_workspace_output`으로 파일 하나를 반영할 수 있다. 원래 job의
+`request_id`를 사용하고, 새 파일은 부재 조건, 교체는 `expected_sha256` CAS를
+요구한다. 반영 중 중단되면 pending 영수증의 고정 hash와 실제 목적지 hash로
+판정하며 다른 staging 내용을 재실행하지 않는다. 여러 파일의 원자적 반영은 지원하지 않는다.
+
+협력하는 MCP 파일 writer·Git·publisher는 설치 전체의 동일 writer lock을 사용한다.
+외부 승인 목적지가 여러 project에 걸쳐 같은 파일을 가리킬 수 있기 때문이다.
+광범위 host 작업은 shared lane과 durable 실행 예약을 유지하고, publication은
+exclusive lane 아래 예약이 없을 때만 진행한다. 소유 서비스가 죽어도 예약은 남는다.
+종료를 검증하지 못한 작업은 자동 해제하지 않으며, 기존 검증된 cancel/recovery 또는
+소유자 유지보수가 필요하다. 같은 UID로 별도 승인한 임의 host 코드를 OS 차원에서
+이 상태로부터 격리하는 계약은 아니다.
+
+활성 정책의 Git push는 전송할 모든 commit과 parent 경로를 검사한다. 보호·ignored·
+등록 산출물 경로가 하나라도 있거나 commit/path 상한(각 128)을 넘으면 승인을 만들지
+않는다. 중간 commit에 추가했다 삭제한 내용도 검사하며 실행 직전 재검증한다.
+현재 legacy isolated-agent snapshot/CAS 경로는 활성 정책에서
+`WORKSPACE_ISOLATED_AGENT_UNSUPPORTED`로 거절한다. 기존 별도 승인 host-agent
+경로는 기존 gate를 유지한다. 이 호환 제한도 운영 적용 전에 검토해야 한다.
+
+### 실행·복구와 활성화 경계
+
+권한 상태는 `$XDG_STATE_HOME/chatgpt-coding-mcp/workspace-authority`에,
+독립 enforcement latch는 그 부모에 둔다. 정책·권한 세대와 grant/pending/cursor/job이
+결합되며, managed target start와 rollback 시도마다 권한 세대를 durable 증가시킨다.
+실패한 target 뒤 rollback도 다시 증가한다. 권한 상태와 latch는 release 백업·복원에
+포함하지 않는다. 모든 복구 target은 전체 manifest digest와 enforcement ABI를
+소유자가 미리 검토한 호환 build여야 한다. pre-epoch 구 릴리스는 시작 전에 거절한다.
+
+stable controller는 release 밖의
+`~/.local/lib/chatgpt-coding-mcp/workspace-controller`에서 MCP/admin/rollout worker를
+시작하기 전에 검사한다. 사용자 정의 controller 경로도 프로젝트 밖이어야 하며
+`controller-manifest.json`이 있는 설치 경로는 일반 경로 도구에서 보호한다.
+서버/admin/worker 자체의 startup 검사도 유지한다.
+
+**첫 활성화에는 owner transaction 검증이 필요하다.** 이 소스의 owner CLI
+`initialize`/`migrate`는 `ACTIVATION_EVIDENCE_REQUIRED`로 중단한다. 두 Boolean
+옵션만으로 구 프로세스 배출, legacy pending 취소·grant 철회, 서비스 unit의 stable
+launcher 전환을 증명할 수 없기 때문이다. Python `initialize`는 임시 검증과 신뢰된
+owner primitive이며 이 CLI 차단을 우회하는 운영 절차로 제안하지 않는다.
+실제 적용에는 검증 가능한 migration evidence 경로, 호환 rollback build, 정확한
+정책 diff와 산출물 필드 검토, 별도 운영 승인 및 실제 connector/smoke 검증이 필요하다.
+
+첫 활성화와 중단 후 재개는 검토한 불변 release의 `workspace_activation_cli.py`로
+준비한다. `workspace_control.py activation --release <절대 release 경로> -- ...`도
+전체 manifest를 검증한 뒤 같은 owner CLI를 실행한다. 웹채팅 도구로 owner 정책이나
+권한 저장소를 활성화하지 않는다.
+
+- `prepare`: 정확한 정책 후보·목적지·projects 파일, target/rollback release와 ABI
+  최저치를 고정한다. ABI 2의 선언과 실제 시작 차단 동작을 검증하며, 선언이 없는
+  구버전을 인자로 재분류하지 않는다. 산출물의 허용 JSON 필드가 비어 있으면 중단한다.
+- `status --transaction-id <ID>`: private journal을 읽는다. 프로젝트 설정이나 경로가
+  사라져도 저장된 상태를 조회하며 서비스나 저장소를 만들지 않는다.
+- `apply --transaction-id <ID>`: 새 작업을 차단하고 실제 worker/lease 배출, 기존 승인
+  철회, launcher 전환, 정책·권한 공개와 서비스 시작을 순서대로 검증한다.
+- `resume --transaction-id <같은 ID>`: 같은 고정 소스와 실제 파일·프로세스 관측값으로
+  중단 지점부터 재개한다. 변경되거나 사라진 증거는 성공으로 간주하지 않는다.
+
+Journal은 `$XDG_STATE_HOME/chatgpt-coding-mcp/workspace-activation`의 owner0700
+디렉터리와 owner0600 파일에 보관한다. 별도로 고정한 계획 digest와 다른 journal은
+재개하지 않는다. 준비된 authority descriptor는 latch 생성 전에
+fsync하며, 부분 준비는 private quarantine으로 보존한다. 첫 활성화 전에 새 admission
+gate가 포함된 release를 배포하고 기존 실행을 별도로 배출해야 한다. 실패 시 latch나
+철회된 승인을 복원하지 않으며, 정확히 확인한 새 서비스만 정지한다.
+과거 `outcome_unknown` 기록은 종료·lease 관측과 분리해 원문을 보존한다.
+
+권한 공개 뒤 서비스 시작 중에도 별도의 durable barrier가 새 작업을 거절한다.
+검증된 launcher만 시작할 수 있으며, 두 서비스와 정책 binding의 확인이 끝난 뒤
+차단을 해제한다. 공개 직후 중단된 transaction은 기존 승인 무효화·배출·wiring을
+다시 확인한다. 재부팅 뒤에는 같은 공개 권한과 고정 설정이 일치하고 현재 서비스·
+worker·lease가 모두 없는 경우에만 새 boot의 관측값을 journal에 고정해 재개한다.
+실제 MCP 연결의 정책 동작과 기존 산출물 조회(T14)는 서비스 시작 뒤 별도 smoke로
+확인하며, 프로세스 실행만으로 이 검증까지 완료됐다고 보고하지 않는다.
+
 ## 검증
 
 ```bash
 cd chatgpt-mcp
-~/.local/share/uv/tools/serena-agent/bin/python -m unittest discover \
-  -s tests -v
+~/.local/share/uv/tools/serena-agent/bin/python -B rollout_test_runner.py \
+  --discover tests --require-excluded-count 5
 ```
 
 임시 프로젝트와 임시 상태 디렉터리에서 실제 MCP 초기화, 도구 목록,

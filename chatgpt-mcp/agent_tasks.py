@@ -26,13 +26,14 @@ from host_runtime_operations import (
 from agent_profiles import AgentProfileRegistry, SENSITIVE_SOURCE_PARTS, profile_digest
 from agent_events import sanitize_agent_event
 from host_execution import _safe_task_label
+from workspace_control import WorkspaceControlError, activation_admission
 
 TASK_ID = re.compile(r"[0-9a-f]{32}\Z")
 REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
 REASONS = frozenset({"MISSING_TOOL", "WORKFLOW_COMPLEXITY", "EXECUTION_ENV_UNSUPPORTED"})
 TERMINAL = frozenset({"succeeded", "failed", "cancelled", "rejected", "expired", "outcome_unknown",
                       "review_required"})
-TTL = 600
+TTL = 7 * 24 * 60 * 60
 MAX_TASKS = 1000
 MAX_PLAN_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_RETAINED_SOURCE_BYTES = 256 * 1024 * 1024
@@ -175,7 +176,8 @@ def _safe_structured_result(value):
 
 class AgentTaskManager:
     def __init__(self, projects: dict, profiles: AgentProfileRegistry | None = None,
-                 *, state_dir=None, runner=None, trusted_runtime=None, event_sink=None):
+                 *, state_dir=None, runner=None, trusted_runtime=None, event_sink=None,
+                 workspace=None):
         self.projects = {name: Path(path).resolve(strict=True) for name, path in projects.items()}
         self.root = validate_state_root(
             state_dir or (Path.home() / ".local/state/chatgpt-coding-mcp/agent-tasks"),
@@ -189,6 +191,11 @@ class AgentTaskManager:
             self.projects, receipts_dir=self.root.parent / "agent-probes")
         self.runner = runner
         self.event_sink = event_sink
+        self.workspace = workspace
+        authority = getattr(workspace, "authority", None)
+        self.activation_authority_dir = Path(
+            getattr(authority, "state_dir", self.root.parent / "workspace-authority")
+        ).absolute()
         self._trusted = _verified_installation() if trusted_runtime is None else trusted_runtime
         self._workers = {}
         self._worker_projects = {}
@@ -275,6 +282,19 @@ class AgentTaskManager:
         if not self._trusted:
             raise HostRuntimeError("UNSAFE_RUNTIME")
 
+    def _workspace_guard(self):
+        from workspace_host import resolve_workspace
+        workspace = resolve_workspace(self.projects, self.workspace)
+        if workspace is not None and workspace.enabled:
+            # This legacy isolated-agent snapshot/CAS pipeline has a separate
+            # contract. Close it until it supports common workspace admission.
+            from workspace_paths import WorkspaceError
+            try:
+                workspace._context()
+            except WorkspaceError:
+                raise HostRuntimeError("WORKSPACE_AUTHORITY_INVALID") from None
+            raise HostRuntimeError("WORKSPACE_ISOLATED_AGENT_UNSUPPORTED")
+
     def _path(self, task_id):
         if not isinstance(task_id, str) or TASK_ID.fullmatch(task_id) is None:
             raise HostRuntimeError("INVALID_TASK_ID")
@@ -299,7 +319,19 @@ class AgentTaskManager:
 
     def prepare(self, project, *, profile_id, objective, reason, request_id,
                 timeout_minutes=30, task_label=None):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._prepare_admitted(
+                    project, profile_id=profile_id, objective=objective, reason=reason,
+                    request_id=request_id, timeout_minutes=timeout_minutes,
+                    task_label=task_label)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _prepare_admitted(self, project, *, profile_id, objective, reason, request_id,
+                          timeout_minutes=30, task_label=None):
         self._guard(project)
+        self._workspace_guard()
         # Registered source review is optional for the legacy read-only server.
         # Missing it must close delegation without taking that server down.
         try:
@@ -428,6 +460,7 @@ class AgentTaskManager:
 
     def approve_web(self, project, *, task_id, plan_digest, source_digest, confirmation):
         self._guard(project)
+        self._workspace_guard()
         if confirmation != task_id:
             raise HostRuntimeError("HOST_APPROVAL_DENIED")
         with _lock(self.lock):
@@ -473,7 +506,15 @@ class AgentTaskManager:
             return _public(item)
 
     async def start(self, project, task_id):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return await self._start_admitted(project, task_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    async def _start_admitted(self, project, task_id):
         self._guard(project)
+        self._workspace_guard()
         with _lock(self.lock):
             item = self._recover_owner_lost(self._load(project, task_id))
             if item["state"] in TERMINAL | ACTIVE:
@@ -554,6 +595,7 @@ class AgentTaskManager:
                     current["provider_usage"] = event["usage"]
                 self._save(current)
         try:
+            self._workspace_guard()
             setter = getattr(self.runner, "set_task_callbacks", None)
             if setter is not None:
                 setter(task_id, on_identity=on_identity, on_event=on_event)
@@ -575,6 +617,7 @@ class AgentTaskManager:
             safe = result if isinstance(result, dict) else {}
             code = safe.get("code") if isinstance(safe.get("code"), str) else None
             if safe.get("verified") is True:
+                self._workspace_guard()
                 from agent_results import apply_agent_result
                 with _lock(self.lock):
                     current = self._load(project, task_id)

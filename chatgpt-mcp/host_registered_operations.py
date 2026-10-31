@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 import functools
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -50,8 +51,14 @@ from host_runtime_operations import (
     acquire_flock, default_state_dir, host_admission, lock_busy, operation_path,
 )
 from host_source_review import freeze_source, inventory_source
+from workspace_host import (
+    acquire_host_operation_lane, complete_host_operation, resolve_workspace,
+)
+from workspace_control import WorkspaceControlError, activation_admission
 
 MODULE_DIR = Path(__file__).resolve().parent
+_LOGGER = logging.getLogger(__name__)
+_RESERVATION_RELEASE_FAILED = "WORKSPACE_HOST_RESERVATION_RELEASE_FAILED"
 EXECUTOR_MODULES = ("host_registered_operations.py", "host_process.py", "host_source_review.py",
                     "host_registry.py", "host_actions.py", "host_runtime.py",
                     "host_runtime_config.py", "host_runtime_operations.py")
@@ -256,7 +263,8 @@ class _Emitter:
 
 
 class RegisteredHostOperations:
-    def __init__(self, projects, registry, *, state_dir=None, adapter_factory=None, runner=None):
+    def __init__(self, projects, registry, *, state_dir=None, adapter_factory=None, runner=None,
+                 workspace=None):
         self.projects = projects
         self.registry = registry
         self.state_dir = validate_state_root(state_dir or default_state_dir(), projects)
@@ -273,6 +281,11 @@ class RegisteredHostOperations:
         self.legacy_target_lock_path = self.state_dir / "target.lock"
         self.adapter_factory = adapter_factory or _default_adapter_factory
         self.runner = runner or run_registered_command
+        self.workspace = resolve_workspace(projects, workspace)
+        authority = getattr(self.workspace, "authority", None)
+        self.activation_authority_dir = Path(
+            getattr(authority, "state_dir", self.state_dir.parent / "workspace-authority")
+        ).absolute()
         self.executor_files = [MODULE_DIR / name for name in EXECUTOR_MODULES]
         # Tests may inject BOTH an adapter factory and a fake runner. Either one alone, the
         # real runner passed explicitly, or a helper script inside a project checkout never
@@ -615,6 +628,15 @@ class RegisteredHostOperations:
     # ----- public API ----------------------------------------------------------------
     @_no_raw_os_errors
     def prepare(self, project, target, *, action, parameters, request_id) -> dict:
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._prepare_admitted(
+                    project, target, action=action, parameters=parameters,
+                    request_id=request_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _prepare_admitted(self, project, target, *, action, parameters, request_id) -> dict:
         self._require_trusted_runtime()
         if not isinstance(request_id, str) or not REQUEST_PATTERN.fullmatch(request_id):
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
@@ -797,14 +819,28 @@ class RegisteredHostOperations:
                 raise HostRuntimeError("HOST_APPROVAL_REQUIRED")
             if state["state"] != "approved":
                 return state
-        with host_admission(self.state_dir.parent):
-            return self._begin_admitted(project, target, operation_id)
+        workspace_fd = acquire_host_operation_lane(
+            self.workspace, operation_id=operation_id, kind="registered")
+        handed_to_worker = False
+        try:
+            with host_admission(self.state_dir.parent):
+                state = self._begin_admitted(
+                    project, target, operation_id, workspace_fd=workspace_fd)
+                handed_to_worker = state.get("state") == "queued"
+                return state
+        finally:
+            if not handed_to_worker:
+                complete_host_operation(
+                    self.workspace, operation_id, "registered",
+                    termination_verified=True)
+            if workspace_fd is not None:
+                os.close(workspace_fd)
 
-    def _begin_admitted(self, project, target, operation_id) -> dict:
+    def _begin_admitted(self, project, target, operation_id, *, workspace_fd=None) -> dict:
         """Verify, consume the receipt, queue and hand the target lock to a worker thread,
         all in this one synchronous call: lock ownership never crosses an await boundary,
         so cancelling execute() cannot orphan the receipt, the state or the lock."""
-        target_fd = None
+        target_fd = worker_workspace_fd = None
         try:
             with _lock(self.lock_path):
                 state = self._refresh(self._load(project, target, operation_id))
@@ -815,12 +851,14 @@ class RegisteredHostOperations:
                 receipt = self._check_receipt(state)
                 target_fd = acquire_flock(self._lock_path_for(state["immutable"]["target_lock"]))
                 target_spec, adapter = self._verify_or_reject(state)
+                if workspace_fd is not None:
+                    worker_workspace_fd = os.dup(workspace_fd)
                 receipt.unlink()  # One use, before any adapter effect.
                 self._transition(state, ("QUEUED", "OPERATION_QUEUED", {}), state="queued",
                                  phase="QUEUED", code=None, started_at=_now().isoformat())
                 worker = threading.Thread(
                     target=self._run_operation, name="host-operation-" + operation_id[:8],
-                    args=(operation_id, target_fd, target_spec, adapter))
+                    args=(operation_id, target_fd, worker_workspace_fd, target_spec, adapter))
                 self._workers[operation_id] = worker
                 try:
                     worker.start()
@@ -830,25 +868,62 @@ class RegisteredHostOperations:
                                              {"error_code": "EXECUTOR_UNAVAILABLE"}),
                                      state="failed", code="EXECUTOR_UNAVAILABLE",
                                      finished_at=_now().isoformat())
+                    complete_host_operation(
+                        self.workspace, operation_id, "registered",
+                        termination_verified=True)
                     raise HostRuntimeError("EXECUTOR_UNAVAILABLE") from None
                 target_fd = None  # The worker owns and closes it.
+                worker_workspace_fd = None
                 return state
         finally:
             if target_fd is not None:
                 os.close(target_fd)
+            if worker_workspace_fd is not None:
+                os.close(worker_workspace_fd)
 
     async def execute(self, project, target, operation_id) -> dict:
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return await self._execute_activation_admitted(
+                    project, target, operation_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    async def _execute_activation_admitted(self, project, target, operation_id) -> dict:
         self._require_trusted_runtime()
         state = await asyncio.to_thread(self._begin, project, target, operation_id)
         return self._public(state)
 
-    def _run_operation(self, operation_id, target_fd, target_spec, adapter) -> None:
+    def _run_operation(self, operation_id, target_fd, workspace_fd, target_spec, adapter) -> None:
         """Owns the target lock from queueing through postcheck."""
         try:
             self._run_body(operation_id, target_spec, adapter)
         finally:
-            os.close(target_fd)
-            self._workers.pop(operation_id, None)
+            try:
+                try:
+                    if self._read_state(operation_id)["state"] in {
+                            "succeeded", "failed", "rejected"}:
+                        complete_host_operation(
+                            self.workspace, operation_id, "registered",
+                            termination_verified=True)
+                except (HostRuntimeError, OSError):
+                    self._record_reservation_release_failure(operation_id)
+            finally:
+                os.close(target_fd)
+                if workspace_fd is not None:
+                    os.close(workspace_fd)
+                self._workers.pop(operation_id, None)
+
+    def _record_reservation_release_failure(self, operation_id):
+        _LOGGER.error(_RESERVATION_RELEASE_FAILED)
+        try:
+            self._record(
+                operation_id,
+                ("RECOVER", _RESERVATION_RELEASE_FAILED, {}),
+                state="outcome_unknown", phase="RECOVER",
+                code=_RESERVATION_RELEASE_FAILED, finished_at=_now().isoformat())
+        except (HostRuntimeError, OSError):
+            _LOGGER.error("WORKSPACE_HOST_RESERVATION_STATE_WRITE_FAILED")
 
     def _run_body(self, operation_id, target_spec, adapter) -> None:
         context = None

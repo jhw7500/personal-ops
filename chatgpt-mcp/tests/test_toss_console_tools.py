@@ -63,7 +63,7 @@ async def check(provider=None):
 
 class ToolSpecTest(unittest.TestCase):
     def test_exact_scope_readonly_annotations_and_no_payload_input(self):
-        self.assertEqual(len(TOSS_CONSOLE_TOOL_SPECS), 2)
+        self.assertEqual(len(TOSS_CONSOLE_TOOL_SPECS), 3)
         spec = TOSS_CONSOLE_TOOL_SPECS[0]
         self.assertEqual(spec["name"], "get_toss_test_console_status")
         self.assertEqual(spec["inputSchema"]["required"], ["project", "target"])

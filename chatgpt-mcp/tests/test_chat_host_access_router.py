@@ -75,9 +75,9 @@ class ChatHostAccessRouterTests(unittest.IsolatedAsyncioTestCase):
                                 "connectDomains": [], "resourceDomains": []})
 
                             opened = await client.call_tool("open_host_access_approval", {
-                                "project": "alpha", "duration_seconds": 28800, "allow_codex": True})
+                                "project": "alpha", "duration_seconds": 2592000, "allow_codex": True})
                             self.assertFalse(opened.isError, text(opened))
-                            self.assertEqual(opened.structuredContent["duration_seconds"], 28800)
+                            self.assertEqual(opened.structuredContent["duration_seconds"], 2592000)
                             token = opened.meta["host_access_confirmation"]
                             self.assertNotIn(token, text(opened))
                             self.assertNotIn(token, json.dumps(opened.structuredContent))

@@ -103,16 +103,16 @@ class AdminHostAccessTest(unittest.TestCase):
 
     def test_wrong_project_or_confirmation_or_duration_is_denied(self):
         endpoint = "/api/host-access-approve?project=demo"
-        for changes in ({"confirmation": "another"}, {"duration_seconds": 28801},
+        for changes in ({"confirmation": "another"}, {"duration_seconds": 2592001},
                         {"duration_seconds": True}, {"allow_codex": "true"}):
             self.assertEqual(self.request("POST", endpoint, self.body(**changes))[0], 400)
         self.assertEqual(self.request("POST", endpoint + "&project=demo", self.body())[0], 400)
         self.assertEqual(self.request("POST", endpoint.replace("demo", "missing"), self.body())[0], 400)
         self.assertFalse(self.access.get("demo")["active"])
 
-    def test_owner_can_grant_eight_hours_without_starting_execution(self):
+    def test_owner_can_grant_thirty_days_without_starting_execution(self):
         code, _grant = self.request("POST", "/api/host-access-approve?project=demo",
-                                    self.body(duration_seconds=28800))
+                                    self.body(duration_seconds=2592000))
         self.assertEqual(code, 200)
         self.assertTrue(self.access.get("demo")["active"])
         self.assertEqual(self.execution.cancelled, [])

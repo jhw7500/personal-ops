@@ -23,6 +23,7 @@ import host_runtime_operations  # noqa: E402
 from host_access import HostAccess  # noqa: E402
 from host_access_ui import HostAccessApprovals  # noqa: E402
 from host_runtime_config import HostRuntimeError  # noqa: E402
+from workspace_tools import WorkspaceTools  # noqa: E402
 
 
 class HostAccessTests(unittest.TestCase):
@@ -60,6 +61,111 @@ class HostAccessTests(unittest.TestCase):
             duration_seconds=duration_seconds, allow_codex=allow_codex,
             confirmation="personal-ops",
         )
+
+    def active_workspace(self):
+        os.chmod(self.project_root, 0o700)
+        owner = self.root / "workspace-owner"
+        owner.mkdir(mode=0o700)
+        policy_path = owner / "policy.json"
+        policy_path.write_text(json.dumps({
+            "version": 1,
+            "base_root": str(self.root),
+            "artifacts": [],
+            "protected_paths": [],
+        }), encoding="utf-8")
+        os.chmod(policy_path, 0o600)
+        workspace = WorkspaceTools(
+            {"personal-ops": self.project_root},
+            state_dir=self.root / "workspace-authority",
+            config_path=policy_path,
+        )
+        snapshot = workspace.policy.load(required=True)
+        workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
+        return workspace, policy_path
+
+    def test_active_workspace_epoch_is_part_of_legacy_runtime_binding(self):
+        workspace, policy_path = self.active_workspace()
+        access = HostAccess(
+            {"personal-ops": self.project_root}, self.state_root,
+            trusted_runtime=lambda: self.runtime_identity, workspace=workspace)
+        request = access.request("personal-ops")
+        grant = access.approve_web(
+            "personal-ops", request_id=request["request_id"], duration_seconds=60,
+            allow_codex=False, confirmation="personal-ops")
+        pending = access.request("personal-ops")
+        original_identity = access._runtime_identity()
+        self.assertNotEqual(original_identity, self.runtime_identity)
+        stored = access._load("personal-ops", self.project_root)
+        self.assertEqual(stored["grant"]["runtime_identity"], original_identity)
+        self.assertNotIn("authority_epoch", stored["grant"])
+        self.assertNotIn("policy_digest", stored["grant"])
+        original_policy = policy_path.read_bytes()
+
+        policy_path.write_text(json.dumps({
+            "version": 1,
+            "base_root": str(self.root),
+            "artifacts": [],
+            "protected_paths": [str(self.project_root / "protected")],
+        }), encoding="utf-8")
+        new_snapshot = workspace.policy.load(required=True)
+        workspace.authority.advance(new_snapshot.digest)
+        self.assert_error(
+            "HOST_ACCESS_RUNTIME_CHANGED",
+            lambda: access.require("personal-ops", grant_id=grant["grant_id"]))
+        self.assert_error(
+            "HOST_ACCESS_REQUEST_STALE",
+            lambda: access.approve_web(
+                "personal-ops", request_id=pending["request_id"], duration_seconds=60,
+                allow_codex=False, confirmation="personal-ops"))
+
+        policy_path.write_bytes(original_policy)
+        restored = workspace.policy.load(required=True)
+        workspace.authority.advance(restored.digest)
+        self.assertNotEqual(access._runtime_identity(), original_identity)
+        self.assert_error(
+            "HOST_ACCESS_RUNTIME_CHANGED",
+            lambda: access.require("personal-ops", grant_id=grant["grant_id"]))
+
+    def test_active_workspace_missing_or_corrupt_authority_is_bounded(self):
+        workspace, policy_path = self.active_workspace()
+        policy_bytes = policy_path.read_bytes()
+        access = HostAccess(
+            {"personal-ops": self.project_root}, self.state_root,
+            trusted_runtime=lambda: self.runtime_identity, workspace=workspace)
+        policy_path.unlink()
+        self.assert_error("HOST_ACCESS_WORKSPACE_INVALID", access._runtime_identity)
+        policy_path.write_text("{}", encoding="utf-8")
+        os.chmod(policy_path, 0o600)
+        self.assert_error("HOST_ACCESS_WORKSPACE_INVALID", access._runtime_identity)
+        policy_path.write_bytes(policy_bytes)
+        authority_file = workspace.authority.state_dir / "authority.json"
+        authority_file.write_text("{}", encoding="utf-8")
+        os.chmod(authority_file, 0o600)
+        self.assert_error("HOST_ACCESS_WORKSPACE_INVALID", access._runtime_identity)
+
+    def test_direct_host_access_discovers_installed_default_workspace(self):
+        config_home = self.root / "default-config"
+        state_home = self.root / "default-workspace-state"
+        with mock.patch.dict(os.environ, {
+            "XDG_CONFIG_HOME": str(config_home), "XDG_STATE_HOME": str(state_home),
+        }):
+            policy = config_home / "chatgpt-coding-mcp" / "workspace-policy.json"
+            policy.parent.mkdir(parents=True, mode=0o700)
+            config_home.chmod(0o700)
+            policy.write_text(json.dumps({
+                "version": 1, "base_root": str(self.root),
+                "artifacts": [], "protected_paths": [],
+            }), encoding="utf-8")
+            os.chmod(policy, 0o600)
+            workspace = WorkspaceTools({"personal-ops": self.project_root})
+            snapshot = workspace.policy.load(required=True)
+            workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
+            access = HostAccess(
+                {"personal-ops": self.project_root}, self.state_root,
+                trusted_runtime=lambda: self.runtime_identity)
+
+        self.assertIsNotNone(access.workspace)
+        self.assertNotEqual(access._runtime_identity(), self.runtime_identity)
 
     def test_no_grant_and_request_only_are_safe_public_status(self):
         status = self.access.get("personal-ops")
@@ -122,20 +228,33 @@ class HostAccessTests(unittest.TestCase):
         base = dict(request_id=requested["request_id"], allow_codex=False)
         self.assert_error("HOST_ACCESS_CONFIRMATION_DENIED", lambda: self.access.approve_web(
             "personal-ops", duration_seconds=60, confirmation="approve", **base))
-        for duration in (0, 28_801, True, "60"):
+        for duration in (0, 2_592_001, True, "60"):
             with self.subTest(duration=duration):
                 self.assert_error("INVALID_HOST_ACCESS_DURATION", lambda: self.access.approve_web(
                     "personal-ops", duration_seconds=duration,
                     confirmation="personal-ops", **base))
         self.assertFalse(self.access.get("personal-ops")["active"])
 
-    def test_none_duration_uses_four_hour_default(self):
+    def test_none_duration_uses_thirty_day_default(self):
         requested = self.access.request("personal-ops")
         grant = self.access.approve_web(
             "personal-ops", request_id=requested["request_id"],
             duration_seconds=None, allow_codex=False, confirmation="personal-ops")
         self.assertEqual(
-            datetime.fromisoformat(grant["expires_at"]), self.now + timedelta(seconds=14_400))
+            datetime.fromisoformat(grant["expires_at"]), self.now + timedelta(days=30))
+
+    def test_thirty_day_grant_survives_reconnect_and_expires_at_the_limit(self):
+        grant = self.approve(duration_seconds=30 * 24 * 60 * 60)
+        before = self.access._record_path("personal-ops").read_bytes()
+        self.now += timedelta(days=29)
+        reconnected = HostAccess(
+            {"personal-ops": self.project_root}, self.state_root,
+            trusted_runtime=lambda: self.runtime_identity,
+        )
+        self.assertEqual(reconnected.require("personal-ops"), grant)
+        self.assertEqual(reconnected._record_path("personal-ops").read_bytes(), before)
+        self.now += timedelta(days=1)
+        self.assert_error("HOST_ACCESS_EXPIRED", lambda: reconnected.require("personal-ops"))
 
     def test_eight_hour_grant_expires_at_the_limit(self):
         grant = self.approve(duration_seconds=28_800)
@@ -246,7 +365,7 @@ class HostAccessTests(unittest.TestCase):
             "personal-ops", **arguments))
 
         stale = self.access.request("personal-ops")
-        self.now += timedelta(seconds=601)
+        self.now += timedelta(days=7)
         self.assert_error("HOST_ACCESS_REQUEST_EXPIRED", lambda: self.access.approve_web(
             "personal-ops", request_id=stale["request_id"], duration_seconds=60,
             allow_codex=False, confirmation="personal-ops"))

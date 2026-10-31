@@ -26,3 +26,6 @@ HANDOFF.*.md
 **/.omc/
 **/.bkit/
 **/.claude/
+
+# Host-local validation copies and temporary diagnostic outputs.
+/tmp/

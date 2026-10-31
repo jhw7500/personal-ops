@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -66,6 +67,88 @@ class RuntimeRolloutWebTest(unittest.TestCase):
             function()
         self.assertEqual(caught.exception.code, code)
 
+    def test_neutral_ab24_command_is_snapshot_source_and_control_not_runtime_target(self):
+        command = self.root / "chatgpt-mcp" / "tossapp_neutral_ab24_command.js"
+        self.assertTrue(command.is_file())
+        paths = {item["path"] for item in _catalog(self.root)["files"]}
+        self.assertIn("chatgpt-mcp/tossapp_neutral_ab24_command.js", paths)
+        target_before, control_before = _expected_snapshots(self.root)
+        command.write_bytes(command.read_bytes() + b"\n// test drift\n")
+        target_after, control_after = _expected_snapshots(self.root)
+        self.assertEqual(target_after, target_before)
+        self.assertNotEqual(control_after, control_before)
+
+    def test_control_approval_accepts_only_current_and_previous_bootstrap_digest(self):
+        script = self.root / "chatgpt-mcp/rollout-host-runtime.py"
+        spec = importlib.util.spec_from_file_location("control_compat_rollout", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        observed = module.control_inventory()
+        _target, current = _expected_snapshots(self.root)
+        legacy_map = dict(observed)
+        self.assertIn(runtime_rollout_web.LEGACY_CONTROL_OMIT, legacy_map)
+        legacy_map.pop(runtime_rollout_web.LEGACY_CONTROL_OMIT)
+        legacy = hashlib.sha256(
+            json.dumps(legacy_map, sort_keys=True).encode()
+        ).hexdigest()
+        self.assertNotEqual(current, legacy)
+        self.assertTrue(
+            runtime_rollout_web._approved_control_matches(current, current, observed)
+        )
+        self.assertTrue(
+            runtime_rollout_web._approved_control_matches(legacy, current, observed)
+        )
+        self.assertFalse(
+            runtime_rollout_web._approved_control_matches("0" * 64, current, observed)
+        )
+        tampered = dict(observed)
+        key = next(key for key in tampered if key != runtime_rollout_web.LEGACY_CONTROL_OMIT)
+        tampered[key] = "f" * 64
+        self.assertFalse(
+            runtime_rollout_web._approved_control_matches(legacy, current, tampered)
+        )
+
+    def test_web_grant_accepts_previous_bootstrap_control_digest(self):
+        script = self.root / "chatgpt-mcp/rollout-host-runtime.py"
+        spec = importlib.util.spec_from_file_location("legacy_grant_rollout", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        installer = module._import_installer()
+        source = _catalog(self.root)
+        target, current = _expected_snapshots(self.root)
+        observed = module.control_inventory()
+        legacy_map = dict(observed)
+        legacy_map.pop(runtime_rollout_web.LEGACY_CONTROL_OMIT)
+        legacy = hashlib.sha256(
+            json.dumps(legacy_map, sort_keys=True).encode()
+        ).hexdigest()
+        self.assertNotEqual(current, legacy)
+
+        state_root = self.base / "grant-state"
+        plans = state_root / "plans"
+        plans.mkdir(parents=True, mode=0o700)
+        operation_id = "a" * 32
+        fixed = {
+            "source_digest": source["digest"],
+            "target_snapshot": target,
+            "control_digest": legacy,
+        }
+        plan = {
+            "state": "running",
+            "worker_pid": os.getpid(),
+            "immutable": fixed,
+            "plan_digest": runtime_rollout_web._digest(fixed),
+        }
+        runtime_rollout_web._save_private_json(
+            plans / (operation_id + ".json"), plan
+        )
+        grant = WebRolloutGrant(
+            operation_id, source["digest"], target, legacy, state_root
+        )
+        grant.verify(
+            self.root, installer, module.inventory, module.control_inventory
+        )
+
     def test_no_execution_before_web_approval(self):
         plan = self.prepare()
         self.assertEqual(plan["state"], "pending_host_approval")
@@ -80,6 +163,23 @@ class RuntimeRolloutWebTest(unittest.TestCase):
         self.assert_error("ROLLOUT_NOT_APPROVED",
                           lambda: self.ops.execute(PROJECT, plan["operation_id"]))
         self.assertFalse(self.started)
+
+    def test_pending_rollout_can_be_approved_six_days_after_creation(self):
+        plan = self.prepare("six-day-approval")
+        created = runtime_rollout_web._expires(plan["created_at"])
+        with mock.patch.object(
+                runtime_rollout_web, "_utc", return_value=created + timedelta(days=6)):
+            approved = self.approve(plan)
+        self.assertTrue(approved["approved"])
+        self.assertEqual(self.ops.get(PROJECT, plan["operation_id"])["state"], "approved")
+
+    def test_pending_rollout_expires_exactly_seven_days_after_creation(self):
+        plan = self.prepare("seven-day-expiry")
+        created = runtime_rollout_web._expires(plan["created_at"])
+        with mock.patch.object(
+                runtime_rollout_web, "_utc", return_value=created + timedelta(days=7)):
+            self.assert_error("ROLLOUT_APPROVAL_DENIED", lambda: self.approve(plan))
+        self.assertFalse((self.ops.receipts_dir / (plan["operation_id"] + ".json")).exists())
 
     def test_explicit_web_approval_does_not_run_anything_and_cannot_be_replayed(self):
         plan = self.prepare()
@@ -497,6 +597,69 @@ class RuntimeRolloutWebTest(unittest.TestCase):
                           lambda: self.ops.execute(PROJECT, next_plan["operation_id"]))
         self.assertFalse(self.started)
 
+    def test_new_prepare_retires_source_stale_pending_plan(self):
+        old = self.prepare("stale-pending")
+        source = self.root / "chatgpt-mcp" / "host_runtime_tools.py"
+        source.write_bytes(source.read_bytes() + b"\n# stale pending plan\n")
+
+        replacement = self.prepare("replacement-after-source-drift")
+
+        retired = self.ops.get(PROJECT, old["operation_id"])
+        self.assertEqual((retired["state"], retired["phase"], retired["code"]),
+                         ("expired", "APPROVAL", "ROLLOUT_SOURCE_CHANGED"))
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+        self.assert_error("ROLLOUT_APPROVAL_DENIED", lambda: self.approve(old))
+        self.assertFalse(self.started)
+
+    def test_new_prepare_retires_source_stale_approved_plan_and_receipt(self):
+        old = self.prepare("stale-approved")
+        self.approve(old)
+        receipt = self.ops.receipts_dir / (old["operation_id"] + ".json")
+        self.assertTrue(receipt.is_file())
+        source = self.root / "chatgpt-mcp" / "server.py"
+        source.write_bytes(source.read_bytes() + b"\n# stale approved plan\n")
+
+        replacement = self.prepare("replacement-after-approved-drift")
+
+        retired = self.ops.get(PROJECT, old["operation_id"])
+        self.assertEqual((retired["state"], retired["code"]),
+                         ("expired", "ROLLOUT_SOURCE_CHANGED"))
+        self.assertFalse(receipt.exists())
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+        result = self.ops.execute(PROJECT, old["operation_id"])
+        self.assertEqual(result["state"], "expired")
+        self.assertFalse(self.started)
+
+    def test_new_prepare_keeps_unchanged_approved_plan_blocking(self):
+        old = self.prepare("unchanged-approved")
+        self.approve(old)
+        self.assert_error("ROLLOUT_ALREADY_PENDING",
+                          lambda: self.prepare("must-remain-blocked"))
+        self.assertEqual(self.ops.get(PROJECT, old["operation_id"])["state"], "approved")
+
+    def test_new_prepare_does_not_retire_plan_when_staleness_check_is_uncertain(self):
+        old = self.prepare("uncertain-source-check")
+        with mock.patch.object(
+                self.ops, "_check_source",
+                side_effect=HostRuntimeError("ROLLOUT_SNAPSHOT_MISSING")):
+            self.assert_error("ROLLOUT_SNAPSHOT_MISSING",
+                              lambda: self.prepare("uncertain-replacement"))
+        self.assertEqual(self.ops.get(PROJECT, old["operation_id"])["state"],
+                         "pending_host_approval")
+
+    def test_expired_pending_plan_with_missing_snapshot_does_not_block_replacement(self):
+        old = self.prepare("expired-missing-snapshot")
+        stored = self.ops._load(old["operation_id"])
+        stored["immutable"]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        stored["plan_digest"] = runtime_rollout_web._digest(stored["immutable"])
+        self.ops._save(stored)
+        shutil.rmtree(self.ops.snapshots_dir / old["operation_id"])
+
+        replacement = self.prepare("replacement-after-expired-snapshot")
+
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+        self.assertEqual(replacement["state"], "pending_host_approval")
+
     def test_changed_source_after_queue_marks_worker_preflight_failed(self):
         plan = self.prepare()
         self.approve(plan)
@@ -567,6 +730,27 @@ class RuntimeRolloutWebTest(unittest.TestCase):
                                   grant.state_root)
         with self.assertRaisesRegex(RuntimeError, "WEB_ROLLOUT_GRANT_INVALID"):
             tampered.verify(frozen, installer, module.inventory, module.control_inventory)
+
+    def test_control_snapshot_pins_test_runner_and_node_ui_inputs(self):
+        _target, before = _expected_snapshots(self.root)
+        for relative in ("rollout_test_runner.py", "tests/test_workspace_approval_ui.mjs"):
+            source = self.root / "chatgpt-mcp" / relative
+            original = source.read_bytes()
+            source.write_bytes(original + b"\n// fixture drift\n")
+            try:
+                _target, changed = _expected_snapshots(self.root)
+                self.assertNotEqual(changed, before)
+            finally:
+                source.write_bytes(original)
+            self.assertEqual(_expected_snapshots(self.root)[1], before)
+
+    def test_control_snapshot_requires_workspace_node_verifier(self):
+        required = self.root / "chatgpt-mcp/tests/test_workspace_approval_ui.mjs"
+        required.unlink()
+        self.assert_error(
+            "ROLLOUT_SOURCE_INCOMPLETE",
+            lambda: _expected_snapshots(self.root),
+        )
 
 
 if __name__ == "__main__":

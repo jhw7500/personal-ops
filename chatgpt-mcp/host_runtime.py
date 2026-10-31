@@ -797,6 +797,14 @@ class HostRuntime:
             "worker": {"AI_PROVIDER", "AI_MODEL", "AI_GENERATION_TIMEOUT_MS"},
             "db": {"POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD_FILE"},
         }
+        api_environment = api.get("environment")
+        if isinstance(api_environment, dict) and "READING_TEST_PROMPT_VERSION" in api_environment:
+            prompt_version = api_environment["READING_TEST_PROMPT_VERSION"]
+            if not isinstance(prompt_version, str) or prompt_version not in {
+                "tarot-grounded.v1", "tarot-grounded.v7",
+            }:
+                raise HostRuntimeError("WRONG_COMPOSE_CONFIG")
+            allowed_environment["api"].add("READING_TEST_PROMPT_VERSION")
         if any(not isinstance(services[name].get("environment"), dict)
                or set(services[name]["environment"]) != allowed
                for name, allowed in allowed_environment.items()):

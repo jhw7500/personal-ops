@@ -8,6 +8,7 @@ itself host execution privileges.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 
 from host_command_operations import HostCommandOperations
@@ -52,7 +53,7 @@ HOST_COMMAND_TOOL_SPECS = [
           {}, readonly=True),
     _spec("prepare_host_command", "호스트 명령 실행 승인 계획 생성",
           "Freeze one host-owned command profile's exact executable, arguments, "
-          "source inputs and checksums into a 10-minute plan. No command executes. "
+          "source inputs and checksums into a 7-day plan. No command executes. "
           "Returns an inline confirmation card for a separate one-use user approval. "
           "Use its approval/cancel buttons; do not substitute an external approval page. "
           "This cannot run arbitrary shell text or inherit other Docker/agent target grants.",
@@ -74,24 +75,34 @@ HOST_COMMAND_TOOL_SPECS = [
 ]
 
 
-def create_host_command_manager(projects, state_dir):
+def create_host_command_manager(projects, state_dir, workspace=None):
     return HostCommandOperations(
         projects, config_path=Path.home() / ".config/chatgpt-coding-mcp/host-commands.json",
         state_dir=Path(state_dir) / "host-runtime" / "commands",
+        workspace=workspace,
     )
 
 
 class HostCommandTools:
-    def __init__(self, projects, state_dir, project_locks):
+    def __init__(self, projects, state_dir, project_locks, workspace=None):
         self.projects = projects
         self.state_dir = state_dir
         self.project_locks = project_locks
         self.names = frozenset(NAMES)
         self._manager = None
+        self.workspace = workspace
 
     def manager(self):
         if self._manager is None:
-            self._manager = create_host_command_manager(self.projects, self.state_dir)
+            factory_accepts_workspace = "workspace" in inspect.signature(
+                create_host_command_manager).parameters
+            if self.workspace is None or not factory_accepts_workspace:
+                self._manager = create_host_command_manager(self.projects, self.state_dir)
+                if self.workspace is not None:
+                    self._manager.workspace = self.workspace
+            else:
+                self._manager = create_host_command_manager(
+                    self.projects, self.state_dir, workspace=self.workspace)
         return self._manager
 
     async def call(self, name, arguments):

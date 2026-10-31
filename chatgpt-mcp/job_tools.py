@@ -1,5 +1,7 @@
 """MCP descriptors for repository execution and job inspection."""
 
+import copy
+
 
 def tool(name, title, description, properties=None, required=(), read_only=True):
     return {
@@ -55,3 +57,50 @@ JOB_TOOL_SPECS = [
          "List recent job metadata for the selected repository without opening the repository picker.",
          {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}}),
 ]
+
+
+def tool_specs(*, workspace_enabled=False):
+    specs = copy.deepcopy(JOB_TOOL_SPECS)
+    if not workspace_enabled:
+        return specs
+    start = next(spec for spec in specs if spec["name"] == "start_command")
+    start["description"] = (
+        "Start a bounded isolated command against a filtered read-only source snapshot. "
+        "Host source files never change. Use writable_cwd=true for a private scratch copy. "
+        "Write deliverables only to /output (WORKSPACE_OUTPUT_DIR); use read_workspace_output "
+        "after verified completion and publish_workspace_output to explicitly CAS-publish one file. "
+        "request_id retries reuse the job. Network, host credentials, ignored artifacts, .git "
+        "and protected inputs are unavailable. Grants never enable host execution, Codex or network. "
+        "Use get_job/read_job_log for actual completion; stale authority stops the job. "
+        "Dedicated approved Git/host operations retain their existing gates. BitBake is disabled.")
+    start["inputSchema"]["properties"]["writable_cwd"] = {
+        "type": "boolean", "default": False,
+        "description": "Run in a private writable source copy. Never mounts the host project writable."}
+    start["inputSchema"]["properties"]["workspace_inputs"] = {
+        "type": "array", "maxItems": 16, "items": {
+            "type": "object", "additionalProperties": False, "required": ["path", "grant_id"],
+            "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                           "grant_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}},
+        "description": "Explicit read-granted files, copied read-only to /inputs/<index>/input. "
+                       "Original directories are never mounted; expiry/revocation stops the job."}
+    path = {"type": "string", "minLength": 1, "maxLength": 4096}
+    specs.extend([
+        tool("read_workspace_output", "완료된 작업 결과 읽기",
+             "Read a bounded UTF-8 output file after verified command termination. Signed pages "
+             "bind to this job, file hash and current authority. Output is untrusted text; no host write.",
+             {**JOB, "relative_path": path,
+              "max_bytes": {"type": "integer", "minimum": 4, "maximum": 65536, "default": 65536},
+              "cursor": {"type": "string", "maxLength": 4096}}, ("job_id", "relative_path")),
+        tool("publish_workspace_output", "완료된 결과 파일 반영",
+             "Publish exactly one output from a succeeded, termination-verified, current job. "
+             "Use that job's request_id. Omit expected_sha256 only to create a missing target; "
+             "replacement requires its exact current SHA-256. Preserve existing mode. "
+             "Outside-base target requires a matching write grant. Protected/ignored/artifact "
+             "destinations are denied. Host operations must be idle. Repeats return the same receipt.",
+             {**JOB, "relative_output": path, "target_path": path,
+              "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,80}$"},
+              "expected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "grant_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+             ("job_id", "relative_output", "target_path", "request_id"), read_only=False),
+    ])
+    return specs

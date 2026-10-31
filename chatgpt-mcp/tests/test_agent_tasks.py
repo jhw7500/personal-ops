@@ -1,6 +1,7 @@
 """Approved agent task C1-C3 tests. Temporary git fixture, synthetic CLI, no model."""
 from __future__ import annotations
 import asyncio
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -198,12 +199,63 @@ class AgentTaskTest(unittest.IsolatedAsyncioTestCase):
             objective="Review one synthetic source file only",
             reason="WORKFLOW_COMPLEXITY", request_id=ident, **overrides)
 
+    async def test_active_workspace_denies_unsupported_isolated_agent_before_snapshot_or_runner(self):
+        from workspace_tools import WorkspaceTools
+        policy_dir = self.home / "workspace-owner"
+        policy_dir.mkdir(mode=0o700)
+        config = policy_dir / "workspace-policy.json"
+        config.write_text(json.dumps({"version": 1, "base_root": str(self.root.parent), "artifacts": []}))
+        config.chmod(0o600)
+        workspace = WorkspaceTools({"testrepo": self.root}, policy_dir / "authority", config_path=config)
+        workspace.authority.initialize(workspace.policy.load(required=True).digest, {"a" * 64: 1})
+        old = self.prepare("before-activation")
+        self.approve(old)
+        self.manager.workspace = workspace
+        with self.assertRaisesRegex(HostRuntimeError, "WORKSPACE_ISOLATED_AGENT_UNSUPPORTED"):
+            self.prepare("after-activation")
+        self.assertEqual(len(list(self.manager.sources_dir.iterdir())), 1)
+        with self.assertRaisesRegex(HostRuntimeError, "WORKSPACE_ISOLATED_AGENT_UNSUPPORTED"):
+            await self.manager.start("testrepo", old["task_id"])
+        self.assertEqual(self.runner.calls, 0)
+        self.assertEqual((self.root / "src/demo.py").read_text(), "original\n")
+
     def approve(self, item):
         return self.manager.approve_web(
             "testrepo", task_id=item["task_id"],
             plan_digest=item["plan_digest"],
             source_digest=item["source_digest"],
             confirmation=item["task_id"])
+
+    def test_pending_task_can_be_approved_six_days_after_creation(self):
+        item = self.prepare("six-day-approval")
+        created = datetime.fromisoformat(item["created_at"])
+        real_datetime = agent_tasks.datetime
+
+        class SixDaysLater(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return created + timedelta(days=6)
+
+        with mock.patch.object(agent_tasks, "datetime", SixDaysLater):
+            approved = self.approve(item)
+        self.assertTrue(approved["approved"])
+        self.assertEqual(self.manager.get("testrepo", item["task_id"])["state"], "approved")
+
+    def test_pending_task_expires_exactly_seven_days_after_creation(self):
+        item = self.prepare("seven-day-expiry")
+        expires = datetime.fromisoformat(item["expires_at"])
+        real_datetime = agent_tasks.datetime
+
+        class SevenDaysLater(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return expires
+
+        with mock.patch.object(agent_tasks, "datetime", SevenDaysLater):
+            with self.assertRaises(HostRuntimeError) as caught:
+                self.approve(item)
+        self.assertEqual(caught.exception.code, "PLAN_EXPIRED")
+        self.assertFalse((self.manager.receipts_dir / (item["task_id"] + ".json")).exists())
 
     async def wait_result(self, task_id):
         for _ in range(100):

@@ -21,10 +21,25 @@ sys.path.insert(0, str(HERE))
 from runtime_rollout_web import RuntimeRolloutWeb, rollout_lock  # noqa: E402
 from host_runtime_config import HostRuntimeError  # noqa: E402
 from host_runtime_operations import _verified_installation  # noqa: E402
+from workspace_control import (  # noqa: E402
+    WorkspaceControlError, activation_admission, verify_launch,
+)
+
+
+def _safe_failure_code(exc):
+    candidates = (getattr(exc, "code", None), str(exc))
+    for value in candidates:
+        if isinstance(value, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", value):
+            return value
+    return "ROLLOUT_FAILED"
 
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        verify_launch(HERE)
+    except WorkspaceControlError:
+        return 125
     if (len(args) != 1 or not re.fullmatch(r"[0-9a-f]{32}", args[0])
             or not _verified_installation()):
         return 125
@@ -33,10 +48,12 @@ def main(argv=None):
     root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
     state_dir = root / "chatgpt-coding-mcp"
     try:
-        from server import CONFIG, load_projects
-        projects = load_projects(CONFIG)
-        manager = RuntimeRolloutWeb(projects, state_dir=state_dir)
-        frozen, grant = manager.claim_for_worker(operation_id)
+        with activation_admission(
+                state_dir / "workspace-authority", create=True):
+            from server import CONFIG, load_projects
+            projects = load_projects(CONFIG)
+            manager = RuntimeRolloutWeb(projects, state_dir=state_dir)
+            frozen, grant = manager.claim_for_worker(operation_id)
     except Exception:
         return 125
 
@@ -64,8 +81,7 @@ def main(argv=None):
                               "tools_registered", "connector_schemas_verified", "code"}
                      and isinstance(v, (str, bool))}}
     except BaseException as exc:
-        code = getattr(exc, "code", None)
-        safe = code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", code) else "ROLLOUT_FAILED"
+        safe = _safe_failure_code(exc)
         # If installer/tunnel/admin effects may have started, never claim a
         # clean failure or replay. Human reconciliation is required.
         events = receipt.data.get("events", []) if receipt is not None else []

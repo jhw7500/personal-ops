@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -11,6 +13,7 @@ from host_execution_tools import HOST_EXECUTION_TOOL_SPECS, HostExecutionTools  
 from host_runtime_config import HostRuntimeError  # noqa: E402
 from host_access import HostAccess  # noqa: E402
 from host_access_ui import HostAccessApprovals  # noqa: E402
+from workspace_tools import WorkspaceTools  # noqa: E402
 
 
 class FakeAccess:
@@ -191,6 +194,39 @@ class HostExecutionToolTests(unittest.IsolatedAsyncioTestCase):
             manager=self.manager, access=FakeAccess(error=HostRuntimeError("UNSAFE_RUNTIME")))
         with self.assertRaisesRegex(ValueError, "UNSAFE_RUNTIME"):
             await tools.call("request_host_access", {"project": "demo"})
+
+    async def test_lazy_manager_reuses_workspace_bound_access(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir(mode=0o700)
+            owner = root / "owner"
+            owner.mkdir(mode=0o700)
+            policy = owner / "policy.json"
+            policy.write_text(json.dumps({
+                "version": 1,
+                "base_root": str(root),
+                "artifacts": [],
+                "protected_paths": [],
+            }), encoding="utf-8")
+            os.chmod(policy, 0o600)
+            projects = {"demo": project}
+            workspace = WorkspaceTools(
+                projects, state_dir=root / "authority", config_path=policy)
+            snapshot = workspace.policy.load(required=True)
+            workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
+            tools = HostExecutionTools(
+                projects, root / "host-state", {"demo": asyncio.Lock()},
+                workspace=workspace)
+
+            access = tools.access()
+            manager = tools.manager()
+
+            self.assertIs(access.workspace, workspace)
+            self.assertIs(manager.access, access)
+            self.assertIs(tools.access(), access)
+            self.assertIs(tools.manager(), manager)
+            await tools.close()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ import stat
 import uuid
 
 from execution import ExecutionPolicy
+from workspace_paths import WorkspaceError
+from workspace_control import WorkspaceControlError, activation_admission
 
 
 MAX_LOG_BYTES = 1024 * 1024
@@ -57,6 +59,11 @@ class JobManager:
         if any(state_dir.resolve().is_relative_to(root.resolve()) for root in projects.values()):
             raise ValueError("Job state must be outside writable projects")
         self.state_dir = private_directory(state_dir)
+        workspace = getattr(policy, "workspace", None)
+        authority = getattr(workspace, "authority", None)
+        self.activation_authority_dir = Path(
+            getattr(authority, "state_dir", self.state_dir.parent / "workspace-authority")
+        ).absolute()
         self.projects = projects
         self.policy = policy
         self.locks = locks or {name: asyncio.Lock() for name in projects}
@@ -72,6 +79,7 @@ class JobManager:
                 raise ValueError("Invalid job state")
             if record["state"] in ACTIVE_STATES:
                 record.update(state="interrupted", finished_at=now(), exit_code=None,
+                              termination_verified=False,
                               error="Server restarted; completion could not be confirmed")
                 self._save(record)
             self.jobs[path.stem] = record
@@ -104,22 +112,43 @@ class JobManager:
 
     @staticmethod
     def _public(record):
-        return {key: value for key, value in record.items() if key != "fingerprint"}
+        return {key: value for key, value in record.items()
+                if key != "fingerprint" and not key.startswith("_")}
 
     async def start(self, project, *, request_id, argv=None, preset=None,
-                    relative_cwd=".", timeout_seconds=None):
+                    relative_cwd=".", timeout_seconds=None, writable_cwd=False, workspace_inputs=None):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return await self._start_admitted(
+                    project, request_id=request_id, argv=argv, preset=preset,
+                    relative_cwd=relative_cwd, timeout_seconds=timeout_seconds,
+                    writable_cwd=writable_cwd, workspace_inputs=workspace_inputs)
+        except WorkspaceControlError as exc:
+            raise WorkspaceError(exc.code) from exc
+
+    async def _start_admitted(self, project, *, request_id, argv=None, preset=None,
+                              relative_cwd=".", timeout_seconds=None, writable_cwd=False,
+                              workspace_inputs=None):
         if self.closed:
             raise ValueError("Job manager is shutting down")
         if project not in self.projects:
             raise ValueError("An allowed project is required")
         if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
             raise ValueError("A unique request_id (1-80 simple characters) is required")
-        fingerprint = hashlib.sha256(json.dumps(
-            [argv, preset, relative_cwd, timeout_seconds], sort_keys=True).encode()).hexdigest()
+        if type(writable_cwd) is not bool:
+            raise ValueError("writable_cwd must be a boolean")
+        identity = [argv, preset, relative_cwd, timeout_seconds]
+        if writable_cwd:
+            identity.append(True)
+        if workspace_inputs is not None:
+            identity.append(workspace_inputs)
+        fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         for record in self.jobs.values():
             if record["project"] == project and record["request_id"] == request_id:
                 if record["fingerprint"] != fingerprint:
                     raise ValueError("request_id was already used for a different command")
+                if record.get("_workspace") is not None:
+                    await asyncio.to_thread(self.policy.workspace_files.require_current, record["_workspace"])
                 return self._public(record)
         if len(self.jobs) >= MAX_HISTORY:
             raise ValueError("Job history capacity reached; host maintenance is required")
@@ -131,7 +160,8 @@ class JobManager:
         try:
             spec = await asyncio.to_thread(
                 self.policy.prepare, project, argv=argv, preset=preset,
-                relative_cwd=relative_cwd, timeout_seconds=timeout_seconds)
+                relative_cwd=relative_cwd, timeout_seconds=timeout_seconds,
+                writable_cwd=writable_cwd, request_id=request_id, workspace_inputs=workspace_inputs)
             if self.closed:
                 raise ValueError("Job manager is shutting down")
             job_id = uuid.uuid4().hex
@@ -142,7 +172,11 @@ class JobManager:
                 "timeout_seconds": spec.timeout_seconds, "created_at": now(),
                 "started_at": None, "finished_at": None, "exit_code": None,
                 "log_bytes": 0, "log_truncated": False,
+                "termination_verified": False,
             }
+            if spec.workspace is not None:
+                record["_workspace"] = spec.workspace
+                record["workspace_mode"] = "private_copy" if writable_cwd else "read_only_snapshot"
             self._save(record)
             self.jobs[job_id] = record
             self.tasks[job_id] = asyncio.create_task(self._run(record, spec))
@@ -173,6 +207,8 @@ class JobManager:
         reader = None
         job_id = record["job_id"]
         try:
+            if spec.workspace is not None:
+                await asyncio.to_thread(self.policy.workspace_files.require_current, spec.workspace)
             log_path = self.state_dir / (job_id + ".log")
             descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.fchmod(descriptor, 0o600)
@@ -219,16 +255,39 @@ class JobManager:
                 if record["state"] == "canceling":
                     await self._stop(process)
                 try:
-                    await asyncio.wait_for(process.wait(), spec.timeout_seconds)
-                    record["state"] = ("canceled" if record["state"] == "canceling" else
-                                       "succeeded" if process.returncode == 0 else "failed")
+                    if spec.workspace is None:
+                        await asyncio.wait_for(process.wait(), spec.timeout_seconds)
+                    else:
+                        async def wait_current():
+                            waiter = asyncio.create_task(process.wait())
+                            try:
+                                while not waiter.done():
+                                    await asyncio.to_thread(
+                                        self.policy.workspace_files.require_current, spec.workspace)
+                                    await asyncio.wait({waiter}, timeout=.1)
+                                await waiter
+                                await asyncio.to_thread(
+                                    self.policy.workspace_files.require_current, spec.workspace)
+                            finally:
+                                if not waiter.done():
+                                    waiter.cancel()
+                                    await asyncio.gather(waiter, return_exceptions=True)
+                        await asyncio.wait_for(wait_current(), spec.timeout_seconds)
+                    final_state = ("canceled" if record["state"] == "canceling" else
+                                   "succeeded" if process.returncode == 0 else "failed")
                 except asyncio.TimeoutError:
-                    record["state"] = "timed_out"
+                    final_state = "timed_out"
                     await self._stop(process)
-                # Background children may still hold the pipe. Their entire PID
-                # namespace is torn down when the bwrap process finishes.
+                # Publish a terminal state only after the output has been drained
+                # and termination and workspace output verification have finished.
+                # Pollers must not observe succeeded with termination_verified=False.
                 await asyncio.wait_for(reader, 5)
                 record["exit_code"] = process.returncode
+                if spec.workspace is not None:
+                    await asyncio.to_thread(self.policy.workspace_files.require_current, spec.workspace)
+                    await asyncio.to_thread(self.policy.workspace_files.freeze_outputs, spec.workspace)
+                record["termination_verified"] = process.returncode is not None
+                record["state"] = final_state
         except asyncio.CancelledError:
             if process is not None:
                 await self._stop(process)
@@ -237,7 +296,8 @@ class JobManager:
         except Exception as exc:
             if process is not None:
                 await self._stop(process)
-            record.update(state="failed", error=str(exc)[:1000])
+            record.update(state="failed", error=(exc.code if isinstance(exc, WorkspaceError) else
+                          "WORKSPACE_JOB_FAILED" if spec.workspace is not None else str(exc)[:1000]))
         finally:
             if reader is not None and not reader.done():
                 reader.cancel()
@@ -247,6 +307,57 @@ class JobManager:
             self.processes.pop(job_id, None)
             self.tasks.pop(job_id, None)
             self.locks[record["project"]].release()
+
+    def _completed_workspace(self, project, job_id, *, successful=False):
+        record = self._get(project, job_id)
+        files = getattr(self.policy, "workspace_files", None)
+        private = record.get("_workspace")
+        if files is None or not isinstance(private, dict):
+            raise WorkspaceError("JOB_WORKSPACE_UNAVAILABLE")
+        if (record["state"] in ACTIVE_STATES or record.get("termination_verified") is not True
+                or successful and record["state"] != "succeeded"):
+            raise WorkspaceError("JOB_INCOMPLETE")
+        files.require_current(private)
+        return record, private
+
+    def read_output(self, project, job_id, relative_path, *, max_bytes=65536, cursor=None):
+        _, private = self._completed_workspace(project, job_id)
+        workspace = self.policy.workspace
+        snapshot, _ = workspace._context()
+        with workspace.authority.admission(snapshot.digest) as binding:
+            self.policy.workspace_files.require_current(private)
+            file = self.policy.workspace_files.read_output(private, relative_path)
+            # Output is untrusted command text. It never implies a host write.
+            return workspace._page(project, f"output:{job_id}/{relative_path}", file, file.data,
+                                   binding, max_bytes=max_bytes, cursor=cursor)
+
+    async def publish_output(self, project, job_id, relative_output, target_path, request_id, *,
+                             expected_sha256=None, grant_id=None):
+        self._completed_workspace(project, job_id, successful=True)
+        if self.locks[project].locked():
+            raise WorkspaceError("PROJECT_BUSY")
+
+        def publish():
+            from workspace_host import publication_lane
+            workspace = self.policy.workspace
+            # Lane ordering is EX host lane -> project lock -> authority admission.
+            with publication_lane(workspace):
+                _, private = self._completed_workspace(project, job_id, successful=True)
+                snapshot, _ = workspace._context()
+                target = workspace._target(snapshot, project, target_path, "write", grant_id)
+                workspace.ordinary_path(snapshot, project, target)
+                return self.policy.workspace_files.publish(
+                    project, private, relative_output, str(target), request_id,
+                    expected_sha256=expected_sha256, grant_id=grant_id,
+                    completion_verified=True)
+
+        async with self.locks[project]:
+            operation = asyncio.create_task(asyncio.to_thread(publish))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                await operation
+                raise
 
     def get(self, project, job_id):
         return self._public(self._get(project, job_id))
@@ -262,6 +373,8 @@ class JobManager:
 
     def read_log(self, project, job_id, offset=0, max_bytes=MAX_READ_BYTES):
         record = self._get(project, job_id)
+        if record.get("_workspace") is not None:
+            self.policy.workspace_files.require_current(record["_workspace"])
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a nonnegative byte cursor")
         if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int)

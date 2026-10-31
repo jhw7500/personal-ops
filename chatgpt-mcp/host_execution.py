@@ -23,6 +23,8 @@ from host_runtime_operations import (
     _digest, _lock, _read_private_json, _save_private_json, _verified_installation,
     acquire_flock,
 )
+from workspace_host import acquire_host_operation_lane, complete_host_operation
+from workspace_control import WorkspaceControlError, activation_admission
 
 
 REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
@@ -36,6 +38,7 @@ AGENT_REASONS = frozenset({
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 ACTIVE = frozenset({"queued", "running"})
 TERMINAL = frozenset({"succeeded", "failed", "cancelled", "outcome_unknown"})
+# Bound only unsettled work, not completed immutable audit receipts.
 MAX_HISTORY = 500
 MAX_INPUT_BYTES = 32768
 MAX_GENERAL_EXECUTABLE = 128 * 1024 * 1024
@@ -181,6 +184,11 @@ class HostExecution:
         self.lock_path = self.state_dir / "operations.lock"
         self.host_lock_path = self.locks_dir / "host.lock"
         self.access = access
+        self.workspace = getattr(access, "workspace", None)
+        authority = getattr(self.workspace, "authority", None)
+        self.activation_authority_dir = Path(
+            getattr(authority, "state_dir", self.state_root / "workspace-authority")
+        ).absolute()
         self.runner = runner or run_host_profile
         self._native_runner = runner is None
         self._trusted = (_verified_installation() if trusted_runtime is None
@@ -233,13 +241,16 @@ class HostExecution:
         return result
 
     def _all(self):
+        """Preserve historical idempotency and audit receipts.
+
+        The newest 500 records alone would not be enough: an older request ID
+        could be mistaken for a fresh instruction and executed a second time.
+        """
         states = []
         for path in self.plans_dir.glob("*.json"):
             if not OPERATION_ID.fullmatch(path.stem):
                 raise HostRuntimeError("INVALID_HOST_EXECUTION")
             states.append(self._load(path.stem))
-            if len(states) > MAX_HISTORY:
-                raise HostRuntimeError("HOST_EXECUTION_HISTORY_FULL")
         return states
 
     def _agent_metadata(self, value):
@@ -299,6 +310,19 @@ class HostExecution:
     def prepare(self, project, *, executable, argv, cwd, request_id,
                 timeout_seconds=1800, input_text=None, agent_metadata=None,
                 task_label=None):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._prepare_admitted(
+                    project, executable=executable, argv=argv, cwd=cwd,
+                    request_id=request_id, timeout_seconds=timeout_seconds,
+                    input_text=input_text, agent_metadata=agent_metadata,
+                    task_label=task_label)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _prepare_admitted(self, project, *, executable, argv, cwd, request_id,
+                          timeout_seconds=1800, input_text=None, agent_metadata=None,
+                          task_label=None):
         self._require_trusted()
         if project not in self.projects:
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
@@ -344,11 +368,23 @@ class HostExecution:
             frozen["task_label"] = task_label
         request_digest = _digest(frozen)
         with _lock(self.lock_path):
-            for existing in self._all():
+            states = self._all()
+            for existing in states:
                 if existing["project"] == project and existing["request_id"] == request_id:
                     if existing["request_digest"] != request_digest:
                         raise HostRuntimeError("REQUEST_ID_CONFLICT")
                     return self._public(existing)
+
+            # Finished work never consumes capacity. Unknown outcomes without
+            # verified termination remain occupied until owner resolution.
+            unsettled = sum(
+                item["state"] in ACTIVE | {"prepared"}
+                or (item["state"] == "outcome_unknown"
+                    and item.get("termination_verified") is not True)
+                for item in states
+            )
+            if unsettled >= MAX_HISTORY:
+                raise HostRuntimeError("HOST_EXECUTION_PENDING_LIMIT")
             operation_id = secrets.token_hex(16)
             state = {
                 "project": project, "operation_id": operation_id, "request_id": request_id,
@@ -366,13 +402,18 @@ class HostExecution:
             return state
         leases = []
         try:
+            workspace_fd = acquire_host_operation_lane(
+                self.workspace, operation_id=state["operation_id"], kind="host-execution",
+                recovery=True)
+            if workspace_fd is not None:
+                leases.append(workspace_fd)
             leases.append(acquire_flock(self._owner_lock_path(state["operation_id"])))
             leases.append(acquire_flock(self.host_lock_path))
             leases.append(acquire_flock(self._project_lock_path(state["project"])))
         except HostRuntimeError as exc:
             for fd in reversed(leases):
                 os.close(fd)
-            if exc.code == "TARGET_BUSY":
+            if exc.code in {"TARGET_BUSY", "WORKSPACE_HOST_LANE_BUSY"}:
                 return state
             raise
         identity = state.get("execution_identity")
@@ -389,6 +430,10 @@ class HostExecution:
                          code="HOST_EXECUTION_WORKER_OWNER_LOST",
                          termination_verified=verified, finished_at=_now().isoformat())
             self._save(state)
+            if verified:
+                complete_host_operation(
+                    self.workspace, state["operation_id"], "host-execution",
+                    termination_verified=True)
             if not verified:
                 self._retained_leases[state["operation_id"]] = tuple(leases)
                 leases = []
@@ -460,23 +505,38 @@ class HostExecution:
                 cancel.set()
                 break
             self.access.require(project, grant_id=grant_id, codex=codex)
-            host_fd = project_fd = None
+            workspace_fd = host_fd = project_fd = None
             try:
+                workspace_fd = acquire_host_operation_lane(
+                    self.workspace, operation_id=operation_id, kind="host-execution")
                 host_fd = acquire_flock(self.host_lock_path)
                 self._reject_observed_managed_work()
                 project_fd = acquire_flock(self._project_lock_path(project))
-                return host_fd, project_fd
+                return tuple(fd for fd in (workspace_fd, host_fd, project_fd)
+                             if fd is not None)
             except HostRuntimeError as exc:
                 if project_fd is not None:
                     os.close(project_fd)
                 if host_fd is not None:
                     os.close(host_fd)
-                if exc.code != "TARGET_BUSY":
+                if workspace_fd is not None:
+                    complete_host_operation(
+                        self.workspace, operation_id, "host-execution",
+                        termination_verified=True)
+                    os.close(workspace_fd)
+                if exc.code not in {"TARGET_BUSY", "WORKSPACE_HOST_LANE_BUSY"}:
                     raise
                 cancel.wait(WATCH_SECONDS)
         raise HostRuntimeError("HOST_COMMAND_CANCELLED")
 
     async def execute(self, project, operation_id):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return await self._execute_admitted(project, operation_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    async def _execute_admitted(self, project, operation_id):
         self._require_trusted()
         with _lock(self.lock_path):
             state = self._recover(self._load(operation_id, project))
@@ -641,6 +701,9 @@ class HostExecution:
                 watcher.join(1)
             if leases is not None:
                 if termination_verified:
+                    complete_host_operation(
+                        self.workspace, operation_id, "host-execution",
+                        termination_verified=True)
                     for fd in reversed(leases):
                         os.close(fd)
                 else:
@@ -731,12 +794,17 @@ class HostExecution:
             if leases is None:
                 acquired = []
                 try:
+                    workspace_fd = acquire_host_operation_lane(
+                        self.workspace, operation_id=operation_id, kind="host-execution",
+                        recovery=True)
+                    if workspace_fd is not None:
+                        acquired.append(workspace_fd)
                     acquired.append(acquire_flock(self.host_lock_path))
                     acquired.append(acquire_flock(self._project_lock_path(project)))
                 except HostRuntimeError as exc:
                     for fd in reversed(acquired):
                         os.close(fd)
-                    if exc.code == "TARGET_BUSY":
+                    if exc.code in {"TARGET_BUSY", "WORKSPACE_HOST_LANE_BUSY"}:
                         raise HostRuntimeError("HOST_EXECUTION_PROCESS_NOT_OWNED") from None
                     raise
                 leases = tuple(acquired)
@@ -745,6 +813,8 @@ class HostExecution:
             state.update(termination_verified=True, code="HOST_EXECUTION_WORKER_OWNER_LOST",
                          finished_at=_now().isoformat())
             self._save(state)
+            complete_host_operation(
+                self.workspace, operation_id, "host-execution", termination_verified=True)
             for fd in reversed(leases):
                 os.close(fd)
             self._retained_leases.pop(operation_id, None)

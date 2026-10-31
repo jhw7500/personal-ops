@@ -362,6 +362,7 @@ class GitWorkflowTest(unittest.TestCase):
         subprocess.run(["/usr/bin/git", "init", "--bare", str(remote)], check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         run_git(self.repo, "remote", "add", "origin", str(remote))
+        run_git(self.repo, "push", "origin", "HEAD:refs/heads/main")
         with self.assertRaisesRegex(ValueError, "main or master"):
             self.workflows.prepare({
                 "project": "repo", "action": "push", "branch": "main", "new_branch": True,
@@ -380,6 +381,49 @@ class GitWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(completed["status"], "completed")
         self.assertIn("refs/heads/feature/test", run_git(remote, "show-ref").stdout)
+
+    def test_large_outgoing_push_binds_blob_ids_and_keeps_one_use_and_stale_checks(self):
+        remote = self.base / "large-remote.git"
+        run_git(self.base, "init", "--bare", str(remote))
+        run_git(self.repo, "remote", "add", "origin", str(remote))
+        run_git(self.repo, "push", "origin", "HEAD:refs/heads/feature/test")
+        base_head = run_git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        old_blob = run_git(self.repo, "rev-parse", "HEAD:selected.txt").stdout.strip()
+        payload = "approved outgoing line\n" * 16000
+        self.assertLess(len(payload.encode()), 512 * 1024)
+        self.assertGreater(2 * len(payload.encode()), 512 * 1024)
+        self.repo.joinpath("selected.txt").write_text(payload)
+        self.repo.joinpath("other.txt").write_text(payload + "second file\n")
+        self.repo.joinpath("selected.txt").chmod(0o755)
+        run_git(self.repo, "add", "selected.txt", "other.txt")
+        run_git(self.repo, "commit", "-m", "large outgoing fixture")
+        head = run_git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        new_blob = run_git(self.repo, "rev-parse", "HEAD:selected.txt").stdout.strip()
+
+        prepared = self.workflows.prepare({
+            "project": "repo", "action": "push", "branch": "feature/test", "new_branch": False,
+        })
+        output = self.approve(prepared)
+        self.assertIn(base_head, output)
+        self.assertIn(head, output)
+        self.assertIn(old_blob, output)
+        self.assertIn(new_blob, output)
+        self.assertIn("100755", output)
+        self.assertIn("selected.txt", output)
+        self.assertIn("other.txt", output)
+        preview = self.workflows._load_plan("repo", prepared["operation_id"])["immutable"]["preview"]
+        self.assertLessEqual(len(preview.encode()), 512 * 1024)
+        self.assertEqual(run_git(remote, "rev-parse", "refs/heads/feature/test").stdout.strip(), base_head)
+        self.repo.joinpath("selected.txt").write_text(payload + "unapproved dirty edit\n")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.workflows.execute({"project": "repo", "operation_id": prepared["operation_id"]})
+        self.assertEqual(run_git(remote, "rev-parse", "refs/heads/feature/test").stdout.strip(), base_head)
+        self.repo.joinpath("selected.txt").write_text(payload)
+        completed = self.workflows.execute({"project": "repo", "operation_id": prepared["operation_id"]})
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(run_git(remote, "rev-parse", "refs/heads/feature/test").stdout.strip(), head)
+        with self.assertRaisesRegex(ValueError, "not executable"):
+            self.workflows.execute({"project": "repo", "operation_id": prepared["operation_id"]})
 
     def test_pr_and_merge_are_native_workflow_handoffs(self):
         pr = self.workflows.prepare({

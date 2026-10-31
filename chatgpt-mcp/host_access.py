@@ -23,9 +23,9 @@ from host_runtime_operations import (
 )
 
 
-DEFAULT_DURATION_SECONDS = 14_400
-MAX_DURATION_SECONDS = 28_800
-REQUEST_TTL_SECONDS = 600
+DEFAULT_DURATION_SECONDS = 30 * 24 * 60 * 60
+MAX_DURATION_SECONDS = 30 * 24 * 60 * 60
+REQUEST_TTL_SECONDS = 7 * 24 * 60 * 60
 SCOPE = "installation"
 _HEX_ID = re.compile(r"[0-9a-f]{32}\Z")
 _BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
@@ -38,6 +38,7 @@ _DISPLAY_ONLY_FILES = frozenset({
     "work-dashboard/visualizer.js", "work-dashboard/visualizer.css",
 })
 _AUTHORITY_ID_DOMAIN = b"personal-ops/host-access/authority-v1\0"
+_WORKSPACE_ID_DOMAIN = b"personal-ops/host-access/workspace-v1\0"
 
 
 def _utcnow() -> datetime:
@@ -138,7 +139,7 @@ def _host_identity() -> dict:
 class HostAccess:
     """Private grant state shared by MCP tools and the authenticated owner web."""
 
-    def __init__(self, projects, state_dir, *, trusted_runtime=None):
+    def __init__(self, projects, state_dir, *, trusted_runtime=None, workspace=None):
         self.projects = {name: Path(root).resolve(strict=True) for name, root in projects.items()}
         if not self.projects or any(not root.is_dir() for root in self.projects.values()):
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
@@ -147,6 +148,11 @@ class HostAccess:
         self.records_dir = private_dir(self.state_dir / "records")
         self.locks_dir = private_dir(self.state_dir / "locks")
         self._runtime_source = trusted_runtime
+        try:
+            from workspace_host import resolve_workspace
+            self.workspace = resolve_workspace(self.projects, workspace)
+        except HostRuntimeError as exc:
+            raise HostRuntimeError("HOST_ACCESS_WORKSPACE_INVALID") from exc
 
     def _project_root(self, project) -> Path:
         if not isinstance(project, str) or project not in self.projects:
@@ -167,6 +173,26 @@ class HostAccess:
             value = hashlib.sha256(value.encode()).hexdigest()
         if not isinstance(value, str) or _RUNTIME_ID.fullmatch(value) is None:
             raise HostRuntimeError("UNSAFE_RUNTIME")
+        if self.workspace is not None:
+            try:
+                if self.workspace.enabled:
+                    snapshot = self.workspace.policy.load(required=True)
+                    binding = self.workspace.authority.binding(snapshot.digest)
+                    if (set(binding) != {"installation_id", "authority_epoch", "policy_digest"}
+                            or _HEX_ID.fullmatch(binding.get("installation_id", "")) is None
+                            or type(binding.get("authority_epoch")) is not int
+                            or binding["authority_epoch"] < 1
+                            or _RUNTIME_ID.fullmatch(binding.get("policy_digest", "")) is None):
+                        raise HostRuntimeError("HOST_ACCESS_WORKSPACE_INVALID")
+                    payload = json.dumps(
+                        {"runtime_identity": value, **binding},
+                        sort_keys=True, separators=(",", ":"),
+                    ).encode("utf-8")
+                    value = hashlib.sha256(_WORKSPACE_ID_DOMAIN + payload).hexdigest()
+            except HostRuntimeError:
+                raise
+            except Exception as exc:
+                raise HostRuntimeError("HOST_ACCESS_WORKSPACE_INVALID") from exc
         return value
 
     @staticmethod

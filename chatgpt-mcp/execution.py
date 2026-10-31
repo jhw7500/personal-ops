@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import uuid
 from typing import Any
 
 
@@ -49,6 +50,7 @@ class CommandSpec:
     argv: list[str]
     execution_argv: list[str]
     relative_cwd: str
+    workspace: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,7 @@ class _Profile:
 class ExecutionPolicy:
     """Validate a command and produce an isolated bubblewrap invocation."""
 
-    def __init__(self, projects: dict[str, Path], config_path: Path | None = None):
+    def __init__(self, projects: dict[str, Path], config_path: Path | None = None, *, workspace=None):
         if not projects:
             raise ValueError("At least one project is required")
         self.projects: dict[str, Path] = {}
@@ -104,6 +106,12 @@ class ExecutionPolicy:
         if any(config_location.is_relative_to(root) for root in self.projects.values()):
             raise ValueError("Execution config must be outside all writable projects")
         self._bwrap = shutil.which("bwrap")
+        self.workspace = workspace
+        self.workspace_files = None
+        if workspace is not None:
+            from workspace_jobs import WorkspaceJobFiles
+            self.workspace_files = WorkspaceJobFiles(workspace.policy, workspace.authority,
+                workspace.authority.state_dir.parent / "workspace-job-files")
 
     def list_profiles(self, project: str) -> list[dict[str, Any]]:
         root = self._project(project)
@@ -123,6 +131,9 @@ class ExecutionPolicy:
         preset: str | None = None,
         relative_cwd: str = ".",
         timeout_seconds: int | None = None,
+        writable_cwd: bool = False,
+        request_id: str | None = None,
+        workspace_inputs: list[dict] | None = None,
     ) -> CommandSpec:
         if not self._bwrap:
             raise RuntimeError("bubblewrap is required; unrestricted execution is disabled")
@@ -169,7 +180,12 @@ class ExecutionPolicy:
         self._reject_bitbake_command(visible_argv)
         host_cwd, normalized_cwd = self._resolve_cwd(root, selected_cwd)
         self._reject_protected_working_tree(root, host_cwd)
-        hides = self._secret_mounts(root)
+        if type(writable_cwd) is not bool:
+            raise ValueError("writable_cwd must be a boolean")
+        active_workspace = self.workspace is not None and self.workspace.enabled
+        if (writable_cwd or workspace_inputs is not None) and not active_workspace:
+            raise ValueError("Workspace options require an active workspace policy")
+        hides = [] if active_workspace else self._secret_mounts(root)
         environment = dict(MINIMAL_ENV)
         if node_prefix is not None:
             environment["PATH"] = f"{SANDBOX_NODE_PREFIX}/bin:{MINIMAL_ENV['PATH']}"
@@ -178,6 +194,21 @@ class ExecutionPolicy:
         if test_database is not None:
             environment["MCP_EPHEMERAL_POSTGRES"] = "1"
         self._reject_installed_bitbake(environment["PATH"], node_prefix)
+
+        workspace_record = None
+        if active_workspace:
+            workspace_record = self.workspace_files.create(project, request_id or uuid.uuid4().hex,
+                                                           inputs=workspace_inputs)
+            source = Path(workspace_record["source"])
+            if writable_cwd:
+                writable = Path(workspace_record["scratch"]) / "workspace"
+                shutil.copytree(source, writable)
+                for directory, _, _ in os.walk(writable):
+                    Path(directory).chmod(0o700)
+                for item in workspace_record["source_manifest"]:
+                    target = writable / item["path"]
+                    target.chmod(item["mode"] & 0o777)
+            workspace_record["writable_cwd"] = writable_cwd
 
         command = [
             self._bwrap,
@@ -195,8 +226,18 @@ class ExecutionPolicy:
             "--tmpfs", "/tmp",
             "--tmpfs", "/home",
             "--dir", "/home/sandbox",
-            "--bind", str(root), "/workspace",
         ))
+        if workspace_record is None:
+            command.extend(("--bind", str(root), "/workspace"))
+        else:
+            command.extend(("--ro-bind", workspace_record["source"], "/workspace",
+                            "--bind", workspace_record["scratch"], "/scratch",
+                            "--bind", workspace_record["output"], "/output"))
+            if workspace_record.get("inputs"):
+                command.extend(("--ro-bind", workspace_record["inputs"], "/inputs"))
+                environment["WORKSPACE_INPUT_DIR"] = "/inputs"
+            environment["WORKSPACE_OUTPUT_DIR"] = "/output"
+            environment["WORKSPACE_SCRATCH_DIR"] = "/scratch"
         if node_prefix is not None:
             command.extend(("--ro-bind", str(node_prefix), SANDBOX_NODE_PREFIX))
         if chromium_prefix is not None:
@@ -215,6 +256,8 @@ class ExecutionPolicy:
         for key, value in environment.items():
             command.extend(("--setenv", key, value))
         sandbox_cwd = "/workspace" if normalized_cwd == "." else f"/workspace/{normalized_cwd}"
+        if workspace_record is not None and writable_cwd:
+            sandbox_cwd = "/scratch/workspace" + ("" if normalized_cwd == "." else "/" + normalized_cwd)
         command.extend(("--chdir", sandbox_cwd, "--"))
         command.extend(execution_argv)
 
@@ -227,6 +270,7 @@ class ExecutionPolicy:
             argv=visible_argv,
             execution_argv=execution_argv,
             relative_cwd=normalized_cwd,
+            workspace=workspace_record,
         )
 
     def _project(self, project: str) -> Path:

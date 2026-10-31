@@ -150,7 +150,8 @@ if __name__ == "__main__":
             expect(self.page.locator("#runtime-rollout-approve")).to_be_enabled()
 
         def test_expired_plan_cannot_be_approved(self):
-            old = datetime.now(timezone.utc) - timedelta(minutes=30)
+            old = (datetime.now(timezone.utc) - runtime_rollout_web.PLAN_TTL
+                   - timedelta(seconds=1))
             with mock.patch.object(runtime_rollout_web, "_utc", return_value=old):
                 expired = self.prepare()
 

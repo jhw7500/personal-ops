@@ -24,12 +24,15 @@ from host_runtime_config import HostRuntimeError, TRUSTED_APPROVAL_ORIGIN, priva
 from host_runtime_operations import (_digest, _lock, _read_private_json,
                                      _save_private_json, _verified_installation,
                                      acquire_flock)
+from workspace_control import (DEFAULT_CONTROLLER_DIR, WorkspaceControlError,
+                               activation_admission, transition_release,
+                               verify_controller, verify_launch)
 
 PROJECT = "personal-ops"
 HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 REQUEST = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
-PLAN_TTL = timedelta(minutes=10)
+PLAN_TTL = timedelta(days=7)
 QUEUE_RECOVERY_AFTER = timedelta(minutes=2)
 RUN_RECOVERY_AFTER = timedelta(minutes=22)
 MAX_FILE_BYTES = 4 * 1024 * 1024
@@ -39,9 +42,11 @@ EXTENSIONS = frozenset({".py", ".js", ".html", ".css", ".json", ".yaml", ".yml",
                         ".c", ".mjs", ".txt"})
 OMIT_DIRS = frozenset({".git", ".venv", ".serena", ".pytest_cache",
                       "__pycache__", "node_modules", "dist", "build"})
-CONTROL = ("rollout-host-runtime.py", "rollout_tunnel.py",
+CONTROL = ("rollout-host-runtime.py", "rollout_test_runner.py", "rollout_tunnel.py",
            "rollout_admin.py", "rollout_catalog.py", "rollout_diagnostics.py",
-           "install-runtime.py", "configure-host-runtime.py")
+           "install-runtime.py", "configure-host-runtime.py",
+           "tossapp_neutral_ab24_command.js")
+LEGACY_CONTROL_OMIT = "tossapp_neutral_ab24_command.js"
 RUNNER_NAME = "runtime_rollout_worker.py"
 TERMINAL = frozenset({"succeeded", "failed", "verification_required",
                        "outcome_unknown", "expired", "cancelled"})
@@ -281,8 +286,34 @@ def _expected_snapshots(root: Path) -> tuple[str, str]:
         ui_check = root / "chatgpt-mcp/tests" / name
         data, _ = _source_bytes(ui_check, root)
         control["tests/" + ui_check.name] = hashlib.sha256(data).hexdigest()
+    tests_dir = root / "chatgpt-mcp/tests"
+    required_node_ui = tests_dir / "test_workspace_approval_ui.mjs"
+    if not required_node_ui.is_file() or required_node_ui.is_symlink():
+        raise HostRuntimeError("ROLLOUT_SOURCE_INCOMPLETE")
+    node_ui_inputs = [required_node_ui]
+    node_ui_inputs.extend(sorted(
+        path for path in tests_dir.glob("test_*.mjs") if path != required_node_ui
+    ))
+    for path in node_ui_inputs:
+        data, _ = _source_bytes(path, root)
+        control["tests/" + path.name] = hashlib.sha256(data).hexdigest()
     control_digest = hashlib.sha256(json.dumps(control, sort_keys=True).encode()).hexdigest()
     return target, control_digest
+
+
+def _approved_control_matches(approved: str, expected: str, observed: dict) -> bool:
+    """Accept the current digest or the immediately previous bootstrap format only."""
+    current = hashlib.sha256(json.dumps(observed, sort_keys=True).encode()).hexdigest()
+    if current != expected:
+        return False
+    if approved == current:
+        return True
+    if LEGACY_CONTROL_OMIT not in observed:
+        return False
+    legacy = dict(observed)
+    legacy.pop(LEGACY_CONTROL_OMIT)
+    legacy_digest = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
+    return approved == legacy_digest
 
 
 class WebRolloutGrant:
@@ -319,14 +350,13 @@ class WebRolloutGrant:
         observed_snapshot = hashlib.sha256(
             json.dumps(official_manifest, sort_keys=True).encode()
         ).hexdigest()[:20]
-        observed_controls = hashlib.sha256(
-            json.dumps(controls_fn(), sort_keys=True).encode()
-        ).hexdigest()
+        observed_control_map = controls_fn()
         if (actual_source["digest"] != self.source_digest
                 or expected != self.target_snapshot
-                or control != self.control_digest
                 or observed_snapshot != self.target_snapshot
-                or observed_controls != self.control_digest):
+                or not _approved_control_matches(
+                    self.control_digest, control, observed_control_map
+                )):
             raise RuntimeError("WEB_ROLLOUT_SOURCE_CHANGED")
 
 
@@ -337,6 +367,7 @@ class RuntimeRolloutWeb:
             raise HostRuntimeError("ROLLOUT_SCOPE_UNAVAILABLE")
         self.root = Path(projects[PROJECT]).resolve(strict=True)
         self.state_root = Path(state_dir).absolute() / "runtime-rollout-web"
+        self.activation_authority_dir = self.state_root.parent / "workspace-authority"
         if self.state_root.resolve(strict=False).is_relative_to(self.root):
             raise HostRuntimeError("ROLLOUT_STATE_UNSAFE")
         private_dir(self.state_root)
@@ -550,7 +581,31 @@ class RuntimeRolloutWeb:
             raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
         return frozen
 
+    def _retire_source_stale_unstarted(self, plan):
+        if plan["state"] not in {"pending_host_approval", "approved"}:
+            return False
+        if _expires(plan["immutable"]["expires_at"]) <= _utc():
+            return False
+        try:
+            self._check_source(plan)
+        except HostRuntimeError as exc:
+            if exc.code != "ROLLOUT_SOURCE_CHANGED":
+                raise
+            plan.update(state="expired", phase="APPROVAL",
+                        code="ROLLOUT_SOURCE_CHANGED", finished_at=_utc().isoformat())
+            self._save(plan)
+            (self.receipts_dir / (plan["operation_id"] + ".json")).unlink(missing_ok=True)
+            return True
+        return False
+
     def prepare(self, project: str, request_id: str):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._prepare_admitted(project, request_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _prepare_admitted(self, project: str, request_id: str):
         self._trusted_only()
         if project != PROJECT or not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
@@ -560,6 +615,8 @@ class RuntimeRolloutWeb:
                 existing = self._reconcile(self._load(path.stem))
                 if existing.get("request_id") == request_id:
                     return self._public(existing)
+                if self._retire_source_stale_unstarted(existing):
+                    continue
                 if existing["state"] in ("pending_host_approval", "approved", "queued",
                                          "running", "outcome_unknown"):
                     if (_expires(existing["immutable"]["expires_at"]) > _utc()
@@ -642,6 +699,13 @@ class RuntimeRolloutWeb:
                     "approved": True, "executed": False}
 
     def execute(self, project: str, operation_id: str):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._execute_admitted(project, operation_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _execute_admitted(self, project: str, operation_id: str):
         self._trusted_only()
         if project != PROJECT:
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
@@ -678,6 +742,21 @@ class RuntimeRolloutWeb:
         node = Path.home() / ".nvm/versions/node/v24.12.0/bin"
         env_path = str(node) + ":/usr/local/bin:/usr/bin:/bin"
         worker = Path(__file__).resolve().with_name(RUNNER_NAME)
+        authority_dir = self.state_root.parent / "workspace-authority"
+        try:
+            admission = verify_launch(worker.parent, authority_dir)
+            worker_argv = [str(python), "-I", str(worker), operation_id]
+            if admission["authority_active"]:
+                controller = verify_controller(DEFAULT_CONTROLLER_DIR)
+                transition_release(worker.parent, authority_dir)
+                worker_argv = [
+                    str(python), "-I", controller["launcher"],
+                    "--authority-dir", admission["authority_dir"],
+                    "--release", str(worker.parent), "--interpreter", str(python),
+                    "--isolated", "--entrypoint", RUNNER_NAME, "--", operation_id,
+                ]
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
         command = ["/usr/bin/systemd-run", "--user", "--quiet", "--collect",
                    "--unit=personal-ops-runtime-rollout-" + operation_id,
                    "--property=Type=exec", "--property=TimeoutStartSec=900",
@@ -686,7 +765,7 @@ class RuntimeRolloutWeb:
                    "--setenv=XDG_RUNTIME_DIR=" + str(runtime),
                    "--setenv=XDG_STATE_HOME=" + str(self.state_root.parent.parent),
                    "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=" + str(runtime / "bus"),
-                   str(python), "-I", str(worker), operation_id]
+                   *worker_argv]
         def start():
             result = subprocess.run(command, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -707,6 +786,13 @@ class RuntimeRolloutWeb:
         return self.get(project, operation_id)
 
     def claim_for_worker(self, operation_id: str):
+        try:
+            with activation_admission(self.activation_authority_dir, create=True):
+                return self._claim_for_worker_admitted(operation_id)
+        except WorkspaceControlError as exc:
+            raise HostRuntimeError(exc.code) from exc
+
+    def _claim_for_worker_admitted(self, operation_id: str):
         self._trusted_only()
         with _lock(self.lock):
             plan = self._load(operation_id)

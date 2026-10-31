@@ -43,7 +43,7 @@ HOST_RUNTIME_TOOL_SPECS = [
     _tool("prepare_test_deploy", "테스트 API 배포 계획",
           "Create a source-pinned, time-limited API-or-Worker deployment plan. "
           "An active fixed-target authorization permits a later explicit execute call without "
-          "per-plan approval; otherwise separate management-web approval is required. "
+           "per-plan approval; otherwise a separate one-use in-chat TEST approval card is opened. "
           "The ready_to_execute response includes approval_required=false and the next execute "
           "call. Planning does not build, restart services, or alter the database. Registered "
           "reviewed_snapshot targets accept uncommitted inputs; no Git commit is required.",

@@ -83,6 +83,18 @@ class ChatHostAccessApprovalTests(unittest.TestCase):
         self.assertEqual(granted["expires_at"], (self.now + timedelta(seconds=900)).isoformat())
         self.assertEqual(result["structuredContent"]["grant"], granted)
 
+    def test_default_card_can_be_confirmed_after_six_days_and_grant_revoked_after_twenty_nine(self):
+        opened = self.cards.open("alpha")
+        self.now += timedelta(days=6)
+        result = self.cards.confirm("alpha", **self.args(opened))
+        grant = result["structuredContent"]["grant"]
+        self.assertEqual(grant["expires_at"], (self.now + timedelta(days=30)).isoformat())
+        self.now += timedelta(days=29)
+        self.assertEqual(self.access.require("alpha"), grant)
+        self.error("HOST_ACCESS_CARD_SPENT", lambda: self.cards.confirm("alpha", **self.args(opened)))
+        self.access.revoke_web("alpha", grant_id=grant["grant_id"], confirmation="alpha")
+        self.error("HOST_ACCESS_REVOKED", lambda: self.access.require("alpha"))
+
     def test_replay_cannot_extend_or_replace_a_grant(self):
         opened = self.open()
         self.cards.confirm("alpha", **self.args(opened))
@@ -139,7 +151,7 @@ class ChatHostAccessApprovalTests(unittest.TestCase):
 
     def test_expiry_and_runtime_or_boot_change_are_rejected(self):
         opened = self.open()
-        self.now += timedelta(seconds=600)
+        self.now += timedelta(days=7)
         self.error("HOST_ACCESS_CARD_EXPIRED", lambda: self.cards.confirm("alpha", **self.args(opened)))
         opened = self.open()
         self.runtime = "b" * 64
@@ -151,18 +163,18 @@ class ChatHostAccessApprovalTests(unittest.TestCase):
 
     def test_invalid_options_do_not_consume_a_valid_card(self):
         opened = self.open()
-        for duration in (0, 28801, True, "600"):
+        for duration in (0, 2592001, True, "600"):
             self.error("INVALID_HOST_ACCESS_DURATION", lambda: self.cards.update(
                 "alpha", **self.args(opened), duration_seconds=duration, allow_codex=False))
         self.error("INVALID_HOST_ACCESS_REQUEST", lambda: self.cards.update(
             "alpha", **self.args(opened), duration_seconds=600, allow_codex="yes"))
         self.cards.confirm("alpha", **self.args(opened))
 
-    def test_eight_hour_grant_keeps_the_card_confirmation_window_short(self):
+    def test_eight_hour_grant_has_a_seven_day_card_confirmation_window(self):
         opened = self.open(duration_seconds=28800)
         self.assertEqual(opened["structuredContent"]["duration_seconds"], 28800)
         self.assertEqual(opened["structuredContent"]["expires_at"],
-                         (self.now + timedelta(minutes=10)).isoformat())
+                         (self.now + timedelta(days=7)).isoformat())
         self.cards.confirm("alpha", **self.args(opened))
         self.assertEqual(self.access.require("alpha")["expires_at"],
                          (self.now + timedelta(hours=8)).isoformat())

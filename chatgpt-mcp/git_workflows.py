@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Constrained Git workflows for allowlisted host repositories.
 
-The MCP process may prepare operations, but commit and push require a separate
-interactive host approval receipt. Pull request and merge operations are handed
+The MCP process may prepare operations. Commit requires a verified owner-confirmed
+commit-only grant or a separate one-use approval; push always requires one-use
+owner approval. Pull request and merge operations are handed
 off to the repository's native review workflows instead of invoking ``gh``.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -27,6 +28,8 @@ import tempfile
 import time
 from typing import Callable, Iterable
 
+from workspace_paths import WorkspaceError
+
 
 GIT = "/usr/bin/git"
 GH = "/usr/bin/gh"
@@ -39,6 +42,8 @@ MAX_CAPTURE = 512 * 1024
 MAX_OPERATIONS = 1000
 MAX_TEXT_BYTES = 64 * 1024
 MAX_PATHS = 128
+MAX_PUSH_COMMITS = 128
+MAX_PUSH_PATHS = 128
 COMMAND_TIMEOUT = 60.0
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 PROTECTED_BRANCHES = frozenset({"main", "master"})
@@ -49,6 +54,10 @@ PR_URL_RE = re.compile(
     r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$"
 )
 BRANCH_RE = re.compile(r"^(?![./])(?!.*(?:\.\.|//|@\{|\\|[ ~^:?*\[]))(?!.*[/.]$)[A-Za-z0-9._/-]+$")
+
+
+class _GitResultUnavailable(ValueError):
+    """A Git mutation returned successfully, but its result could not be read."""
 
 
 def _tool(name: str, title: str, description: str, properties: dict, required=(), *, read_only=False):
@@ -95,8 +104,10 @@ GIT_TOOL_SPECS = [
     ),
     _tool(
         "prepare_git_operation", "Git 작업 준비",
-        "Prepare a commit, push, PR, or merge plan. Commit and push still require a separate "
-        "interactive host approval; PR and merge return a native-workflow handoff.",
+        "Prepare an exact commit, push, PR, or merge plan. A commit covered by a still-valid "
+        "owner-confirmed repository-and-branch grant returns approval_required=false and next_action; "
+        "follow it without another approval when execution was requested. Other commits and all pushes "
+        "require exact one-use chat approval (host TTY fallback). PR/merge return native-workflow handoffs.",
         {
             "project": _PROJECT,
             "action": {"type": "string", "enum": ["commit", "push", "pr", "merge"]},
@@ -112,8 +123,9 @@ GIT_TOOL_SPECS = [
     ),
     _tool(
         "execute_git_operation", "승인된 Git 작업 실행",
-        "Execute one prepared commit or push only after a matching single-use host approval. "
-        "PR and merge operations return their required native-workflow handoff.",
+        "Execute one prepared commit under its matching active commit-only grant or exact one-use "
+        "owner receipt. Push may reuse an explicitly approved origin/feature-branch/push-count grant; otherwise exact one-use approval is required. Revalidate scope and the prepared snapshot "
+        "at execution; PR/merge return their required native-workflow handoffs.",
         {"project": _PROJECT, "operation_id": {"type": "string", "minLength": 1}},
         ("project", "operation_id"),
     ),
@@ -368,6 +380,7 @@ class GitWorkflows:
         message_validator: Callable[[Path], None] | None = None,
         reference_checker: Callable[[str], None] | None = None,
         remote_adapter: Callable[[Path, str, str], tuple[str, bool, str | None]] | None = None,
+        workspace=None,
     ):
         if not projects or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", name) for name in projects):
             raise ValueError("Git workflow projects require simple allowlisted names")
@@ -376,7 +389,10 @@ class GitWorkflows:
         self.message_validator = message_validator or _default_message_validator
         self.reference_checker = reference_checker or _default_reference_checker
         self.remote_adapter = remote_adapter or _default_remote_adapter
+        self.workspace = workspace
         self._ensure_state_dir()
+        from git_commit_access import CommitAccess
+        self.commit_access = CommitAccess(self)
 
     def _ensure_state_dir(self) -> None:
         candidate = self.state_dir.absolute()
@@ -409,6 +425,258 @@ class GitWorkflows:
         if top_level != root:
             raise ValueError("Git project must be the exact repository root, not a subdirectory")
         return root
+
+    @contextmanager
+    def _workspace_access(self, project: str, *, write=False):
+        """Bind active-policy work; project writers lock before admission."""
+        if self.workspace is None or not self.workspace.enabled:
+            yield None
+            return
+        snapshot, _ = self.workspace._context()
+        lock = self.workspace.authority.project_lock(project) if write else nullcontext()
+        with lock:
+            with self.workspace.authority.admission(snapshot.digest):
+                yield snapshot
+                self.workspace._current(snapshot)
+
+    def _workspace_path(self, snapshot, project: str, relative: str, operation: str) -> Path:
+        if snapshot is None:
+            return self.projects[project] / relative
+        target = self.workspace.policy.check(project, relative, operation, snapshot=snapshot)
+        return self.workspace.ordinary_path(snapshot, project, target)
+
+    def _workspace_paths(self, snapshot, project: str, paths: Iterable[str], operation: str) -> None:
+        for relative in paths:
+            self._workspace_path(snapshot, project, relative, operation)
+
+    def _safe_changed_paths(
+        self, snapshot, project: str, root: Path, *, staged=False,
+        comparison: tuple[str, str] | None = None,
+        requested: Iterable[str] = (),
+    ) -> tuple[list[str], int, bool]:
+        command = ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "--find-renames"]
+        if staged:
+            command.append("--cached")
+        if comparison:
+            command.extend(comparison)
+        requested = set(requested)
+        groups = self._changed_path_groups(_git(root, *command).stdout)
+
+        selected = []
+        omitted = 0
+        truncated = False
+        for group in groups:
+            if requested and not requested.intersection(group):
+                continue
+            try:
+                for relative in group:
+                    self._paths(root, [relative], required=True)
+                    self._workspace_path(snapshot, project, relative, "read")
+            except (WorkspaceError, ValueError):
+                omitted += 1
+                continue
+            additions = [relative for relative in group if relative not in selected]
+            if len(selected) + len(additions) > MAX_PATHS:
+                omitted += 1
+                truncated = True
+                continue
+            selected.extend(additions)
+        return selected, omitted, truncated
+
+    @staticmethod
+    def _changed_path_groups(output: bytes) -> list[list[str]]:
+        fields = output.split(b"\0")
+        groups = []
+        index = 0
+        while index < len(fields) and fields[index]:
+            status_value = fields[index].decode("ascii")
+            index += 1
+            count = 2 if status_value.startswith(("R", "C")) else 1
+            if index + count > len(fields):
+                raise ValueError("Git returned malformed changed-path metadata")
+            group = [item.decode("utf-8", errors="surrogateescape")
+                     for item in fields[index:index + count]]
+            if any(not item for item in group):
+                raise ValueError("Git returned malformed changed-path metadata")
+            groups.append(group)
+            index += count
+        if any(fields[index:]):
+            raise ValueError("Git returned malformed changed-path metadata")
+        return groups
+
+    def _validate_outgoing_history(
+        self, snapshot, project: str, root: Path, comparison: str, head: str,
+    ) -> None:
+        revision_args = [head]
+        if comparison != EMPTY_TREE:
+            revision_args.append(f"^{comparison}")
+        lines = _decode(_git(root, "rev-list", "--parents", *revision_args).stdout).splitlines()
+        if len(lines) > MAX_PUSH_COMMITS:
+            raise ValueError("Outgoing Git history exceeds the commit limit")
+        commits = []
+        for line in lines:
+            fields = line.split()
+            if (not fields or any(not re.fullmatch(r"[0-9a-f]{40,64}", item)
+                                  for item in fields)):
+                raise ValueError("Git returned malformed outgoing history metadata")
+            commits.append((fields[0], fields[1:] or [EMPTY_TREE]))
+
+        observed = set()
+        for commit, parents in commits:
+            for parent in parents:
+                output = _git(
+                    root, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z",
+                    "--find-renames", parent, commit,
+                ).stdout
+                for group in self._changed_path_groups(output):
+                    for relative in group:
+                        observed.add(relative)
+                        if len(observed) > MAX_PUSH_PATHS:
+                            raise ValueError("Outgoing Git history exceeds the path limit")
+                        try:
+                            self._paths(root, [relative], required=True)
+                            self._workspace_path(snapshot, project, relative, "read")
+                        except (WorkspaceError, ValueError):
+                            raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED") from None
+
+    def _safe_diff(
+        self, snapshot, project: str, root: Path, *, staged=False,
+        comparison: tuple[str, str] | None = None,
+        requested: Iterable[str] = (),
+        raw=False,
+    ) -> tuple[str, int, bool]:
+        paths, omitted, truncated = self._safe_changed_paths(
+            snapshot, project, root, staged=staged, comparison=comparison, requested=requested,
+        )
+        if not paths:
+            return "", omitted, truncated
+        command = ["diff", "--no-ext-diff", "--no-textconv", "--no-renames"]
+        if raw:
+            command.extend(["--raw", "--no-abbrev"])
+        if staged:
+            command.append("--cached")
+        if comparison:
+            command.extend(comparison)
+        command.extend(["--", *paths])
+        return _decode(_git(root, *command).stdout), omitted, truncated
+
+    @staticmethod
+    def _status_path(relative: str) -> str:
+        if (relative and relative == relative.strip()
+                and all(character.isprintable() for character in relative)):
+            return relative
+        return json.dumps(relative, ensure_ascii=False)
+
+    def _safe_status_with_fingerprint(self, snapshot, project: str, root: Path) -> dict:
+        """Hash all *authorized* dirty paths, not just the bounded display.
+
+        Excluded paths never enter either digest. Worktree content hashing has
+        explicit size budgets; an incomplete digest must not be used as proof.
+        """
+        raw = _git(
+            root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
+        ).stdout
+        branch = self._current_branch(root)
+        visible_status = hashlib.sha256(b"visible-status-v2\0" + branch.encode("utf-8") + b"\0")
+        worktree = hashlib.sha256(b"visible-worktree-v2\0" + branch.encode("utf-8") + b"\0")
+        rows = []
+        omitted = 0
+        excluded = 0
+        visible_count = 0
+        truncated = False
+        content_complete = True
+        content_budget = 64 * 1024 * 1024
+        used = 0
+        for record in raw.split(b"\0"):
+            if not record:
+                continue
+            if len(record) < 4 or record[2:3] != b" ":
+                raise ValueError("Git returned malformed status metadata")
+            code = record[:2].decode("ascii")
+            relative = record[3:].decode("utf-8", errors="surrogateescape")
+            try:
+                self._paths(root, [relative], required=True)
+                target = self._workspace_path(snapshot, project, relative, "read")
+            except (WorkspaceError, ValueError):
+                omitted += 1
+                excluded += 1
+                continue
+
+            visible_count += 1
+            visible_status.update(record + b"\0")
+            worktree.update(record + b"\0")
+            try:
+                info = target.lstat()
+            except FileNotFoundError:
+                worktree.update(b"deleted\0")
+            except OSError:
+                content_complete = False
+                worktree.update(b"unreadable\0")
+            else:
+                if stat.S_ISREG(info.st_mode):
+                    if info.st_size > 8 * 1024 * 1024 or info.st_size > content_budget:
+                        content_complete = False
+                        worktree.update(b"oversized\0")
+                        worktree.update(str((info.st_size, info.st_mtime_ns, info.st_mode)).encode())
+                    else:
+                        try:
+                            fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+                            with os.fdopen(fd, "rb") as reader:
+                                before = os.fstat(reader.fileno())
+                                digest = hashlib.sha256()
+                                remaining = 8 * 1024 * 1024 + 1
+                                while remaining > 0:
+                                    part = reader.read(min(65536, remaining))
+                                    if not part:
+                                        break
+                                    digest.update(part)
+                                    remaining -= len(part)
+                                after = os.fstat(reader.fileno())
+                            if (remaining <= 0 or before.st_ino != info.st_ino
+                                    or before.st_mtime_ns != after.st_mtime_ns
+                                    or before.st_size != after.st_size):
+                                content_complete = False
+                                worktree.update(b"unstable\0")
+                                worktree.update(str((after.st_size, after.st_mtime_ns)).encode())
+                            else:
+                                worktree.update(b"file\0" + digest.digest())
+                                content_budget -= after.st_size
+                        except OSError:
+                            content_complete = False
+                            worktree.update(b"unreadable\0")
+                elif stat.S_ISLNK(info.st_mode):
+                    try:
+                        worktree.update(b"symlink\0" + os.readlink(target).encode("utf-8", "surrogateescape"))
+                    except OSError:
+                        content_complete = False
+                        worktree.update(b"unreadable-link\0")
+                else:
+                    content_complete = False
+                    worktree.update(b"special\0" + str(info.st_mode).encode("ascii"))
+
+            row = f"{code} {self._status_path(relative)}\n"
+            size = len(row.encode("utf-8", errors="surrogateescape"))
+            if len(rows) >= MAX_PATHS or used + size > MAX_TEXT_BYTES:
+                omitted += 1
+                truncated = True
+                continue
+            rows.append(row)
+            used += size
+        return {
+            "status": f"## {branch}\n{''.join(rows)}",
+            "omitted_paths": omitted,
+            "excluded_paths": excluded,
+            "truncated": truncated,
+            "visible_paths": visible_count,
+            "visible_status_sha256": visible_status.hexdigest(),
+            "worktree_content_sha256": worktree.hexdigest(),
+            "content_fingerprint_complete": content_complete,
+            "fingerprint_scope": "authorized-visible-dirty-paths",
+        }
+
+    def _safe_status(self, snapshot, project: str, root: Path) -> tuple[str, int, bool]:
+        details = self._safe_status_with_fingerprint(snapshot, project, root)
+        return details["status"], details["omitted_paths"], details["truncated"]
 
     def _paths(self, root: Path, values: object, *, required=False) -> list[str]:
         if values is None and not required:
@@ -453,7 +721,11 @@ class GitWorkflows:
 
     def _snapshot(self, root: Path, paths: Iterable[str] = ()) -> dict:
         selected = list(paths)
-        status = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout
+        status_args = ["status", "--porcelain=v1", "--untracked-files=all"]
+        if selected:
+            status_args.extend(["--", *selected])
+        status = _git(root, *status_args).stdout
+        index_state = _git(root, "diff", "--cached", "--raw", "-z", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD").stdout
         diff_args = ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"]
         if selected:
             diff_args.extend(["--", *selected])
@@ -487,6 +759,7 @@ class GitWorkflows:
             "head": self._head(root),
             "branch": self._current_branch(root),
             "status_sha256": _sha256(status),
+            "index_sha256": _sha256(index_state),
             "diff_sha256": _sha256(diff),
             "selected_content_sha256": digest.hexdigest(),
             "selected_index_state": self._worktree_index_state(root, selected),
@@ -635,58 +908,81 @@ class GitWorkflows:
         raise ValueError(f"Unknown Git workflow tool: {name}")
 
     def git_status(self, args: dict) -> dict:
-        root = self._project(args.get("project"))
-        output = _decode(_git(root, "status", "--short", "--branch").stdout)
-        return {"project": args["project"], "branch": self._current_branch(root), "status": output}
+        project = args.get("project")
+        root = self._project(project)
+        with self._workspace_access(project) as snapshot:
+            if snapshot is None:
+                output = _decode(_git(root, "status", "--short", "--branch").stdout)
+                return {"project": project, "branch": self._current_branch(root), "status": output}
+            details = self._safe_status_with_fingerprint(snapshot, project, root)
+            return {"project": project, "branch": self._current_branch(root), **details}
 
     def git_diff(self, args: dict) -> dict:
-        root = self._project(args.get("project"))
+        project = args.get("project")
+        root = self._project(project)
         paths = self._paths(root, args.get("paths"))
-        command = ["diff", "--no-ext-diff", "--no-textconv"]
-        if args.get("staged") is True:
-            command.append("--cached")
-        elif args.get("staged") not in (None, False):
+        staged = args.get("staged") is True
+        if args.get("staged") not in (None, False, True):
             raise ValueError("staged must be a boolean")
-        if paths:
-            command.extend(["--", *paths])
-            output = _decode(_git(root, *command).stdout)
-        else:
-            command.extend(["--", ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*"])
-            output = _decode(_git(root, *command, literal=False).stdout)
-        return {"project": args["project"], "staged": bool(args.get("staged")), "paths": paths,
-                "diff": output}
+        with self._workspace_access(project) as snapshot:
+            if snapshot is not None:
+                if paths:
+                    self._workspace_paths(snapshot, project, paths, "read")
+                    output, omitted, truncated = self._safe_diff(
+                        snapshot, project, root, staged=staged, requested=paths,
+                    )
+                    if omitted:
+                        raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED")
+                else:
+                    output, omitted, truncated = self._safe_diff(
+                        snapshot, project, root, staged=staged,
+                    )
+                return {"project": project, "staged": staged, "paths": paths, "diff": output,
+                        "omitted_paths": omitted, "truncated": truncated}
+            command = ["diff", "--no-ext-diff", "--no-textconv"]
+            if staged:
+                command.append("--cached")
+            if paths:
+                command.extend(["--", *paths])
+                output = _decode(_git(root, *command).stdout)
+            else:
+                command.extend(["--", ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*"])
+                output = _decode(_git(root, *command, literal=False).stdout)
+            return {"project": project, "staged": staged, "paths": paths, "diff": output}
 
     def prepare(self, args: dict) -> dict:
         project = args.get("project")
         root = self._project(project)
-        if sum(1 for _ in self._project_dir(project).glob("*.plan.json")) >= MAX_OPERATIONS:
-            raise ValueError("Git operation history capacity reached; host maintenance is required")
-        for field in ("message", "title", "body"):
-            value = args.get(field)
-            if value is not None and (not isinstance(value, str)
-                                      or len(value.encode("utf-8")) > MAX_TEXT_BYTES):
-                raise ValueError(f"{field} must be text of at most 64 KiB")
-        action = args.get("action")
-        if action == "commit":
-            self._reject_unknown_args(args, {"project", "action", "paths", "message"})
-            return self._prepare_commit(project, root, args)
-        if action == "push":
-            self._reject_unknown_args(args, {"project", "action", "branch", "new_branch"})
-            return self._prepare_push(project, root, args)
-        if action in {"pr", "merge"}:
-            allowed = ({"project", "action", "title", "body", "base"} if action == "pr"
-                       else {"project", "action", "pull_request_url"})
-            self._reject_unknown_args(args, allowed)
-            return self._prepare_native_handoff(project, root, action, args)
-        raise ValueError("action must be commit, push, pr, or merge")
+        with self._workspace_access(project) as snapshot:
+            if sum(1 for _ in self._project_dir(project).glob("*.plan.json")) >= MAX_OPERATIONS:
+                raise ValueError("Git operation history capacity reached; host maintenance is required")
+            for field in ("message", "title", "body"):
+                value = args.get(field)
+                if value is not None and (not isinstance(value, str)
+                                          or len(value.encode("utf-8")) > MAX_TEXT_BYTES):
+                    raise ValueError(f"{field} must be text of at most 64 KiB")
+            action = args.get("action")
+            if action == "commit":
+                self._reject_unknown_args(args, {"project", "action", "paths", "message"})
+                return self._prepare_commit(project, root, args, snapshot)
+            if action == "push":
+                self._reject_unknown_args(args, {"project", "action", "branch", "new_branch"})
+                return self._prepare_push(project, root, args, snapshot)
+            if action in {"pr", "merge"}:
+                allowed = ({"project", "action", "title", "body", "base"} if action == "pr"
+                           else {"project", "action", "pull_request_url"})
+                self._reject_unknown_args(args, allowed)
+                return self._prepare_native_handoff(project, root, action, args)
+            raise ValueError("action must be commit, push, pr, or merge")
 
     def _reject_unknown_args(self, args: dict, allowed: set[str]) -> None:
         unknown = sorted(set(args) - allowed)
         if unknown:
             raise ValueError(f"Unsupported or unsafe arguments: {', '.join(unknown)}")
 
-    def _prepare_commit(self, project: str, root: Path, args: dict) -> dict:
+    def _prepare_commit(self, project: str, root: Path, args: dict, workspace_snapshot=None) -> dict:
         paths = self._paths(root, args.get("paths"), required=True)
+        self._workspace_paths(workspace_snapshot, project, paths, "write")
         message = args.get("message")
         if not isinstance(message, str) or not message.strip():
             raise ValueError("Commit preparation requires the complete commit message")
@@ -718,6 +1014,9 @@ class GitWorkflows:
                 "head_target": snapshot["head"], "preview": preview,
                 "approval_nonce": secrets.token_hex(32),
             }
+            binding = self.commit_access.preparation_binding(project)
+            if binding is not None:
+                immutable["development_grant_id"] = binding
             plan = {
                 "version": 1, "operation_id": operation_id, "project": project,
                 "action": "commit", "status": "pending_host_approval", "created_at": _utcnow(),
@@ -731,7 +1030,7 @@ class GitWorkflows:
                 message_path.unlink()
             raise
 
-    def _prepare_push(self, project: str, root: Path, args: dict) -> dict:
+    def _prepare_push(self, project: str, root: Path, args: dict, workspace_snapshot=None) -> dict:
         branch = self._branch(args.get("branch"))
         if branch in PROTECTED_BRANCHES:
             raise ValueError("Direct pushes to main or master are disabled")
@@ -748,21 +1047,56 @@ class GitWorkflows:
             actual = "already exists" if exists else "does not exist"
             raise ValueError(f"new_branch does not match origin: branch {actual}")
         snapshot = self._snapshot(root)
-        comparison = remote_head or EMPTY_TREE
-        preview = _decode(_git(
-            root, "diff", "--no-ext-diff", "--no-textconv", "--binary",
-            comparison, snapshot["head"], "--",
-            ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*", literal=False,
-        ).stdout)
+        base_head = None
+        if new_branch:
+            # A fresh remote feature branch inherits already-published main.
+            # Only that authenticated remote ref may narrow the outgoing scope.
+            base_target, base_exists, candidate = self.remote_adapter(root, remote_url, "main")
+            if (base_target != trusted_target or not base_exists or not isinstance(candidate, str)
+                    or not re.fullmatch(r"[0-9a-f]{40,64}", candidate)):
+                raise ValueError("New branch push requires an authenticated origin/main base")
+            if _git(root, "merge-base", "--is-ancestor", candidate, snapshot["head"],
+                    check=False).returncode != 0:
+                raise ValueError("Verified origin/main is not an ancestor of the proposed branch")
+            base_head = candidate
+        comparison = remote_head or base_head or EMPTY_TREE
+        if workspace_snapshot is None:
+            preview = _decode(_git(
+                root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--raw", "--no-abbrev",
+                comparison, snapshot["head"], "--",
+                ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*", literal=False,
+            ).stdout)
+        else:
+            self._validate_outgoing_history(
+                workspace_snapshot, project, root, comparison, snapshot["head"],
+            )
+            preview, omitted, truncated = self._safe_diff(
+                workspace_snapshot, project, root,
+                comparison=(comparison, snapshot["head"]),
+                raw=True,
+            )
+            if omitted or truncated:
+                raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED")
+        preview = (
+            (f"Verified already-published origin/main base: {base_head}\n" if base_head else "")
+            + f"Outgoing committed changes: {comparison} -> {snapshot['head']}\n"
+            + "Changed paths, modes and complete old/new blob IDs:\n"
+            + preview
+        )
+        if len(preview.encode("utf-8")) > MAX_CAPTURE:
+            raise ValueError("Push preview exceeded the 512 KiB safety limit")
         immutable = {
             "action": "push", "branch": branch, "new_branch": new_branch,
             "remote": "origin", "trusted_target": trusted_target,
-            "remote_head": remote_head, "snapshot": snapshot,
+            "remote_head": remote_head, "base_head": base_head, "snapshot": snapshot,
             "display_command": f"git push origin HEAD:refs/heads/{branch}",
             "head_target": f"refs/heads/{branch} -> {snapshot['head']}",
             "preview": preview,
             "approval_nonce": secrets.token_hex(32),
         }
+        binding = self.commit_access.preparation_binding(project)
+        if binding is not None:
+            immutable["development_grant_id"] = binding
         plan = self._new_plan(project, immutable, status="pending_host_approval")
         with self._lock(project):
             self._save_plan(plan)
@@ -826,6 +1160,15 @@ class GitWorkflows:
                 "--state-dir", str(self.state_dir), "--project", plan["project"],
                 "--operation-id", plan["operation_id"],
             ])
+        access = self.commit_access.public_plan(plan)
+        if access is not None:
+            result.pop("approval_command", None)
+            result.update(approval_required=False, authorization=access, next_action={
+                "tool": "execute_git_operation",
+                "arguments": {"project": plan["project"], "operation_id": plan["operation_id"]},
+            })
+        if plan.get("authorization"):
+            result["authorization"] = plan["authorization"]
         if "handoff" in immutable:
             result["code"] = "NATIVE_WORKFLOW_REQUIRED"
             result["handoff"] = immutable["handoff"]
@@ -846,47 +1189,80 @@ class GitWorkflows:
         root = self._project(project)
         operation_id = args.get("operation_id")
         with self._lock(project):
-            plan = self._load_plan(project, operation_id)
-            if plan["status"] == "waiting_native_workflow":
-                return self._public(plan)
-            if plan["status"] != "pending_host_approval":
-                raise ValueError(f"Git operation is not executable in state {plan['status']!r}")
-            immutable = plan["immutable"]
-            current = self._snapshot(root, immutable.get("paths", ()))
-            if current != immutable["snapshot"]:
-                raise ValueError("Prepared Git operation is stale because HEAD or working state changed")
-            receipt_path = self._receipt_path(project, operation_id)
-            self._verify_private(receipt_path)
-            try:
-                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise ValueError("Host approval receipt is unreadable") from exc
-            expected = {
-                "operation_id": operation_id,
-                "plan_digest": plan["plan_digest"],
-                "approval_nonce": immutable["approval_nonce"],
-            }
-            if any(receipt.get(key) != value for key, value in expected.items()):
-                raise ValueError("Host approval receipt does not match the full prepared plan")
-            receipt_path.unlink()
-            plan["status"] = "executing"
-            self._save_plan(plan)
-            try:
+            with self._workspace_access(project, write=True) as workspace_snapshot:
+                plan = self._load_plan(project, operation_id)
+                if plan["status"] == "waiting_native_workflow":
+                    return self._public(plan)
+                if plan["status"] != "pending_host_approval":
+                    raise ValueError(f"Git operation is not executable in state {plan['status']!r}")
+                immutable = plan["immutable"]
                 if plan["action"] == "commit":
-                    result = self._execute_commit(root, immutable)
-                elif plan["action"] == "push":
-                    result = self._execute_push(root, immutable)
+                    self._workspace_paths(
+                        workspace_snapshot, project, immutable.get("paths", ()), "write",
+                    )
+                elif plan["action"] == "push" and workspace_snapshot is not None:
+                    self._validate_outgoing_history(
+                        workspace_snapshot, project, root,
+                        immutable["remote_head"] or immutable.get("base_head") or EMPTY_TREE,
+                        immutable["snapshot"]["head"],
+                    )
+                current = self._snapshot(root, immutable.get("paths", ()))
+                if current != immutable["snapshot"]:
+                    raise ValueError("Prepared Git operation is stale because HEAD or working state changed")
+                authorization = self.commit_access.begin_locked(plan)
+                if authorization is None:
+                    receipt_path = self._receipt_path(project, operation_id)
+                    self._verify_private(receipt_path)
+                    try:
+                        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as exc:
+                        raise ValueError("Host approval receipt is unreadable") from exc
+                    expected = {
+                        "operation_id": operation_id,
+                        "plan_digest": plan["plan_digest"],
+                        "approval_nonce": immutable["approval_nonce"],
+                    }
+                    if any(receipt.get(key) != value for key, value in expected.items()):
+                        raise ValueError("Host approval receipt does not match the full prepared plan")
+                    receipt_path.unlink()
                 else:
-                    raise ValueError("Only commit and push may execute through this MCP")
-            except BaseException as exc:
-                plan["status"] = "failed"
-                plan["result"] = {"error": str(exc)[:4000]}
+                    plan["authorization"] = authorization
+                plan["status"] = "executing"
                 self._save_plan(plan)
-                raise
-            plan["status"] = "completed"
-            plan["result"] = result
-            self._save_plan(plan)
-            return self._public(plan)
+                operation_result = None
+                try:
+                    if plan["action"] == "commit":
+                        result = self._execute_commit(root, immutable)
+                    elif plan["action"] == "push":
+                        result = self._execute_push(root, immutable)
+                    else:
+                        raise ValueError("Only commit and push may execute through this MCP")
+                    operation_result = result
+                    if authorization is not None:
+                        self.commit_access.finish_locked(plan, result)
+                    plan["status"] = "completed"
+                    plan["result"] = result
+                    self._save_plan(plan)
+                except BaseException as exc:
+                    if authorization is not None:
+                        try:
+                            self.commit_access.fail_locked(plan)
+                        except Exception:
+                            pass  # In-flight or unsettled completion evidence blocks reuse.
+                    uncertain = operation_result is not None or isinstance(exc, _GitResultUnavailable)
+                    plan["status"] = "outcome_unknown" if uncertain else "failed"
+                    plan["result"] = {"error": str(exc)[:4000]}
+                    if uncertain:
+                        plan["result"]["requires_manual_verification"] = True
+                        if plan["action"] == "commit":
+                            commit = operation_result.get("commit") if operation_result is not None else None
+                            if commit is not None:
+                                plan["result"]["commit"] = commit
+                        else:
+                            plan["result"]["branch"] = immutable["branch"]
+                    self._save_plan(plan)
+                    raise
+                return self._public(plan)
 
     def _execute_commit(self, root: Path, immutable: dict) -> dict:
         message_path = Path(immutable["message_path"])
@@ -896,30 +1272,39 @@ class GitWorkflows:
         if _git(root, "diff", "--cached", "--quiet", check=False).returncode != 0:
             raise ValueError("Git index changed after approval")
         _reject_dangerous_git_config(root)
-        _git(root, "add", "--", *immutable["paths"])
-        staged_paths = set(_decode(_git(
-            root, "diff", "--cached", "--name-only", "-z"
-        ).stdout).rstrip("\0").split("\0"))
-        staged_paths.discard("")
-        if (not staged_paths or not staged_paths.issubset(set(immutable["paths"]))
-                or self._staged_index_state(root, immutable["paths"])
-                != immutable["snapshot"]["selected_index_state"]):
-            self._restore_selected_index(root, immutable["paths"])
-            raise ValueError(
-                "The staged paths, selected file bytes, or executable modes changed during commit staging"
-            )
         try:
+            _git(root, "add", "--", *immutable["paths"])
+            staged_paths = set(_decode(_git(
+                root, "diff", "--cached", "--name-only", "-z"
+            ).stdout).rstrip("\0").split("\0"))
+            staged_paths.discard("")
+            if (not staged_paths or not staged_paths.issubset(set(immutable["paths"]))
+                    or self._staged_index_state(root, immutable["paths"])
+                    != immutable["snapshot"]["selected_index_state"]):
+                raise ValueError(
+                    "The staged paths, selected file bytes, or executable modes changed during commit staging"
+                )
             result = _git(
                 root, "commit", "--no-verify", "--file", str(message_path),
             )
         except BaseException as commit_error:
-            if not self._restore_selected_index(root, immutable["paths"]):
-                raise ValueError(
-                    "Commit failed and the selected-path index cleanup also failed; "
-                    "inspect the index before retrying"
-                ) from commit_error
+            cleanup_message = (
+                "Selected-path index cleanup could not be verified; inspect the index before retrying. "
+                f"Original failure: {str(commit_error)[:1000]}"
+            )
+            try:
+                restored = self._restore_selected_index(root, immutable["paths"])
+            except Exception as cleanup_error:
+                raise ValueError(cleanup_message) from cleanup_error
+            if not restored:
+                raise ValueError(cleanup_message) from commit_error
             raise
-        return {"commit": self._head(root), "output": _decode(result.stdout).strip()}
+        try:
+            return {"commit": self._head(root), "output": _decode(result.stdout).strip()}
+        except BaseException as result_error:
+            raise _GitResultUnavailable(
+                "Commit completed but its result could not be inspected; manual verification is required"
+            ) from result_error
 
     def _restore_selected_index(self, root: Path, paths: list[str]) -> bool:
         restore = _git(root, "restore", "--staged", "--", *paths, check=False)
@@ -968,13 +1353,25 @@ class GitWorkflows:
                 or exists == immutable["new_branch"]
                 or remote_head != immutable["remote_head"]):
             raise ValueError("Origin identity or branch existence changed after approval")
+        if immutable["new_branch"]:
+            base_target, base_exists, base_head = self.remote_adapter(root, remote_url, "main")
+            if (base_target != trusted_target or not base_exists
+                    or base_head != immutable.get("base_head")
+                    or _git(root, "merge-base", "--is-ancestor", base_head,
+                            immutable["snapshot"]["head"], check=False).returncode != 0):
+                raise ValueError("Verified origin/main base changed after approval")
         fixture_push = getattr(self.remote_adapter, "push", None)
         if fixture_push is None:
             result = _git(root, "push", trusted_target, f"HEAD:refs/heads/{branch}", authenticated=True)
         else:
             # Only an explicitly injected test fixture adapter reaches this path.
             result = fixture_push(root, branch)
-        return {"pushed": self._head(root), "branch": branch, "output": _decode(result.stderr).strip()}
+        try:
+            return {"pushed": self._head(root), "branch": branch, "output": _decode(result.stderr).strip()}
+        except BaseException as result_error:
+            raise _GitResultUnavailable(
+                "Push completed but its result could not be inspected; manual verification is required"
+            ) from result_error
 
 
 def approve_operation(state_dir: Path, project: str, operation_id: str) -> dict:

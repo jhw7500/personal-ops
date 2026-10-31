@@ -165,7 +165,7 @@ class HostCommandChatApprovalTests(unittest.TestCase):
         import host_command_operations
         args = self.args(self.open())
         begin = self.ops._begin
-        later = host_access._utcnow() + timedelta(minutes=11)
+        later = host_access._utcnow() + timedelta(days=7, seconds=1)
         def enqueue_after_deadline(*pos, **kw):
             with mock.patch.object(host_command_operations, "_now", return_value=later):
                 return begin(*pos, **kw)
@@ -180,7 +180,7 @@ class HostCommandChatApprovalTests(unittest.TestCase):
 
     def test_combined_callback_rejects_expired_card_without_execution(self):
         args = self.args(self.open())
-        later = host_access._utcnow() + timedelta(minutes=11)
+        later = host_access._utcnow() + timedelta(days=7, seconds=1)
         with mock.patch.object(host_access, "_utcnow", return_value=later):
             with self.assertRaises(HostRuntimeError):
                 self.approve_and_execute(args)
@@ -223,7 +223,7 @@ class HostCommandChatApprovalTests(unittest.TestCase):
 
     def test_expired_card_cannot_issue_receipt(self):
         args = self.args(self.open())
-        later = host_access._utcnow() + timedelta(minutes=11)
+        later = host_access._utcnow() + timedelta(days=7, seconds=1)
         with mock.patch.object(host_access, "_utcnow", return_value=later):
             with self.assertRaises(HostRuntimeError):
                 self.cards.confirm(**args)

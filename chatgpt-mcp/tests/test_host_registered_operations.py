@@ -34,6 +34,8 @@ import host_registered_operations  # noqa: E402
 import host_runtime_operations  # noqa: E402
 from host_runtime_operations import HostRuntimeOperations, _digest, host_admission  # noqa: E402
 from host_registered_operations import observed_registered_operation_blocks_host  # noqa: E402
+from workspace_host import publication_lane  # noqa: E402
+from workspace_tools import WorkspaceTools  # noqa: E402
 
 HEX32 = re.compile(r"\A[0-9a-f]{32}\Z")
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -134,6 +136,22 @@ class RegisteredOperationsTest(unittest.IsolatedAsyncioTestCase):
         self.config.write_text(json.dumps(self.payload))
         self.config.chmod(0o600)
 
+    def active_workspace(self):
+        owner = self.home / "workspace-owner"
+        owner.mkdir(mode=0o700)
+        policy = owner / "policy.json"
+        policy.write_text(json.dumps({
+            "version": 1, "base_root": str(self.home),
+            "artifacts": [], "protected_paths": [],
+        }), encoding="utf-8")
+        policy.chmod(0o600)
+        workspace = WorkspaceTools(
+            self.projects, state_dir=self.home / "workspace-authority",
+            config_path=policy)
+        snapshot = workspace.policy.load(required=True)
+        workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
+        return workspace
+
     def factory(self, target, action, runner):
         self.factory_calls.append((target["id"], action, runner))
         return self.adapter
@@ -185,6 +203,106 @@ class RegisteredOperationsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runner.effects, [])
         self.assertEqual(self.adapter.execute_calls, 0)
 
+    async def test_workspace_lane_covers_execute_and_postcheck(self):
+        workspace = self.active_workspace()
+        self.ops = self.make_ops(workspace=workspace)
+        entered = threading.Event()
+        release = threading.Event()
+        self.adapter.on_postcheck = lambda: (entered.set(), release.wait(3))
+        plan = self.plan("workspace-lane")
+        self.approve(plan)
+        await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+        with self.assertRaises(HostRuntimeError) as caught:
+            with publication_lane(workspace):
+                pass
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+        release.set()
+        await self.finish()
+        with publication_lane(workspace):
+            pass
+
+    async def test_worker_escape_with_running_state_keeps_durable_reservation(self):
+        workspace = self.active_workspace()
+        self.ops = self.make_ops(workspace=workspace)
+        plan = self.plan("workspace-worker-save-failure")
+        self.approve(plan)
+
+        def terminal_save_failed(operation_id, _target_spec, _adapter):
+            self.ops._record(operation_id, state="running", phase="EXECUTE")
+            raise RuntimeError("synthetic terminal state save failure")
+
+        with patch.object(threading, "excepthook"), \
+                patch.object(self.ops, "_run_body", side_effect=terminal_save_failed):
+            await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+            await self.finish()
+
+        self.assertEqual(self.ops._read_state(plan["operation_id"])["state"], "running")
+        with self.assertRaises(HostRuntimeError) as caught:
+            with publication_lane(workspace):
+                pass
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+
+    async def test_reservation_cleanup_failure_is_bounded_and_releases_target_fd(self):
+        workspace = self.active_workspace()
+        self.ops = self.make_ops(workspace=workspace)
+        plan = self.plan("workspace-reservation-cleanup-failure")
+        self.approve(plan)
+
+        with self.assertLogs("host_registered_operations", level="ERROR") as logged, \
+                patch("host_registered_operations.complete_host_operation",
+                      side_effect=HostRuntimeError("WORKSPACE_HOST_LANE_INVALID")):
+            await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+            await self.finish()
+
+        state = self.ops._read_state(plan["operation_id"])
+        self.assertEqual(
+            (state["state"], state["phase"], state["code"]),
+            ("outcome_unknown", "RECOVER", "WORKSPACE_HOST_RESERVATION_RELEASE_FAILED"))
+        self.assertIn("WORKSPACE_HOST_RESERVATION_RELEASE_FAILED", "\n".join(logged.output))
+        target_fd = host_runtime_operations.acquire_flock(
+            self.ops._lock_path_for(state["immutable"]["target_lock"]))
+        os.close(target_fd)
+        with self.assertRaises(HostRuntimeError) as caught:
+            with publication_lane(workspace):
+                pass
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+
+    async def test_busy_publication_lane_does_not_consume_registered_approval(self):
+        workspace = self.active_workspace()
+        self.ops = self.make_ops(workspace=workspace)
+        plan = self.plan("busy-lane")
+        self.approve(plan)
+        with publication_lane(workspace):
+            with self.assertRaises(HostRuntimeError) as caught:
+                await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+        self.assertTrue(self.ops._receipt_path(plan["operation_id"]).exists())
+        self.assertEqual(self.ops.get(PROJECT, TARGET, plan["operation_id"])["state"],
+                         "approved")
+
+    def test_standalone_manager_discovers_default_active_workspace(self):
+        config_home = self.home / "default-config"
+        state_home = self.home / "default-state"
+        with patch.dict(os.environ, {
+            "XDG_CONFIG_HOME": str(config_home), "XDG_STATE_HOME": str(state_home),
+        }):
+            policy = config_home / "chatgpt-coding-mcp" / "workspace-policy.json"
+            policy.parent.mkdir(parents=True, mode=0o700)
+            config_home.chmod(0o700)
+            policy.write_text(json.dumps({
+                "version": 1, "base_root": str(self.home),
+                "artifacts": [], "protected_paths": [],
+            }), encoding="utf-8")
+            policy.chmod(0o600)
+            workspace = WorkspaceTools(self.projects)
+            snapshot = workspace.policy.load(required=True)
+            workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
+            standalone = self.make_ops()
+
+        self.assertIsNotNone(standalone.workspace)
+        self.assertTrue(standalone.workspace.enabled)
+
     async def test_plan_public_output_is_bounded_and_carries_no_secret(self):
         before = datetime.now(timezone.utc)
         plan = self.plan()
@@ -205,7 +323,7 @@ class RegisteredOperationsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["source"]["changed_paths"], [])
         self.assertEqual(plan["source"]["high_risk_changes"], [])
         expires = datetime.fromisoformat(plan["expires_at"])
-        self.assertLessEqual(abs((expires - before).total_seconds() - 600), 5)
+        self.assertLessEqual(abs((expires - before).total_seconds() - 604800), 5)
         self.assertEqual(plan["approval_url"],
                          f"https://cantopsbuildserver.tail661d29.ts.net:8443"
                          f"/host-operations?project=tossApp&target=tarororo-test"
@@ -346,8 +464,8 @@ class RegisteredOperationsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replay["state"], "succeeded")
         self.assertEqual(self.runner.effects, ["restart"])
 
-    async def test_plans_and_approvals_expire_after_600_seconds(self):
-        later = datetime.now(timezone.utc) + timedelta(seconds=601)
+    async def test_plans_and_approvals_expire_after_seven_days(self):
+        later = datetime.now(timezone.utc) + timedelta(days=7, seconds=1)
         pending = self.plan("expire-pending")
         with patch("host_registered_operations._now", return_value=later):
             with self.assertRaises(HostRuntimeError) as caught:
@@ -1235,7 +1353,9 @@ class RegisteredOperationsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code, "UNSAFE_STATE_PATH")
         fake_home = self.home / "home"
         fake_home.mkdir()
-        with patch.dict(os.environ, {"HOME": str(fake_home)}):
+        default_env = {key: value for key, value in os.environ.items() if key != "XDG_STATE_HOME"}
+        default_env["HOME"] = str(fake_home)
+        with patch.dict(os.environ, default_env, clear=True):
             ops = self.make_ops(state_dir=None)
         expected = fake_home / ".local/state/chatgpt-coding-mcp/host-runtime"
         self.assertEqual(ops.state_dir, expected)

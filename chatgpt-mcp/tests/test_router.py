@@ -28,6 +28,7 @@ EXECUTION_TOOLS = {"list_execution_profiles", "start_command", "get_job", "read_
 GIT_TOOLS = {"git_status", "git_diff", "prepare_git_operation", "execute_git_operation", "get_git_operation"}
 MEMORY_TOOLS = {"read_project_memory", "update_project_memory"}
 PROGRESS_TOOLS = {"read_project_progress", "update_project_progress"}
+RESUME_TOOLS = {"get_project_resume", "compact_project_memory"}
 # Registered (version 3) host tools are listed for every project; access is checked server-side.
 REGISTERED_HOST_TOOLS = {"list_host_targets", "inspect_host_target", "prepare_host_operation",
                          "execute_host_operation", "read_host_operation_events"}
@@ -42,10 +43,19 @@ HOST_ACCESS_APPROVAL_TOOLS = {"open_host_access_approval", "update_host_access_a
 HOST_COMMAND_APPROVAL_TOOLS = {"open_host_command_approval", "confirm_host_command_approval",
                                "confirm_and_execute_host_command",
                                "cancel_host_command_approval"}
+GIT_CHAT_APPROVAL_TOOLS = {"open_git_approval", "confirm_git_approval", "cancel_git_approval"}
+GIT_COMMIT_ACCESS_TOOLS = {
+    "open_git_commit_access_approval", "get_git_commit_access",
+    "confirm_git_commit_access", "cancel_git_commit_access", "revoke_git_commit_access",
+}
+REGISTERED_CHAT_APPROVAL_TOOLS = {"open_registered_host_approval",
+                                  "confirm_registered_host_approval",
+                                  "cancel_registered_host_approval"}
 TOOLS = (PROJECT_TOOLS | {"list_projects", "open_project_picker", "select_project"}
-         | SETTINGS_TOOLS | EXECUTION_TOOLS | GIT_TOOLS | MEMORY_TOOLS | PROGRESS_TOOLS
+         | SETTINGS_TOOLS | EXECUTION_TOOLS | GIT_TOOLS | MEMORY_TOOLS | PROGRESS_TOOLS | RESUME_TOOLS
          | {"report_work_events"} | REGISTERED_HOST_TOOLS | AGENT_TOOLS | HOST_COMMAND_TOOLS
-         | HOST_EXECUTION_TOOLS | HOST_ACCESS_APPROVAL_TOOLS | HOST_COMMAND_APPROVAL_TOOLS)
+         | HOST_EXECUTION_TOOLS | HOST_ACCESS_APPROVAL_TOOLS | HOST_COMMAND_APPROVAL_TOOLS
+         | GIT_CHAT_APPROVAL_TOOLS | GIT_COMMIT_ACCESS_TOOLS | REGISTERED_CHAT_APPROVAL_TOOLS)
 TOOL_PROPERTIES = {
     "read_file": {"relative_path", "start_line", "end_line", "max_answer_chars"},
     "list_dir": {"relative_path", "recursive", "skip_ignored_files", "max_answer_chars"},
@@ -261,6 +271,42 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                 self.assertEqual(
                                     reread_memory.structuredContent["content"], "verified handoff"
                                 )
+                                self.assertIn("get_project_resume", tools_by_name)
+                                self.assertIn("compact_project_memory", tools_by_name)
+                                resume = await client.call_tool(
+                                    "get_project_resume", {"project": "alpha"}
+                                )
+                                self.assertFalse(resume.isError, result_text(resume))
+                                self.assertEqual(
+                                    resume.structuredContent["memory"]["revision"], 1
+                                )
+                                self.assertFalse(
+                                    resume.structuredContent["git"]["available"]
+                                )
+                                self.assertEqual(
+                                    resume.structuredContent["git"]["reason"], "UNAVAILABLE"
+                                )
+                                compacted = await client.call_tool(
+                                    "compact_project_memory", {
+                                        "project": "alpha",
+                                        "content": "durable compact memory",
+                                        "expected_revision": 1,
+                                    },
+                                )
+                                self.assertFalse(compacted.isError, result_text(compacted))
+                                self.assertEqual(compacted.structuredContent["revision"], 2)
+                                self.assertEqual(
+                                    compacted.structuredContent["archived"]["revision"], 1
+                                )
+                                compacted_resume = await client.call_tool(
+                                    "get_project_resume", {"project": "alpha"}
+                                )
+                                self.assertEqual(
+                                    compacted_resume.structuredContent["memory"]["revision"], 2
+                                )
+                                self.assertEqual(
+                                    compacted_resume.structuredContent["memory"]["archives"][0]["revision"], 1
+                                )
                                 self.assertTrue(
                                     tools_by_name["read_project_progress"].annotations.readOnlyHint
                                 )
@@ -474,7 +520,10 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                 resources = await client.list_resources()
                                 self.assertEqual({str(item.uri) for item in resources.resources}, {
                                     UI_URI, "ui://host-access/approval-v2.html",
-                                    "ui://host-commands/approval-v1.html"})
+                                    "ui://host-commands/approval-v1.html",
+                                    "ui://git-operations/approval-v1.html",
+                                    "ui://git-commit-access/approval-v1.html",
+                                    "ui://host-operations/registered-approval-v1.html"})
                                 resource = next(item for item in resources.resources
                                                 if str(item.uri) == UI_URI)
                                 self.assertEqual(str(resource.uri), UI_URI)
@@ -676,7 +725,7 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                     result_text(memory_with_broken_activity),
                                 )
                                 self.assertEqual(
-                                    memory_with_broken_activity.structuredContent["revision"], 1
+                                    memory_with_broken_activity.structuredContent["revision"], 2
                                 )
                                 self.assertEqual(
                                     outside_activity.read_text(encoding="utf-8"), "do not touch"

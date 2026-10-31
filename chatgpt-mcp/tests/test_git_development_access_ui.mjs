@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
+const html=readFileSync(new URL('../git-commit-access-approval.html',import.meta.url),'utf8');
+const section=html.split('// VALIDATION_START')[1].split('// VALIDATION_END')[0];
+const valid=vm.runInNewContext(section+'; validCard',{Date,Number,Array});
+const same=vm.runInNewContext(section+'; sameScope',{Date,Number,Array});
+const c={component:'git_commit_access',project:'repo',card_id:'a'.repeat(32),state:'pending',repository:'/tmp/repo',branch:'feature/test',head:'b'.repeat(40),operations:['commit','push'],duration_seconds:86400,expires_at:'2030-01-01T00:00:00Z',executes_on_approval:false,permission_version:2,origin:'https://github.com/jhw7500/tossApp.git',push_limit:3};
+assert.equal(valid(c),true,'explicit push scope must be renderable');
+for(const patch of [{permission_version:1},{push_limit:0},{push_limit:11},{origin:'https://attacker.test/repo'},{operations:['push']},{operations:['commit','push','reset']}])assert.equal(valid({...c,...patch}),false,JSON.stringify(patch));
+for(const patch of [{origin:'https://github.com/jhw7500/another.git'},{push_limit:2},{operations:['commit']}])assert.equal(same(c,{...c,...patch}),false,'scope change');
+assert.ok(html.includes('get_git_commit_access'),'uncertain result requires read-only reconciliation');
+assert.ok(html.includes('id="refresh"'));
+assert.ok(html.includes('id="operations"'));
+console.log('DEVELOPMENT_UI_SCOPE_PASS');

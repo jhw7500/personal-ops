@@ -5,6 +5,7 @@ No real Docker, credentials, network, DB or host service is touched.
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import hashlib
 import io
 import json
@@ -22,10 +23,13 @@ sys.path.insert(0, str(MODULE_DIR))
 from host_runtime import (HostRuntime, SOURCE_DIRS, SOURCE_SINGLE, HIGH_RISK_INPUTS,  # noqa: E402
                           source_inventory, verify_reviewed_high_risk_inputs, _default_run)
 from host_runtime_config import HostRuntimeError, PROJECT, TARGET, TARGET_CONFIG, load_config  # noqa: E402
+import host_runtime_operations  # noqa: E402
 from host_runtime_operations import (  # noqa: E402
     HostRuntimeOperations, _digest, host_admission, observed_legacy_operation_blocks_host,
 )
 from host_runtime_tools import HOST_RUNTIME_TOOL_SPECS  # noqa: E402
+from workspace_host import publication_lane  # noqa: E402
+from workspace_tools import WorkspaceTools  # noqa: E402
 
 
 class TTY(io.StringIO):
@@ -442,10 +446,58 @@ class OperationTest(unittest.IsolatedAsyncioTestCase):
     def plan(self, mode="toss-demo", request_id="req-1"):
         return self.ops.prepare(PROJECT, TARGET, "api", mode, request_id)
 
+    def active_workspace(self):
+        owner = self.home / "workspace-owner"
+        owner.mkdir(mode=0o700)
+        policy = owner / "policy.json"
+        policy.write_text(json.dumps({
+            "version": 1, "base_root": str(self.home),
+            "artifacts": [], "protected_paths": [],
+        }), encoding="utf-8")
+        policy.chmod(0o600)
+        workspace = WorkspaceTools(
+            {PROJECT: self.root}, state_dir=self.home / "workspace-authority",
+            config_path=policy)
+        snapshot = workspace.policy.load(required=True)
+        workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
+        return workspace
+
     def approve(self, plan):
         result = self.ops.approve(PROJECT, TARGET, plan["operation_id"],
                                   input_stream=TTY(plan["operation_id"] + "\n"), output=TTY())
         self.assertTrue(result["approved"])
+
+    def test_pending_plan_can_be_approved_six_days_after_creation(self):
+        plan = self.plan(request_id="six-day-approval")
+        created = host_runtime_operations._timestamp(plan["created_at"])
+        real_datetime = host_runtime_operations.datetime
+
+        class SixDaysLater(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return created + timedelta(days=6)
+
+        with patch.object(host_runtime_operations, "datetime", SixDaysLater):
+            self.approve(plan)
+        receipt = self.ops.operations_dir / (plan["operation_id"] + ".approval.json")
+        self.assertTrue(receipt.is_file())
+
+    def test_pending_plan_expires_exactly_seven_days_after_creation(self):
+        plan = self.plan(request_id="seven-day-expiry")
+        created = host_runtime_operations._timestamp(plan["created_at"])
+        real_datetime = host_runtime_operations.datetime
+
+        class SevenDaysLater(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return created + timedelta(days=7)
+
+        with patch.object(host_runtime_operations, "datetime", SevenDaysLater):
+            with self.assertRaises(HostRuntimeError) as caught:
+                self.approve(plan)
+        self.assertEqual(caught.exception.code, "PLAN_EXPIRED")
+        receipt = self.ops.operations_dir / (plan["operation_id"] + ".approval.json")
+        self.assertFalse(receipt.exists())
 
     async def test_plan_has_no_build_or_api_restart_and_requires_real_receipt(self):
         plan = self.plan()
@@ -473,6 +525,108 @@ class OperationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ops.get(PROJECT, TARGET, plan["operation_id"])["state"],
                          "pending_host_approval")
 
+    async def test_workspace_lane_covers_deploy_through_postcheck(self):
+        workspace = self.active_workspace()
+        self.ops = HostRuntimeOperations(
+            {PROJECT: self.root}, state_dir=self.home / "workspace-runtime-state",
+            config_path=self.config, runtime=self.runtime,
+            approval_script=self.home / "immutable" / "approve-host-operation.py",
+            workspace=workspace)
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.ops._run_deploy_body
+
+        def paused(operation_id):
+            entered.set()
+            release.wait(3)
+            original(operation_id)
+
+        plan = self.plan(request_id="workspace-lane")
+        self.approve(plan)
+        with patch.object(self.ops, "_run_deploy_body", side_effect=paused):
+            await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+            self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+            with self.assertRaises(HostRuntimeError) as caught:
+                with publication_lane(workspace):
+                    pass
+            self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+            release.set()
+            await asyncio.gather(*list(self.ops._tasks))
+        with publication_lane(workspace):
+            pass
+
+    async def test_deploy_escape_with_running_state_keeps_durable_reservation(self):
+        workspace = self.active_workspace()
+        self.ops = HostRuntimeOperations(
+            {PROJECT: self.root},
+            state_dir=self.home / "workspace-runtime-save-failure",
+            config_path=self.config, runtime=self.runtime,
+            approval_script=self.home / "immutable" / "approve-host-operation.py",
+            workspace=workspace)
+        plan = self.plan(request_id="workspace-save-failure")
+        self.approve(plan)
+
+        def terminal_save_failed(operation_id):
+            self.ops._record(operation_id, state="running", phase="EXECUTE")
+            raise RuntimeError("synthetic terminal state save failure")
+
+        with patch.object(self.ops, "_run_deploy_body", side_effect=terminal_save_failed):
+            await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+            await asyncio.gather(*list(self.ops._tasks), return_exceptions=True)
+
+        state = self.ops._load(PROJECT, TARGET, plan["operation_id"])
+        self.assertEqual(state["state"], "running")
+        with self.assertRaises(HostRuntimeError) as caught:
+            with publication_lane(workspace):
+                pass
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+
+    async def test_reservation_cleanup_failure_is_bounded_and_releases_target_fd(self):
+        workspace = self.active_workspace()
+        self.ops = HostRuntimeOperations(
+            {PROJECT: self.root}, state_dir=self.home / "workspace-runtime-cleanup-failure",
+            config_path=self.config, runtime=self.runtime,
+            approval_script=self.home / "immutable" / "approve-host-operation.py",
+            workspace=workspace)
+        plan = self.plan(request_id="workspace-cleanup-failure")
+        self.approve(plan)
+
+        with self.assertLogs("host_runtime_operations", level="ERROR") as logged, \
+                patch("host_runtime_operations.complete_host_operation",
+                      side_effect=HostRuntimeError("WORKSPACE_HOST_LANE_INVALID")):
+            await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+            await asyncio.gather(*list(self.ops._tasks))
+
+        state = self.ops._load(PROJECT, TARGET, plan["operation_id"])
+        self.assertEqual(
+            (state["state"], state["phase"], state["code"]),
+            ("outcome_unknown", "RECOVER", "WORKSPACE_HOST_RESERVATION_RELEASE_FAILED"))
+        self.assertIn("WORKSPACE_HOST_RESERVATION_RELEASE_FAILED", "\n".join(logged.output))
+        target_fd = self.ops._acquire_target_lock()
+        os.close(target_fd)
+        with self.assertRaises(HostRuntimeError) as caught:
+            with publication_lane(workspace):
+                pass
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+
+    async def test_busy_publication_lane_does_not_consume_legacy_approval(self):
+        workspace = self.active_workspace()
+        self.ops = HostRuntimeOperations(
+            {PROJECT: self.root}, state_dir=self.home / "busy-runtime-state",
+            config_path=self.config, runtime=self.runtime,
+            approval_script=self.home / "immutable" / "approve-host-operation.py",
+            workspace=workspace)
+        plan = self.plan(request_id="busy-lane")
+        self.approve(plan)
+        receipt = self.ops.operations_dir / (plan["operation_id"] + ".approval.json")
+        with publication_lane(workspace):
+            with self.assertRaises(HostRuntimeError) as caught:
+                await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+        self.assertTrue(receipt.exists())
+        self.assertEqual(self.ops.get(PROJECT, TARGET, plan["operation_id"])["state"],
+                         "pending_host_approval")
+
     def test_stale_valid_legacy_approved_record_does_not_block_dynamic_host(self):
         plan = self.plan()
         state = self.ops._load(PROJECT, TARGET, plan["operation_id"])
@@ -494,6 +648,77 @@ class OperationTest(unittest.IsolatedAsyncioTestCase):
             self.ops.approve(PROJECT, TARGET, plan["operation_id"],
                              input_stream=TTY(plan["operation_id"] + "\n"), output=TTY())
         self.assertEqual(exc.exception.code, "STALE_PLAN")
+
+    def test_new_prepare_retires_source_stale_pending_plan(self):
+        old = self.plan(request_id="stale-pending-source")
+        (self.root / "server/src/main.ts").write_text("changed before approval\n")
+
+        replacement = self.plan(request_id="replacement-after-source-drift")
+
+        retired = self.ops.get(PROJECT, TARGET, old["operation_id"])
+        self.assertEqual((retired["state"], retired["phase"], retired["code"]),
+                         ("expired", "APPROVAL", "STALE_PLAN"))
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+        self.assertEqual(replacement["state"], "pending_host_approval")
+
+    def test_failed_approval_retires_target_stale_pending_plan_for_replacement(self):
+        old = self.plan(request_id="stale-pending-target")
+        self.docker.worker_id = "f" * 64
+
+        with self.assertRaises(HostRuntimeError) as caught:
+            self.approve(old)
+        self.assertEqual(caught.exception.code, "STALE_PLAN")
+        retired = self.ops.get(PROJECT, TARGET, old["operation_id"])
+        self.assertEqual((retired["state"], retired["phase"], retired["code"]),
+                         ("expired", "APPROVAL", "STALE_PLAN"))
+
+        replacement = self.plan(request_id="replacement-after-target-drift")
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+        self.assertEqual(replacement["state"], "pending_host_approval")
+
+    def test_tty_approval_race_retires_plan_that_turns_stale_after_prompt(self):
+        old = self.plan(request_id="tty-race-stale-target")
+        fixture = self
+
+        class DriftAfterPrompt(TTY):
+            def readline(self, *args, **kwargs):
+                fixture.docker.worker_id = "f" * 64
+                return super().readline(*args, **kwargs)
+
+        with self.assertRaises(HostRuntimeError) as caught:
+            self.ops.approve(
+                PROJECT, TARGET, old["operation_id"],
+                input_stream=DriftAfterPrompt(old["operation_id"] + "\n"), output=TTY())
+        self.assertEqual(caught.exception.code, "STALE_PLAN")
+        retired = self.ops.get(PROJECT, TARGET, old["operation_id"])
+        self.assertEqual((retired["state"], retired["phase"], retired["code"]),
+                         ("expired", "APPROVAL", "STALE_PLAN"))
+
+        replacement = self.plan(request_id="replacement-after-tty-race")
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+
+    def test_new_prepare_does_not_retire_pending_plan_on_source_check_error(self):
+        old = self.plan(request_id="uncertain-pending-source")
+        with patch("host_runtime_operations.source_inventory",
+                   side_effect=HostRuntimeError("UNSAFE_SOURCE_TREE")):
+            with self.assertRaises(HostRuntimeError) as caught:
+                self.plan(request_id="uncertain-source-replacement")
+        self.assertEqual(caught.exception.code, "UNSAFE_SOURCE_TREE")
+        self.assertEqual(
+            self.ops.get(PROJECT, TARGET, old["operation_id"])["state"],
+            "pending_host_approval")
+
+    def test_new_prepare_retires_pending_plan_after_git_head_only_change(self):
+        old = self.plan(request_id="stale-pending-head")
+        with patch("host_runtime_operations.git_state", return_value={
+                "head": "b" * 40, "dirty": True,
+                "changed_paths": ["docs/unchanged-runtime-input.md"]}):
+            replacement = self.plan(request_id="replacement-after-head-change")
+
+        retired = self.ops.get(PROJECT, TARGET, old["operation_id"])
+        self.assertEqual((retired["state"], retired["code"]),
+                         ("expired", "STALE_PLAN"))
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
 
     async def test_schema_not_ready_blocks_demo_before_any_plan(self):
         original = self.docker.run
@@ -637,6 +862,26 @@ class OperationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exc.exception.code, "STALE_PLAN")
         self.assertFalse(any(("build" in argv or "up" in argv) for argv, _, _ in self.docker.calls))
 
+    async def test_prequeue_target_drift_retires_approved_plan_for_replacement(self):
+        old = self.plan(request_id="prequeue-stale-target")
+        self.approve(old)
+        receipt = self.ops.operations_dir / (old["operation_id"] + ".approval.json")
+        self.assertTrue(receipt.is_file())
+        self.docker.worker_id = "f" * 64
+
+        with self.assertRaises(HostRuntimeError) as caught:
+            await self.ops.execute(PROJECT, TARGET, old["operation_id"])
+        self.assertEqual(caught.exception.code, "STALE_PLAN")
+        retired = self.ops.get(PROJECT, TARGET, old["operation_id"])
+        self.assertEqual((retired["state"], retired["phase"], retired["code"]),
+                         ("expired", "APPROVAL", "STALE_PLAN"))
+        self.assertFalse(receipt.exists())
+        self.assertFalse(any(("build" in argv or "up" in argv)
+                             for argv, _, _ in self.docker.calls))
+
+        replacement = self.plan(request_id="replacement-after-prequeue-drift")
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+
     async def test_worker_build_recreates_only_worker(self):
         from host_runtime_config import TARGET_CONFIG_V2
         self.config.write_text(json.dumps({"version": 2, "enabled": True,
@@ -651,6 +896,26 @@ class OperationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "succeeded", result)
         self.assertEqual(self.docker.api_id, "a" * 64)
         self.assertEqual(self.docker.db_id, "c" * 64)
+        self.assertEqual(self.docker.worker_id, "e" * 64)
+
+    async def test_worker_postcheck_preserves_existing_toss_demo_api_mode(self):
+        from host_runtime_config import TARGET_CONFIG_V2
+        self.config.write_text(json.dumps({"version": 2, "enabled": True,
+                                           "targets": {TARGET: TARGET_CONFIG_V2}}))
+        # Worker plans use mode=disabled for their Compose scope; this must not
+        # be compared to the preserved, still-running API's toss-demo setting.
+        self.docker.mode = "toss-demo"
+        plan = self.ops.prepare(PROJECT, TARGET, "worker", "disabled",
+                                "worker-preserves-demo-api")
+        self.approve(plan)
+        before_api_id, before_db_id = self.docker.api_id, self.docker.db_id
+        await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
+        await asyncio.gather(*list(self.ops._tasks))
+        result = self.ops.get(PROJECT, TARGET, plan["operation_id"])
+        self.assertEqual((result["state"], result["code"]), ("succeeded", None), result)
+        self.assertEqual(self.docker.mode, "toss-demo")
+        self.assertEqual(self.docker.api_id, before_api_id)
+        self.assertEqual(self.docker.db_id, before_db_id)
         self.assertEqual(self.docker.worker_id, "e" * 64)
 
     async def test_local_web_approval_is_digest_and_id_bound(self):
@@ -674,6 +939,28 @@ class OperationTest(unittest.IsolatedAsyncioTestCase):
         await self.ops.execute(PROJECT, TARGET, plan["operation_id"])
         await asyncio.gather(*list(self.ops._tasks))
         self.assertEqual(self.ops.get(PROJECT, TARGET, plan["operation_id"])["state"], "succeeded")
+
+    def test_local_web_stale_target_retires_pending_plan_for_replacement(self):
+        from host_runtime_web import approve_web
+        old = self.plan(request_id="web-stale-target")
+        receipt = self.ops.operations_dir / (old["operation_id"] + ".approval.json")
+        receipt.write_text("{}")
+        receipt.chmod(0o600)
+        self.docker.worker_id = "f" * 64
+
+        with self.assertRaises(HostRuntimeError) as caught:
+            approve_web(
+                self.ops, operation_id=old["operation_id"],
+                plan_digest=old["plan_digest"], source_digest=old["source_digest"],
+                confirmation=old["operation_id"])
+        self.assertEqual(caught.exception.code, "STALE_PLAN")
+        retired = self.ops.get(PROJECT, TARGET, old["operation_id"])
+        self.assertEqual((retired["state"], retired["phase"], retired["code"]),
+                         ("expired", "APPROVAL", "STALE_PLAN"))
+        self.assertFalse(receipt.exists())
+
+        replacement = self.plan(request_id="replacement-after-web-target-drift")
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
 
     async def test_db_migration_plan_is_scoped_and_requires_explicit_upgrade(self):
         from host_runtime_config import TARGET_CONFIG_V2

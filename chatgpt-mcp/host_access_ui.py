@@ -10,7 +10,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import re
+import stat
 import secrets
 import sys
 import uuid
@@ -83,6 +85,40 @@ class HostAccessApprovals:
         except (OSError, TypeError, KeyError, ValueError, HostRuntimeError):
             raise HostRuntimeError("HOST_ACCESS_CARD_STATE_INVALID") from None
 
+    def _quarantine_orphaned_card(self, project, root):
+        """Explicit recovery only; never grant authority or trust damaged state.
+
+        An unreadable private card may be retired only when the authority
+        ledger has no unexpired pending requests or unexpired live grant.
+        Preserve the original card as a private audit artifact; owner and
+        filesystem protections must be intact.
+        """
+        path = self._path(project)
+        try:
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise HostRuntimeError("HOST_ACCESS_CARD_RECOVERY_DENIED")
+            with _lock(self.access._lock_path(project)):
+                record = self.access._load(project, root)
+                now = host_access._utcnow()
+                if any(host_access._timestamp(request["expires_at"]) > now
+                       for request in record["requests"]):
+                    raise HostRuntimeError("HOST_ACCESS_CARD_RECOVERY_DENIED")
+                grant = record["grant"]
+                if (grant is not None and grant["revoked_at"] is None
+                        and host_access._timestamp(grant["expires_at"]) > now):
+                    raise HostRuntimeError("HOST_ACCESS_CARD_RECOVERY_DENIED")
+                # Never overwrite a previous archive. The private card is
+                # moved, not deleted or interpreted as an authorization.
+                archive = path.with_name(
+                    path.stem + ".rejected-" + secrets.token_hex(16) + ".json")
+                if archive.exists() or archive.is_symlink():
+                    raise HostRuntimeError("HOST_ACCESS_CARD_RECOVERY_DENIED")
+                os.rename(path, archive)
+        except (OSError, TypeError, KeyError, ValueError, HostRuntimeError):
+            raise HostRuntimeError("HOST_ACCESS_CARD_RECOVERY_DENIED") from None
+
     def _checked(self, project, root, card_id, confirmation_token):
         if (not isinstance(card_id, str) or _ID.fullmatch(card_id) is None
                 or not isinstance(confirmation_token, str)
@@ -128,14 +164,22 @@ class HostAccessApprovals:
         return result
 
     def open(self, project, *, duration_seconds=host_access.DEFAULT_DURATION_SECONDS,
-             allow_codex=False):
+             allow_codex=False, recover_invalid_card=False):
         _options(duration_seconds, allow_codex)
+        if type(recover_invalid_card) is not bool:
+            raise HostRuntimeError("INVALID_HOST_ACCESS_CARD_ARGUMENTS")
         root = self.access._project_root(project)
         with _lock(self._lock_path(project)):
             if self._path(project).exists() or self._path(project).is_symlink():
-                old = self._load(project)
-                if old["state"] == "pending":
-                    self._discard_request(project, root, old)
+                try:
+                    old = self._load(project)
+                except HostRuntimeError as exc:
+                    if exc.code != "HOST_ACCESS_CARD_STATE_INVALID" or not recover_invalid_card:
+                        raise
+                    self._quarantine_orphaned_card(project, root)
+                else:
+                    if old["state"] == "pending":
+                        self._discard_request(project, root, old)
             request = self.access.request(project)
             token = secrets.token_hex(32)
             card = {
@@ -198,6 +242,7 @@ _REQUIRED = {
     "cancel_host_access_approval": {"project", "card_id", "confirmation_token"},
 }
 _OPTIONS = {"duration_seconds", "allow_codex"}
+_OPEN_OPTIONS = _OPTIONS | {"recover_invalid_card"}
 
 
 def tool_specs(projects):
@@ -208,13 +253,14 @@ def tool_specs(projects):
         "duration_seconds": {"type": "integer", "minimum": 1,
                              "maximum": host_access.MAX_DURATION_SECONDS},
         "allow_codex": {"type": "boolean"},
+        "recover_invalid_card": {"type": "boolean"},
     }
     titles = {"open": "호스트 권한 승인 카드", "update": "호스트 권한 옵션 변경",
               "confirm": "호스트 권한 승인", "cancel": "호스트 권한 요청 취소"}
     for name in sorted(NAMES):
         action = name.split("_", 1)[0]
         opener = action == "open"
-        fields = _REQUIRED[name] | (_OPTIONS if opener else set())
+        fields = _REQUIRED[name] | (_OPEN_OPTIONS if opener else set())
         metadata = {"ui": {"visibility": ["model"] if opener else ["app"]},
                     "openai/widgetAccessible": not opener,
                     "openai/toolInvocation/invoking": titles[action] + " 중입니다",
@@ -227,7 +273,10 @@ def tool_specs(projects):
             "description": (
                 "Open an explicit user confirmation card for expiring installation-wide "
                 "host-user access. Does not grant access or start work. Use only when the "
-                "user requests host access/renewal. Project selects cwd, not containment."
+                "user requests host access/renewal. Project selects cwd, not containment. "
+                "Use recover_invalid_card=true only for a private orphaned card with no "
+                "unexpired pending request/grant; it archives old bytes and opens a NEW "
+                "human-approval card without issuing any host authority."
                 if opener else "App-only callback requiring the hidden, one-use card capability."),
             "inputSchema": {"type": "object", "properties": {
                 key: properties[key] for key in sorted(fields)},
@@ -248,7 +297,7 @@ class HostAccessApprovalTools:
     def validate_arguments(self, name, arguments):
         """Run BEFORE SDK validation, whose error text can echo secret values."""
         required = _REQUIRED.get(name)
-        optional = _OPTIONS if name == "open_host_access_approval" else set()
+        optional = _OPEN_OPTIONS if name == "open_host_access_approval" else set()
         if (required is None or not isinstance(arguments, dict)
                 or not required.issubset(arguments)
                 or not set(arguments).issubset(required | optional)):
@@ -259,6 +308,9 @@ class HostAccessApprovalTools:
         if name in {"open_host_access_approval", "update_host_access_approval"}:
             _options(arguments.get("duration_seconds", host_access.DEFAULT_DURATION_SECONDS),
                      arguments.get("allow_codex", False))
+        if (name == "open_host_access_approval"
+                and type(arguments.get("recover_invalid_card", False)) is not bool):
+            raise HostRuntimeError("INVALID_HOST_ACCESS_CARD_ARGUMENTS")
         if name != "open_host_access_approval":
             if (not isinstance(arguments["card_id"], str)
                     or _ID.fullmatch(arguments["card_id"]) is None

@@ -7,7 +7,7 @@ has no host home, tunnel credentials, or network access. No Docker/DB changes.
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import hashlib
 import importlib.util
 import json
@@ -16,13 +16,20 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import site
 import stat
 import subprocess
 import sys
+import tempfile
 
 from rollout_catalog import observe_tools
 from rollout_diagnostics import (RECEIPT_ROOT, CliSessionObserver, RolloutReceipt,
                                  is_interruption, run_command, safe_error)
+from rollout_test_runner import EXCLUDED_TEST_METHODS
+from workspace_authority import WorkspaceAuthority
+from workspace_control import (DEFAULT_AUTHORITY_DIR, WorkspaceControlError,
+                               release_enforcement_abi, verify_launch,
+                               verify_release_manifest)
 
 HERE = Path(__file__).resolve().parent
 ALIAS = "personal-ops-coding"
@@ -36,15 +43,21 @@ TESTS = (
     "tests.test_host_schema_update", "tests.test_host_schema_router",
     "tests.test_host_schema014", "tests.test_host_schema014_approval",
     "tests.test_schema014_chat_approval", "tests.test_schema014_chat_router",
+    "tests.test_test_plan_chat_approval", "tests.test_test_plan_chat_router",
     "tests.test_host_predecessor_objects",
     "tests.test_admin_target_authorization",
     "tests.test_admin_registered_approval", "tests.test_host_actions",
     "tests.test_host_compose_actions", "tests.test_host_process",
     "tests.test_host_registered_operations", "tests.test_host_registered_router",
+    "tests.test_registered_host_chat_approval",
+    "tests.test_extended_chat_approval_router",
     "tests.test_host_registry", "tests.test_host_source_review",
     "tests.test_host_config_cas",
     "tests.test_stage1_activation_fixes",
-    "tests.test_project_loading",
+    "tests.test_project_loading", "tests.test_git_chat_approval",
+    "tests.test_git_commit_access", "tests.test_git_commit_access_backend_router",
+    "tests.test_git_commit_access_router", "tests.test_git_commit_access_concurrency",
+    "tests.test_git_commit_access_registration",
     "tests.test_runtime_install", "tests.test_admin_server",
     "tests.test_rollout_host_runtime", "tests.test_rollout_admin",
     "tests.test_rollout_diagnostics", "tests.test_rollout_tunnel",
@@ -56,11 +69,15 @@ TESTS = (
     "tests.test_agent_supervised_runner", "tests.test_agent_host_broker",
     "tests.test_agent_proofs", "tests.test_agent_smoke", "tests.test_agent_profile_setup",
     "tests.test_host_backup_validation",
-    "tests.test_runtime_rollout_web", "tests.test_admin_runtime_rollout_approval",
+    "tests.test_runtime_rollout_web", "tests.test_runtime_rollout_worker",
+    "tests.test_rollout_bootstrap_compat",
+    "tests.test_rollout_workspace_authority",
+    "tests.test_admin_runtime_rollout_approval",
     "tests.test_runtime_rollout_router", "tests.test_runtime_rollout_chat_approval", "tests.test_runtime_rollout_chat_router", "tests.test_runtime_rollout_chat_bootstrap",
     "tests.test_toss_console_evidence", "tests.test_toss_console_tools",
     "tests.test_toss_console_sdk_bridge", "tests.test_toss_console_codex",
-    "tests.test_toss_console_ux019",
+    "tests.test_toss_console_ux019", "tests.test_toss_console_20261026",
+    "tests.test_toss_console_new_test_evidence",
     "tests.test_host_command_profiles", "tests.test_host_command_entry",
     "tests.test_host_command_operations", "tests.test_host_command_runner",
     "tests.test_host_command_supervisor", "tests.test_host_command_tools",
@@ -69,6 +86,18 @@ TESTS = (
     "tests.test_host_access", "tests.test_host_execution", "tests.test_host_execution_tools",
     "tests.test_chat_host_access_approval", "tests.test_chat_host_access_router",
     "tests.test_host_agent", "tests.test_host_agent_entry", "tests.test_admin_host_access",
+    "tests.test_execution",
+    "tests.test_workspace_policy", "tests.test_workspace_authority",
+    "tests.test_workspace_files", "tests.test_workspace_git",
+    "tests.test_workspace_jobs", "tests.test_workspace_host",
+    "tests.test_workspace_execution", "tests.test_workspace_tools",
+    "tests.test_workspace_router", "tests.test_workspace_control",
+    "tests.test_workspace_initialization", "tests.test_workspace_activation",
+    "tests.test_workspace_activation_transaction", "tests.test_workspace_activation_cli",
+    "tests.test_workspace_activation_gate", "tests.test_workspace_activation_host",
+    "tests.test_workspace_activation_legacy",
+    "tests.test_catalog_refresh", "tests.test_catalog_refresh_router",
+    "tests.test_project_resume", "tests.test_resume_fingerprint",
     "tests.test_server_shutdown",
 )
 # A reviewed, independent contract. Do not derive this from dynamic tool
@@ -77,6 +106,7 @@ TOOL_NAMES = {
     "get_runtime_status", "compare_deployment", "get_db_migration_status",
     "get_predecessor_migration_status", "get_schema014_migration_status",
     "get_toss_test_console_status", "get_toss_ux019_test_console_status",
+    "get_toss_20261026_test_console_status",
     "prepare_schema014_migration", "execute_schema014_migration",
     "prepare_db_migration", "prepare_predecessor_migration",
     "execute_db_migration", "execute_predecessor_migration",
@@ -94,9 +124,30 @@ TOOL_NAMES = {
     "open_host_access_approval", "update_host_access_approval",
     "confirm_host_access_approval", "cancel_host_access_approval",
     "open_schema014_approval", "confirm_schema014_approval", "cancel_schema014_approval",
+    "open_test_plan_approval", "confirm_test_plan_approval", "cancel_test_plan_approval",
+    "open_registered_host_approval", "confirm_registered_host_approval",
+    "cancel_registered_host_approval",
+    "open_git_approval", "confirm_git_approval", "cancel_git_approval",
+    "open_git_commit_access_approval", "get_git_commit_access",
+    "confirm_git_commit_access", "cancel_git_commit_access", "revoke_git_commit_access",
     "open_host_command_approval", "confirm_host_command_approval", "cancel_host_command_approval",
     "confirm_and_execute_host_command",
+    "get_project_resume", "compact_project_memory",
 }
+# This surface is configured only when personal-ops is available. Keep the
+# expected names independent from catalog_refresh.tool_specs() so registration
+# drift still blocks rollout validation.
+CATALOG_REFRESH_TOOL_NAMES = frozenset({
+    "refresh_mcp_catalog",
+    "get_mcp_catalog_refresh_status",
+})
+# These are registered separately by job_tools under the same workspace
+# predicate. Keep them independent of dynamic registration for fail-closed
+# discovery validation.
+WORKSPACE_OUTPUT_TOOL_NAMES = frozenset({
+    "read_workspace_output",
+    "publish_workspace_output",
+})
 
 
 def _import_installer():
@@ -122,13 +173,16 @@ def inventory(installer):
 
 def control_inventory():
     """Pin the rollout helpers and regression inputs as well as runtime files."""
-    names = ("rollout-host-runtime.py", "rollout_tunnel.py", "rollout_admin.py", "rollout_catalog.py",
-             "rollout_diagnostics.py", "install-runtime.py", "configure-host-runtime.py")
+    names = ("rollout-host-runtime.py", "rollout_test_runner.py",
+             "rollout_tunnel.py", "rollout_admin.py", "rollout_catalog.py",
+             "rollout_diagnostics.py", "install-runtime.py", "configure-host-runtime.py",
+             "tossapp_neutral_ab24_command.js")
     paths = [HERE / name for name in names]
     paths.extend(sorted((HERE / "tests").glob("test_*.py")))
     paths.append(HERE / "tests/check_host_access_approval_ui.py")
     paths.append(HERE / "tests/check_schema014_approval_ui.py")
     paths.append(HERE / "tests/check_host_command_approval_ui.py")
+    paths.extend(node_ui_test_inputs())
     result = {}
     for path in paths:
         info = path.lstat()
@@ -146,28 +200,118 @@ def runtime_interpreter(interpreter=sys.executable):
     return str(Path(interpreter).absolute())
 
 
+def runtime_node():
+    verified_node = Path.home() / ".nvm/versions/node/v24.12.0/bin/node"
+    if verified_node.is_file() and os.access(verified_node, os.X_OK):
+        return str(verified_node)
+    raise RuntimeError("ROLLOUT_NODE_UNAVAILABLE")
+
+
+def expected_tool_names(projects, *, config_path=None, authority_dir=None):
+    """Use the server's workspace activation rule without creating authority."""
+    from workspace_tools import NAMES, WorkspaceTools
+    if authority_dir is None:
+        state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+        authority_dir = state / "chatgpt-coding-mcp/workspace-authority"
+    expected = TOOL_NAMES | (CATALOG_REFRESH_TOOL_NAMES
+                             if "personal-ops" in projects else frozenset())
+    workspace = WorkspaceTools(projects, authority_dir, config_path=config_path)
+    if workspace.enabled:
+        return expected | NAMES | WORKSPACE_OUTPUT_TOOL_NAMES
+    return expected
+
+
+def node_ui_test_inputs(tests_dir=HERE / "tests"):
+    """Return the mandatory workspace verifier first, then optional MJS checks."""
+    tests_dir = Path(tests_dir)
+    required = tests_dir / "test_workspace_approval_ui.mjs"
+    try:
+        info = required.lstat()
+    except OSError:
+        raise RuntimeError("RUNTIME_TEST_INPUT_MISSING") from None
+    if required.is_symlink() or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError("RUNTIME_TEST_INPUT_UNSAFE")
+    optional = sorted(path for path in tests_dir.glob("test_*.mjs") if path != required)
+    return (required, *optional)
+
+
+@contextmanager
+def _private_check_umask():
+    # This standalone rollout process restores its creation mode before any
+    # live operation. Isolated test subprocesses always create private state.
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
 def run_checks(interpreter=sys.executable, *, receipt=None):
     # Always run the relevant tests and the complete MCP regression before
     # switching a privileged installed runtime. Failure blocks activation.
     interpreter = runtime_interpreter(interpreter)
-    for stage, argv, timeout in (
-        ("checks_approval_ui", ["/usr/bin/python3", "-B",
-                                str(HERE / "tests/check_host_access_approval_ui.py")], 120),
-        ("checks_schema014_ui", ["/usr/bin/python3", "-B",
-                                 str(HERE / "tests/check_schema014_approval_ui.py")], 120),
-        ("checks_host_command_ui", ["/usr/bin/python3", "-B",
-                                    str(HERE / "tests/check_host_command_approval_ui.py")], 120),
-        ("checks_runtime_rollout_chat_ui", ["/usr/bin/python3", "-B",
-                                            str(HERE / "tests/test_runtime_rollout_chat_ui.py")], 120),
-        ("checks_runtime_rollout_ui", ["/usr/bin/python3", "-B",
-                                       str(HERE / "tests/test_runtime_rollout_ui.py")], 120),
-        ("checks_targeted", [interpreter, "-m", "unittest", "-q", *TESTS], 240),
-        ("checks_full", [interpreter, "-m", "unittest", "discover", "-s", "tests", "-q"], 420),
-    ):
-        check = run_command(argv, stage=stage, cwd=HERE,
-                            timeout=timeout, receipt=receipt)
-        if check.returncode != 0:
-            raise RuntimeError("RUNTIME_TESTS_FAILED")
+    node = runtime_node()
+    owner_home = Path.home()
+    owner_userbase = site.getuserbase()
+    approved_venv = owner_home / ".local/share/uv/tools/serena-agent"
+    approved_interpreter = approved_venv / "bin/python"
+    print(f"Official excluded unittest IDs ({len(EXCLUDED_TEST_METHODS)}):", flush=True)
+    for method in EXCLUDED_TEST_METHODS:
+        print(" - test_execution.ExecutionPolicyTest." + method
+              + " (or tests.test_execution prefix)", flush=True)
+    with _private_check_umask(), tempfile.TemporaryDirectory(prefix="runtime-preflight-") as temporary:
+        private = Path(temporary)
+        home = private / "home"
+        config = private / "config"
+        state = private / "state"
+        cache = private / "cache"
+        for directory in (home, config, state, cache):
+            directory.mkdir(mode=0o700)
+        if Path(interpreter) == approved_interpreter:
+            private_tools = home / ".local/share/uv/tools"
+            private_tools.mkdir(mode=0o700, parents=True)
+            (private_tools / "serena-agent").symlink_to(
+                approved_venv, target_is_directory=True)
+        environment = [
+            "/usr/bin/env",
+            "HOME=" + str(home),
+            "XDG_CONFIG_HOME=" + str(config),
+            "XDG_STATE_HOME=" + str(state),
+            "XDG_CACHE_HOME=" + str(cache),
+            "PLAYWRIGHT_BROWSERS_PATH=" + str(owner_home / ".cache/ms-playwright"),
+            "PYTHONDONTWRITEBYTECODE=1",
+            "PYTHONUSERBASE=" + owner_userbase,
+            "PATH=" + str(Path(node).parent) + ":" + str(owner_home / ".local/bin")
+            + ":/usr/local/bin:/usr/bin:/bin",
+            "UV_OFFLINE=1",
+        ]
+        test_runner = str(HERE / "rollout_test_runner.py")
+        node_tests = [str(path) for path in node_ui_test_inputs()]
+        for stage, argv, timeout in (
+            ("checks_approval_ui", [*environment, "/usr/bin/python3", "-B",
+                                    str(HERE / "tests/check_host_access_approval_ui.py")], 120),
+            ("checks_schema014_ui", [*environment, "/usr/bin/python3", "-B",
+                                     str(HERE / "tests/check_schema014_approval_ui.py")], 120),
+            ("checks_host_command_ui", [*environment, "/usr/bin/python3", "-B",
+                                        str(HERE / "tests/check_host_command_approval_ui.py")], 120),
+            ("checks_runtime_rollout_chat_ui", [*environment, "/usr/bin/python3", "-B",
+                                                str(HERE / "tests/test_runtime_rollout_chat_ui.py")], 120),
+            ("checks_runtime_rollout_ui", [*environment, "/usr/bin/python3", "-B",
+                                           str(HERE / "tests/test_runtime_rollout_ui.py")], 120),
+            ("checks_workspace_approval_browser", [*environment, "/usr/bin/python3", "-B",
+                                                    str(HERE / "tests/test_workspace_approval_browser.py")], 180),
+            ("checks_git_commit_access_browser", [*environment, "/usr/bin/python3", "-B",
+                                                  str(HERE / "tests/test_git_commit_access_browser.py")], 120),
+            ("checks_workspace_ui", [*environment, node, "--test", *node_tests], 180),
+            ("checks_targeted", [*environment, interpreter, "-B", test_runner,
+                                 "--require-excluded-count", "5", "--modules", *TESTS], 300),
+            ("checks_full", [*environment, interpreter, "-B", test_runner,
+                             "--require-excluded-count", "5", "--discover", "tests"], 480),
+        ):
+            check = run_command(argv, stage=stage, cwd=HERE,
+                                timeout=timeout, receipt=receipt)
+            if check.returncode != 0:
+                raise RuntimeError("RUNTIME_TESTS_FAILED")
 
 
 def tunnel_client():
@@ -238,9 +382,18 @@ def service_command(argv, *, stdout=subprocess.DEVNULL, receipt=None):
         stage = services[argv[4]] + "_active"
     else:
         raise RuntimeError("UNEXPECTED_SERVICE_COMMAND")
+    uid = os.getuid()
+    runtime = f"/run/user/{uid}"
+    environment = {
+        "HOME": str(Path.home()),
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "XDG_RUNTIME_DIR": runtime,
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + runtime + "/bus",
+    }
     result = run_command(argv, stage=stage, timeout=40,
                          capture=stdout == subprocess.PIPE, max_output=256 * 1024,
-                         receipt=receipt)
+                         receipt=receipt, env=environment)
     if result.returncode:
         raise RuntimeError("ROLLOUT_SERVICE_COMMAND_FAILED")
     return result.stdout
@@ -249,6 +402,85 @@ def service_command(argv, *, stdout=subprocess.DEVNULL, receipt=None):
 def _live_fields(live):
     return {key: live[key] for key in ("tunnel_pid", "tunnel_start_ticks", "mcp_pid", "mcp_start_ticks",
                                       "codex_pid", "codex_start_ticks") if key in live}
+
+
+def _verify_approved_web(approved_web, installer, *, catalog_fn=None):
+    """Verify a web grant, with one exact legacy-control bootstrap fallback."""
+    try:
+        approved_web.verify(HERE.parent, installer, inventory, control_inventory)
+        return
+    except RuntimeError as exc:
+        if safe_error(exc) != "WEB_ROLLOUT_SOURCE_CHANGED":
+            raise
+        original = exc
+    if catalog_fn is None:
+        from runtime_rollout_web import _catalog as catalog_fn
+    actual_source = catalog_fn(HERE.parent)
+    official = inventory(installer)
+    manifest = {name.removeprefix("chatgpt-mcp/"): digest
+                for name, digest in official.items()}
+    target = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:20]
+    controls = control_inventory()
+    legacy_key = "tossapp_neutral_ab24_command.js"
+    if legacy_key not in controls:
+        raise original
+    current_digest = hashlib.sha256(
+        json.dumps(controls, sort_keys=True).encode()
+    ).hexdigest()
+    legacy_controls = dict(controls)
+    legacy_controls.pop(legacy_key)
+    legacy_digest = hashlib.sha256(
+        json.dumps(legacy_controls, sort_keys=True).encode()
+    ).hexdigest()
+    if (actual_source.get("digest") != approved_web.source_digest
+            or target != approved_web.target_snapshot
+            or approved_web.control_digest == current_digest
+            or approved_web.control_digest != legacy_digest):
+        raise original
+
+
+def _authorize_workspace_rollout(projects, target_runtime, rollback_runtime,
+                                 authority_dir=None):
+    """Authorize exactly target + rollback releases before a managed switch."""
+    authority_path = Path(
+        authority_dir if authority_dir is not None else DEFAULT_AUTHORITY_DIR
+    ).absolute()
+    target_path = Path(target_runtime).absolute()
+    rollback_path = Path(rollback_runtime).absolute()
+    try:
+        rollback = verify_launch(
+            rollback_path, authority_path, enforcement_required=True
+        )
+        target_release = verify_release_manifest(target_path)
+        target_abi = release_enforcement_abi(target_path)
+        minimum_abi = rollback["minimum_abi"]
+        if target_abi < minimum_abi:
+            raise WorkspaceControlError("WORKSPACE_RELEASE_INCOMPATIBLE")
+        allowed = {target_release["release_digest"]: target_abi}
+        old_digest = rollback["release_digest"]
+        old_abi = rollback["release_abi"]
+        if old_digest in allowed and allowed[old_digest] != old_abi:
+            raise WorkspaceControlError("WORKSPACE_RELEASE_ABI_MISMATCH")
+        allowed[old_digest] = old_abi
+        authority = WorkspaceAuthority(projects, state_dir=authority_path)
+        binding = authority.advance(rollback["binding"]["policy_digest"], allowed)
+        target = verify_launch(
+            target_path, authority_path, enforcement_required=True
+        )
+        restored = verify_launch(
+            rollback_path, authority_path, enforcement_required=True
+        )
+        if target["binding"] != binding or restored["binding"] != binding:
+            raise WorkspaceControlError("WORKSPACE_AUTHORITY_CHANGED")
+        return {
+            "target_digest": target["release_digest"],
+            "target_abi": target["release_abi"],
+            "rollback_digest": restored["release_digest"],
+            "rollback_abi": restored["release_abi"],
+            "authority_epoch": binding["authority_epoch"],
+        }
+    except WorkspaceControlError as exc:
+        raise RuntimeError(exc.code) from exc
 
 
 def rollout(*, apply=False, tunnel_id=None, interpreter=sys.executable,
@@ -309,7 +541,7 @@ def rollout(*, apply=False, tunnel_id=None, interpreter=sys.executable,
         from runtime_rollout_web import WebRolloutGrant
         if type(approved_web) is not WebRolloutGrant:
             raise RuntimeError("WEB_ROLLOUT_GRANT_INVALID")
-        approved_web.verify(HERE.parent, installer, inventory, control_inventory)
+        _verify_approved_web(approved_web, installer)
         if approved_web.target_snapshot != target_digest:
             raise RuntimeError("WEB_ROLLOUT_SOURCE_CHANGED")
     # Revalidate the source after operator approval, before snapshot creation.
@@ -333,12 +565,15 @@ def rollout(*, apply=False, tunnel_id=None, interpreter=sys.executable,
         if (actual["snapshot"] != installed["snapshot"]
                 or actual["interpreter"] != runtime_interpreter(interpreter)):
             raise TunnelSwitchError("LIVE_RUNTIME_MISMATCH")
-        catalog.update(observe_tools(TOOL_NAMES))
+        catalog.update(observe_tools(expected_tool_names(projects)))
         if receipt:
             receipt.event("mcp_discovery", "completed", **catalog)
     excluded = tuple(before[key] for key in ("tunnel_pid", "mcp_pid", "codex_pid") if key in before)
     with CliSessionObserver(receipt, excluded_pids=excluded) as cli:
         with receipt.phase("tunnel_switch") if receipt else nullcontext():
+            _authorize_workspace_rollout(
+                projects, installed["runtime_dir"], Path(before["server"]).parent
+            )
             actual = switch_tunnel(installed["runtime_dir"], interpreter=runtime_interpreter(interpreter),
                                    status_fn=lambda: read_status(client), command_fn=call_service,
                                    plan=plan, client=client, verify_fn=verify_live)

@@ -95,33 +95,39 @@ HOST_EXECUTION_TOOL_SPECS = [
 ]
 
 
-def create_host_execution_manager(projects, state_dir, access=None):
+def create_host_execution_manager(projects, state_dir, access=None, workspace=None):
     if access is None:
         from host_access import HostAccess
-        access = HostAccess(projects, state_dir)
+        access = HostAccess(projects, state_dir, workspace=workspace)
     return HostExecution(projects, state_dir, access=access)
 
 
 class HostExecutionTools:
-    def __init__(self, projects, state_dir, project_locks, manager=None, access=None):
+    def __init__(self, projects, state_dir, project_locks, manager=None, access=None,
+                 workspace=None):
         self.projects = projects
         self.state_dir = state_dir
         self.project_locks = project_locks
         self.names = frozenset(NAMES)
         self._manager = manager
         self._access = access
+        self.workspace = workspace
 
     def manager(self):
         if self._manager is None:
             self._manager = create_host_execution_manager(
-                self.projects, self.state_dir, access=self._access)
+                self.projects, self.state_dir, access=self.access(), workspace=self.workspace)
         return self._manager
 
     def access(self):
-        if self._access is not None:
-            return self._access
-        manager = self.manager()
-        return manager.access
+        if self._access is None:
+            if self._manager is not None:
+                self._access = self._manager.access
+            else:
+                from host_access import HostAccess
+                self._access = HostAccess(
+                    self.projects, self.state_dir, workspace=self.workspace)
+        return self._access
 
     async def call(self, name, arguments):
         try:

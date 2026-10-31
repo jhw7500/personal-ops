@@ -29,7 +29,7 @@ MAX_ARGV = 32
 MAX_TIMEOUT_SECONDS = 3600
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,62}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-EFFECTS = frozenset({"read_only", "build", "external_publish"})
+EFFECTS = frozenset({"read_only", "build", "external_publish", "external_call"})
 PROFILE_FIELDS = frozenset({
     "project", "label", "executable", "executable_sha256", "argv", "cwd",
     "timeout_seconds", "effect", "inputs",

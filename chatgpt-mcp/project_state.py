@@ -16,6 +16,8 @@ import uuid
 
 MAX_MEMORY_BYTES = 32 * 1024
 MAX_MEMORY_STATE_BYTES = MAX_MEMORY_BYTES * 6 + 8192
+MAX_MEMORY_ARCHIVES = 64
+MAX_MEMORY_ARCHIVE_STATE_BYTES = MAX_MEMORY_STATE_BYTES
 MAX_PROGRESS_TITLE_BYTES = 200
 MAX_PROGRESS_SUMMARY_BYTES = 4096
 MAX_PROGRESS_ITEMS = 20
@@ -58,9 +60,15 @@ PROJECTLESS_TOOLS = {
     "check_settings_support",
 }
 PROJECT_TOOLS = {
+    "read_registered_artifact", "list_registered_artifacts",
+    "read_workspace_file", "list_workspace_files", "write_workspace_file",
+    "open_workspace_access_approval", "confirm_workspace_access_approval",
+    "cancel_workspace_access_approval", "publish_workspace_output", "read_workspace_output",
     "select_project",
     "read_project_memory",
     "update_project_memory",
+    "get_project_resume",
+    "compact_project_memory",
     "read_project_progress",
     "update_project_progress",
     "read_file",
@@ -80,6 +88,8 @@ PROJECT_TOOLS = {
     "prepare_git_operation",
     "execute_git_operation",
     "get_git_operation",
+    "open_git_commit_access_approval", "get_git_commit_access",
+    "confirm_git_commit_access", "cancel_git_commit_access", "revoke_git_commit_access",
     "get_runtime_status", "compare_deployment", "prepare_test_deploy",
     "execute_test_deploy", "get_host_operation",
     "get_db_migration_status", "get_predecessor_migration_status",
@@ -381,6 +391,7 @@ class ProjectState:
             raise ValueError("Shared state must be outside writable projects")
         self.state_dir = _private_directory(state_dir)
         self.memory_dir = _private_directory(self.state_dir / "project-memory")
+        self.memory_archive_dir = _private_directory(self.state_dir / "project-memory-archive")
         self.progress_dir = _private_directory(self.state_dir / "project-progress")
         self.lock_dir = _private_directory(self.state_dir / "project-state-locks")
         self.activity_path = self.state_dir / "activity.jsonl"
@@ -478,6 +489,137 @@ class ProjectState:
             return {"project": project, **{key: record[key] for key in (
                 "content", "revision", "updated_at")}}
 
+    def _memory_archive_project_dir(self, project, *, create=True):
+        key = self._memory_key(project)
+        path = self.memory_archive_dir / key
+        if create:
+            return _private_directory(path)
+        if not path.exists() and not path.is_symlink():
+            return path
+        _reject_symlink_ancestors(path)
+        info = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise ValueError("Project memory archive directory must be owner-only")
+        return path
+
+    def _memory_archive_path(self, project, archive_id):
+        if (not isinstance(archive_id, str)
+                or re.fullmatch(r"v[0-9]{8}-[a-f0-9]{16}", archive_id) is None):
+            raise ValueError("Invalid memory archive id")
+        return self._memory_archive_project_dir(project, create=True) / (archive_id + ".json")
+
+    def _archive_memory_locked(self, project, current):
+        if current["revision"] == 0:
+            return None
+        digest = hashlib.sha256(current["content"].encode("utf-8")).hexdigest()
+        archive_id = f'v{current["revision"]:08d}-{digest[:16]}'
+        path = self._memory_archive_path(project, archive_id)
+        record = {
+            "root": str(self._root(project)),
+            "content": current["content"],
+            "revision": current["revision"],
+            "updated_at": current["updated_at"],
+            "content_sha256": digest,
+        }
+        if path.exists() or path.is_symlink():
+            try:
+                existing = json.loads(_read_private_bytes(
+                    path, MAX_MEMORY_ARCHIVE_STATE_BYTES).decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError("Invalid project memory archive") from exc
+            archived_at = existing.get("archived_at") if isinstance(existing, dict) else None
+            if (not isinstance(archived_at, str)
+                    or {key: existing.get(key) for key in record} != record):
+                raise ValueError("Project memory archive identity conflict")
+        else:
+            directory = path.parent
+            existing_count = sum(1 for item in directory.glob("*.json") if item.is_file())
+            if existing_count >= MAX_MEMORY_ARCHIVES:
+                raise ValueError("Project memory archive capacity reached")
+            archived_at = _now()
+            self._create_json(path, {**record, "archived_at": archived_at})
+        return {
+            "archive_id": archive_id,
+            "revision": current["revision"],
+            "updated_at": current["updated_at"],
+            "archived_at": archived_at,
+            "bytes": len(current["content"].encode("utf-8")),
+            "content_sha256": digest,
+        }
+
+    def list_memory_archives(self, project, limit=5):
+        self._root(project)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+            raise ValueError("limit must be 1-20")
+        directory = self._memory_archive_project_dir(project, create=False)
+        if not directory.exists():
+            return {"project": project, "archives": []}
+        archives = []
+        for path in directory.glob("*.json"):
+            if path.is_symlink():
+                raise ValueError("Invalid project memory archive")
+            try:
+                record = json.loads(_read_private_bytes(
+                    path, MAX_MEMORY_ARCHIVE_STATE_BYTES).decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError("Invalid project memory archive") from exc
+            archive_id = path.stem
+            content = record.get("content")
+            digest = record.get("content_sha256")
+            if (re.fullmatch(r"v[0-9]{8}-[a-f0-9]{16}", archive_id) is None
+                    or record.get("root") != str(self._root(project))
+                    or not isinstance(content, str)
+                    or len(content.encode("utf-8")) > MAX_MEMORY_BYTES
+                    or isinstance(record.get("revision"), bool)
+                    or not isinstance(record.get("revision"), int)
+                    or record["revision"] < 1
+                    or not isinstance(record.get("updated_at"), str)
+                    or not isinstance(record.get("archived_at"), str)
+                    or not isinstance(digest, str)
+                    or digest != hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    or archive_id != f'v{record["revision"]:08d}-{digest[:16]}'):
+                raise ValueError("Invalid project memory archive")
+            archives.append({
+                "archive_id": archive_id,
+                "revision": record["revision"],
+                "updated_at": record["updated_at"],
+                "archived_at": record["archived_at"],
+                "bytes": len(content.encode("utf-8")),
+                "content_sha256": digest,
+            })
+        archives.sort(key=lambda item: (item["revision"], item["archived_at"]), reverse=True)
+        return {"project": project, "archives": archives[:limit]}
+
+    def compact_memory(self, project, content, expected_revision):
+        if not isinstance(content, str):
+            raise ValueError("Memory content must be text")
+        if len(content.encode("utf-8")) > MAX_MEMORY_BYTES:
+            raise ValueError("Memory content exceeds 32768 UTF-8 bytes")
+        if (isinstance(expected_revision, bool) or not isinstance(expected_revision, int)
+                or expected_revision < 0):
+            raise ValueError("expected_revision must be a non-negative integer")
+        key = self._memory_key(project)
+        with self._lock("memory-" + key, exclusive=True):
+            current = self._read_memory_locked(project)
+            if current["revision"] != expected_revision:
+                raise MemoryConflict("Project memory was changed by another writer")
+            archive = self._archive_memory_locked(project, current)
+            record = {
+                "root": str(self._root(project)),
+                "content": content,
+                "revision": expected_revision + 1,
+                "updated_at": _now(),
+            }
+            self._atomic_json(self._memory_path(project), record)
+            return {
+                "project": project,
+                "revision": record["revision"],
+                "updated_at": record["updated_at"],
+                "bytes": len(content.encode("utf-8")),
+                "archived": archive,
+            }
+
     def _progress_path(self, project):
         return self.progress_dir / (self._progress_key(project) + ".json")
 
@@ -566,6 +708,28 @@ class ProjectState:
             self._atomic_json(self._progress_path(project), record)
             return {"project": project, **{field: record[field] for field in (
                 "title", "status", "summary", "completed", "next_steps", "revision", "updated_at")}}
+
+    def _create_json(self, target, record):
+        _reject_symlink_ancestors(target)
+        descriptor = os.open(
+            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                descriptor = None
+                json.dump(record, stream, ensure_ascii=False, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     def _atomic_json(self, target, record):
         _reject_symlink_ancestors(target)

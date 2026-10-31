@@ -255,6 +255,26 @@ test('a cached grant expires locally while following is paused without making a 
   assert.equal(app.byId.get('host-access-token').value, 'still-fresh-token');
 });
 
+test('a thirty-day grant stays active after twenty-nine days and shows time in days', async () => {
+  const app = await loadUi({routes: {
+    'GET /api/host-access': () => [200, access({active: true, reason: null, requests: [],
+      grant_id: GRANT, expires_at: new Date(NOW + 30 * 86400000).toISOString(), allow_codex: false})],
+  }});
+  assert.equal(text(app, 'overview-access-state'), '활성 · 30일 0시간 남음');
+  app.byId.get('dashboard').dataset.following = 'false';
+  app.advance(29 * 86400000);
+  await app.intervals[0].callback();
+  await settle();
+  assert.equal(text(app, 'overview-access-state'), '활성 · 1일 0시간 남음');
+  app.byId.get('host-access-confirmation').value = 'alpha';
+  app.byId.get('host-access-token').value = 'revoke-token';
+  await app.byId.get('host-access-token').dispatch('input');
+  assert.equal(app.byId.get('host-access-revoke').disabled, false);
+  await app.byId.get('host-access-revoke').dispatch('click');
+  await settle();
+  assert.equal(calls(app, 'POST', '/api/host-access-revoke')[0].body.grant_id, GRANT);
+});
+
 test('missing or malformed host identity prevents approval even with a fresh token', async () => {
   for (const hostIdentity of [undefined, {hostname: 'build-host'}, {
     hostname: 'build-host', user: 'jhw', uid: 1003, groups: ['docker'],
@@ -281,7 +301,7 @@ test('missing or malformed host identity prevents approval even with a fresh tok
   }
 });
 
-test('approval uses selected request, four hours, Codex consent, project confirmation and fresh token', async () => {
+test('approval uses selected request, thirty-day default, Codex consent, project confirmation and fresh token', async () => {
   const app = await loadUi();
   app.byId.get('host-access-codex').checked = true;
   app.byId.get('host-access-confirmation').value = 'alpha';
@@ -294,32 +314,32 @@ test('approval uses selected request, four hours, Codex consent, project confirm
   const approve = calls(app, 'POST', '/api/host-access-approve');
   assert.equal(approve.length, 1);
   assert.deepEqual(approve[0].body, {
-    request_id: REQUEST, duration_seconds: 14400, allow_codex: true,
+    request_id: REQUEST, duration_seconds: 2592000, allow_codex: true,
     confirmation: 'alpha', admin_token: 'fresh-token',
   });
   assert.equal(app.byId.get('host-access-token').value, '');
   assert.equal(app.requests.some(request => request.path.includes('start')), false);
 });
 
-test('approval submits an eight-hour duration', async () => {
+test('approval submits a thirty-day duration', async () => {
   const app = await loadUi();
   app.byId.get('host-access-confirmation').value = 'alpha';
   app.byId.get('host-access-token').value = 'fresh-token';
-  app.byId.get('host-access-duration').value = '480';
+  app.byId.get('host-access-duration').value = '43200';
   await app.byId.get('host-access-confirmation').dispatch('input');
   await app.byId.get('host-access-token').dispatch('input');
   await app.byId.get('host-access-duration').dispatch('input');
   assert.equal(app.byId.get('host-access-approve').disabled, false);
   await app.byId.get('host-access-approve').dispatch('click');
   await settle();
-  assert.equal(calls(app, 'POST', '/api/host-access-approve')[0].body.duration_seconds, 28800);
+  assert.equal(calls(app, 'POST', '/api/host-access-approve')[0].body.duration_seconds, 2592000);
 });
 
-test('approval rejects durations above eight hours', async () => {
+test('approval rejects durations above thirty days', async () => {
   const overLimit = await loadUi();
   overLimit.byId.get('host-access-confirmation').value = 'alpha';
   overLimit.byId.get('host-access-token').value = 'fresh-token';
-  overLimit.byId.get('host-access-duration').value = '481';
+  overLimit.byId.get('host-access-duration').value = '43201';
   await overLimit.byId.get('host-access-confirmation').dispatch('input');
   await overLimit.byId.get('host-access-token').dispatch('input');
   await overLimit.byId.get('host-access-duration').dispatch('input');

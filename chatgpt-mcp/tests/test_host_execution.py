@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -14,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from host_execution import HostExecution  # noqa: E402
 from host_runtime_config import HostRuntimeError  # noqa: E402
 from host_runtime_operations import _save_private_json  # noqa: E402
+from workspace_host import publication_lane  # noqa: E402
+from workspace_tools import WorkspaceTools  # noqa: E402
 
 
 class FakeAccess:
@@ -109,6 +113,27 @@ class HostExecutionTests(unittest.IsolatedAsyncioTestCase):
                 return state
             await __import__("asyncio").sleep(0.02)
         self.fail("operation did not finish")
+
+    def active_workspace(self, project, name):
+        projects_root = project.parent
+        os.chmod(projects_root, 0o700)
+        os.chmod(project, 0o700)
+        owner = self.base / (name + "-owner")
+        owner.mkdir(mode=0o700)
+        policy = owner / "policy.json"
+        policy.write_text(json.dumps({
+            "version": 1,
+            "base_root": str(projects_root),
+            "artifacts": [],
+            "protected_paths": [],
+        }), encoding="utf-8")
+        os.chmod(policy, 0o600)
+        workspace = WorkspaceTools(
+            {"demo": project}, state_dir=self.base / (name + "-authority"),
+            config_path=policy)
+        snapshot = workspace.policy.load(required=True)
+        workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
+        return workspace
 
     async def test_two_commands_one_grant_and_request_id_idempotency(self):
         first = self.prepare()
@@ -216,6 +241,48 @@ class HostExecutionTests(unittest.IsolatedAsyncioTestCase):
         stopped = await self.wait_terminal(running["operation_id"])
         self.assertEqual(stopped["state"], "cancelled")
 
+    async def test_runner_holds_shared_workspace_lane_through_verified_termination(self):
+        projects_root = self.base / "projects-root"
+        projects_root.mkdir(mode=0o700)
+        lane_project = projects_root / "demo"
+        lane_project.mkdir(mode=0o700)
+        workspace = self.active_workspace(lane_project, "workspace")
+
+        access = FakeAccess()
+        access.workspace = workspace
+        runner = FakeRunner()
+        runner.block = True
+        manager = HostExecution(
+            {"demo": lane_project}, self.base / "lane-state", access=access,
+            runner=runner, trusted_runtime=True)
+        self.addAsyncCleanup(manager.close)
+        plan = manager.prepare(
+            "demo", executable=str(self.executable), argv=[], cwd=".", request_id="lane")
+        await manager.execute("demo", plan["operation_id"])
+        self.assertTrue(runner.started.wait(1))
+
+        with self.assertRaises(HostRuntimeError) as caught:
+            with publication_lane(workspace):
+                pass
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
+        runner.block = False
+        for _ in range(100):
+            terminal = manager.get("demo", plan["operation_id"])
+            if terminal["state"] not in {"queued", "running"}:
+                break
+            await __import__("asyncio").sleep(0.02)
+        else:
+            self.fail("workspace-lane operation did not finish")
+        self.assertTrue(terminal["termination_verified"])
+        for _ in range(100):
+            if plan["operation_id"] not in manager._workers:
+                break
+            await __import__("asyncio").sleep(0.01)
+        else:
+            self.fail("workspace-lane worker did not release its leases")
+        with publication_lane(workspace):
+            pass
+
     async def test_private_redacted_paged_logs_and_public_metadata(self):
         plan = self.prepare(
             input_text="multiline\nprivate objective")
@@ -299,6 +366,8 @@ class HostExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unverified_cleanup_retains_all_leases_until_verified_stop(self):
         runner = UnverifiedRunner()
+        workspace = self.active_workspace(self.project, "unverified-workspace")
+        self.access.workspace = workspace
         manager = HostExecution({"demo": self.project}, self.base / "failure-state",
                                 access=self.access, runner=runner,
                                 trusted_runtime=True)
@@ -314,6 +383,10 @@ class HostExecutionTests(unittest.IsolatedAsyncioTestCase):
         state = manager.get("demo", plan["operation_id"])
         self.assertEqual(state["state"], "outcome_unknown")
         self.assertIn(plan["operation_id"], manager._retained_leases)
+        with self.assertRaises(HostRuntimeError) as caught:
+            with publication_lane(workspace):
+                pass
+        self.assertEqual(caught.exception.code, "WORKSPACE_HOST_LANE_BUSY")
         manager._finish_scope = lambda _identity: (_ for _ in ()).throw(
             HostRuntimeError("HOST_COMMAND_PROCESS_TREE_UNVERIFIED"))
         with self.assertRaisesRegex(HostRuntimeError, "HOST_COMMAND_PROCESS_TREE_UNVERIFIED"):
@@ -323,6 +396,8 @@ class HostExecutionTests(unittest.IsolatedAsyncioTestCase):
         cleaned = manager.cancel("demo", plan["operation_id"])
         self.assertTrue(cleaned["termination_verified"])
         self.assertNotIn(plan["operation_id"], manager._retained_leases)
+        with publication_lane(workspace):
+            pass
 
     async def test_observed_registered_work_blocks_dynamic_start(self):
         _save_private_json(

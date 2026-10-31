@@ -13,7 +13,7 @@ from jobs import private_directory, private_file
 from server import CONFIG, load_projects
 
 
-FILES = ("server.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
+FILES = ("server.py", "catalog_refresh.py", "project_resume.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
          "host_runtime_config.py", "host_runtime.py", "host_runtime_operations.py",
          "host_runtime_tools.py", "host_runtime_web.py", "host_db_migration.py", "host_schema014.py",
          "toss_console_evidence.py", "toss_console_tools.py", "toss_console_sdk_bridge.py",
@@ -40,7 +40,17 @@ FILES = ("server.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools
          "host_access.py", "host_execution.py", "host_execution_tools.py", "host_agent.py",
          "host-access-admin.js", "host_access_ui.py", "host-access-approval.html",
          "host_operation_ui.py", "host-operation-approval.html",
-         "host_command_ui.py", "host-command-approval.html")
+         "host_test_approval_ui.py", "host-test-plan-approval.html",
+         "host_registered_approval_ui.py", "host-registered-approval.html",
+         "git_approval_ui.py", "git-approval.html",
+          "git_commit_access.py", "git_commit_access_policy.py", "git-commit-access-approval.html",
+         "host_command_ui.py", "host-command-approval.html",
+         "workspace_paths.py", "workspace_policy.py", "workspace_authority.py",
+         "workspace_activation.py", "workspace_activation_cli.py",
+         "workspace_activation_host.py", "workspace_activation_legacy.py",
+         "rollout_admin.py", "rollout_tunnel.py", "rollout_diagnostics.py",
+         "workspace_files.py", "workspace_jobs.py", "workspace_tools.py", "workspace_host.py",
+         "workspace_control.py", "workspace-launcher.py", "workspace-access-approval.html")
 DASHBOARD_FILES = ('model.js', 'motion.js', 'pixels.js', 'visualizer.js', 'visualizer.css')
 
 

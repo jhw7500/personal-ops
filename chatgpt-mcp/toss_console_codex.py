@@ -17,7 +17,7 @@ import stat
 from typing import Any
 
 from jobs import private_directory
-from toss_console_evidence import ConsoleEvidenceError, DEPLOYMENT_ID, UX019_DEPLOYMENT_ID
+from toss_console_evidence import ConsoleEvidenceError, DEPLOYMENT_ID, UX019_DEPLOYMENT_ID, TEST_20261026_DEPLOYMENT_ID
 from toss_console_sdk_bridge import (
     REVIEWED_CONSOLE_SCHEMA_SHA256, reviewed_console_arguments, ConsoleSessionContractError,
     ReviewedBundleListContract, ReviewedMcpBundleListProvider,
@@ -335,6 +335,9 @@ class CodexConsoleConnection:
 
     async def get_ux019_provider(self):
         return await self.get_provider(deployment_id=UX019_DEPLOYMENT_ID)
+
+    async def get_test_20261026_provider(self):
+        return await self.get_provider(deployment_id=TEST_20261026_DEPLOYMENT_ID)
 
     async def get_provider(self, *, deployment_id: str = DEPLOYMENT_ID):
         # Validate before reading configuration, creating a process or resetting a session.

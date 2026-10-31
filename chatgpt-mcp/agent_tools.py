@@ -33,7 +33,7 @@ AGENT_TOOL_SPECS = [
           "an active owner grant that includes Codex account usage. ready/reason describe "
           "ISOLATED readiness only; host_ready/host_reason describe separate granted host execution.", {}, readonly=True),
     _tool("prepare_agent_task", "에이전트 작업 승인 계획",
-          "Freeze an exact coding objective and source snapshot into a 10-minute plan. "
+          "Freeze an exact coding objective and source snapshot into a 7-day plan. "
           "Preparation starts no model. execution_mode=auto uses a real active host grant "
           "including Codex usage, otherwise the existing isolated review and one-use approval. "
           "host mode edits the REAL checkout with host-user access and no per-task approval; "
@@ -77,7 +77,7 @@ _ALLOWED = {item["name"]: set(item["inputSchema"]["properties"]) for item in AGE
 
 class AgentTools:
     def __init__(self, projects, state_dir, project_locks=None, manager=None, event_sink=None,
-                 host_execution=None):
+                 host_execution=None, workspace=None):
         self.projects = projects
         self.state_dir = Path(state_dir)
         self.project_locks = project_locks or {}
@@ -85,6 +85,7 @@ class AgentTools:
         self._manager = manager
         self.event_sink = event_sink
         self.host_execution = host_execution
+        self.workspace = workspace
         self._host_agent = None
 
     def host_agent(self):
@@ -97,7 +98,7 @@ class AgentTools:
         if self._manager is None:
             self._manager = AgentTaskManager(
                 self.projects, state_dir=self.state_dir,
-                runner=CodexAgentRunner(), event_sink=self.event_sink)
+                runner=CodexAgentRunner(), event_sink=self.event_sink, workspace=self.workspace)
         return self._manager
 
     async def close(self):
