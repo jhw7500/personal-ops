@@ -44,6 +44,7 @@ MAX_TEXT_BYTES = 64 * 1024
 MAX_PATHS = 128
 MAX_PUSH_COMMITS = 128
 MAX_PUSH_PATHS = 128
+MAX_LARGE_PUSH_PATHS = 2048
 COMMAND_TIMEOUT = 60.0
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 PROTECTED_BRANCHES = frozenset({"main", "master"})
@@ -115,6 +116,7 @@ GIT_TOOL_SPECS = [
             "message": {"type": "string"},
             "branch": {"type": "string"},
             "new_branch": {"type": "boolean"},
+            "large_push": {"type": "boolean", "default": False},
             "title": {"type": "string"},
             "body": {"type": "string"},
             "base": {"type": "string"},
@@ -506,7 +508,10 @@ class GitWorkflows:
 
     def _validate_outgoing_history(
         self, snapshot, project: str, root: Path, comparison: str, head: str,
-    ) -> None:
+        *, max_paths: int = MAX_PUSH_PATHS,
+    ) -> dict:
+        if type(max_paths) is not int or not 1 <= max_paths <= MAX_LARGE_PUSH_PATHS:
+            raise ValueError("Outgoing Git path limit is invalid")
         revision_args = [head]
         if comparison != EMPTY_TREE:
             revision_args.append(f"^{comparison}")
@@ -531,13 +536,39 @@ class GitWorkflows:
                 for group in self._changed_path_groups(output):
                     for relative in group:
                         observed.add(relative)
-                        if len(observed) > MAX_PUSH_PATHS:
+                        if len(observed) > max_paths:
                             raise ValueError("Outgoing Git history exceeds the path limit")
                         try:
                             self._paths(root, [relative], required=True)
                             self._workspace_path(snapshot, project, relative, "read")
                         except (WorkspaceError, ValueError):
                             raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED") from None
+
+        manifest = hashlib.sha256(b"git-large-push-paths-v1\0")
+        for relative in sorted(observed):
+            manifest.update(relative.encode("utf-8", errors="surrogateescape") + b"\0")
+        return {
+            "commit_count": len(commits),
+            "path_count": len(observed),
+            "path_manifest_sha256": manifest.hexdigest(),
+        }
+
+    def _revalidate_prepared_push_history(
+        self, snapshot, project: str, root: Path, immutable: dict,
+    ) -> None:
+        max_paths = MAX_LARGE_PUSH_PATHS if immutable.get("large_push") is True else MAX_PUSH_PATHS
+        observed = self._validate_outgoing_history(
+            snapshot, project, root,
+            immutable["remote_head"] or immutable.get("base_head") or EMPTY_TREE,
+            immutable["snapshot"]["head"], max_paths=max_paths,
+        )
+        expected = {
+            "commit_count": immutable.get("outgoing_commit_count"),
+            "path_count": immutable.get("outgoing_path_count"),
+            "path_manifest_sha256": immutable.get("outgoing_path_manifest_sha256"),
+        }
+        if observed != expected:
+            raise ValueError("Prepared Git push history changed")
 
     def _safe_diff(
         self, snapshot, project: str, root: Path, *, staged=False,
@@ -966,7 +997,7 @@ class GitWorkflows:
                 self._reject_unknown_args(args, {"project", "action", "paths", "message"})
                 return self._prepare_commit(project, root, args, snapshot)
             if action == "push":
-                self._reject_unknown_args(args, {"project", "action", "branch", "new_branch"})
+                self._reject_unknown_args(args, {"project", "action", "branch", "new_branch", "large_push"})
                 return self._prepare_push(project, root, args, snapshot)
             if action in {"pr", "merge"}:
                 allowed = ({"project", "action", "title", "body", "base"} if action == "pr"
@@ -1040,6 +1071,11 @@ class GitWorkflows:
         new_branch = args.get("new_branch")
         if not isinstance(new_branch, bool):
             raise ValueError("Push preparation requires explicit new_branch=true or false")
+        large_push = args.get("large_push", False)
+        if type(large_push) is not bool:
+            raise ValueError("large_push must be true or false")
+        if large_push and new_branch:
+            raise ValueError("Large push requires an existing remote feature branch")
         _reject_dangerous_git_config(root)
         remote_url = _decode(_git(root, "remote", "get-url", "--push", "origin").stdout).strip()
         trusted_target, exists, remote_head = self.remote_adapter(root, remote_url, branch)
@@ -1060,16 +1096,29 @@ class GitWorkflows:
                 raise ValueError("Verified origin/main is not an ancestor of the proposed branch")
             base_head = candidate
         comparison = remote_head or base_head or EMPTY_TREE
-        if workspace_snapshot is None:
+        history = self._validate_outgoing_history(
+            workspace_snapshot, project, root, comparison, snapshot["head"],
+            max_paths=MAX_LARGE_PUSH_PATHS if large_push else MAX_PUSH_PATHS,
+        )
+        if large_push and history["path_count"] <= MAX_PUSH_PATHS:
+            raise ValueError("Large push is only for outgoing history above the standard path limit")
+        if large_push:
+            if (remote_head is None
+                    or _git(root, "merge-base", "--is-ancestor", remote_head,
+                            snapshot["head"], check=False).returncode != 0):
+                raise ValueError("Large push requires an existing remote branch that is an ancestor of HEAD")
+            preview = _decode(_git(
+                root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--raw", "--no-abbrev",
+                comparison, snapshot["head"], "--",
+                ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*", literal=False,
+            ).stdout)
+        elif workspace_snapshot is None:
             preview = _decode(_git(
                 root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--raw", "--no-abbrev",
                 comparison, snapshot["head"], "--",
                 ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*", literal=False,
             ).stdout)
         else:
-            self._validate_outgoing_history(
-                workspace_snapshot, project, root, comparison, snapshot["head"],
-            )
             preview, omitted, truncated = self._safe_diff(
                 workspace_snapshot, project, root,
                 comparison=(comparison, snapshot["head"]),
@@ -1077,8 +1126,15 @@ class GitWorkflows:
             )
             if omitted or truncated:
                 raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED")
+        large_notice = (
+            "LARGE PUSH: exact one-use approval required; reusable development grants are disabled.\n"
+            f"Outgoing paths: {history['path_count']} / {MAX_LARGE_PUSH_PATHS}\n"
+            f"Path manifest SHA-256: {history['path_manifest_sha256']}\n"
+            if large_push else ""
+        )
         preview = (
-            (f"Verified already-published origin/main base: {base_head}\n" if base_head else "")
+            large_notice
+            + (f"Verified already-published origin/main base: {base_head}\n" if base_head else "")
             + f"Outgoing committed changes: {comparison} -> {snapshot['head']}\n"
             + "Changed paths, modes and complete old/new blob IDs:\n"
             + preview
@@ -1087,6 +1143,10 @@ class GitWorkflows:
             raise ValueError("Push preview exceeded the 512 KiB safety limit")
         immutable = {
             "action": "push", "branch": branch, "new_branch": new_branch,
+            "large_push": large_push,
+            "outgoing_commit_count": history["commit_count"],
+            "outgoing_path_count": history["path_count"],
+            "outgoing_path_manifest_sha256": history["path_manifest_sha256"],
             "remote": "origin", "trusted_target": trusted_target,
             "remote_head": remote_head, "base_head": base_head, "snapshot": snapshot,
             "display_command": f"git push origin HEAD:refs/heads/{branch}",
@@ -1094,9 +1154,10 @@ class GitWorkflows:
             "preview": preview,
             "approval_nonce": secrets.token_hex(32),
         }
-        binding = self.commit_access.preparation_binding(project)
-        if binding is not None:
-            immutable["development_grant_id"] = binding
+        if not large_push:
+            binding = self.commit_access.preparation_binding(project)
+            if binding is not None:
+                immutable["development_grant_id"] = binding
         plan = self._new_plan(project, immutable, status="pending_host_approval")
         with self._lock(project):
             self._save_plan(plan)
@@ -1154,6 +1215,13 @@ class GitWorkflows:
             "created_at": plan["created_at"], "head_target": immutable.get("head_target"),
             "display_command": immutable.get("display_command"),
         }
+        if plan["action"] == "push":
+            result.update(
+                large_push=immutable.get("large_push", False),
+                outgoing_commit_count=immutable.get("outgoing_commit_count"),
+                outgoing_path_count=immutable.get("outgoing_path_count"),
+                outgoing_path_manifest_sha256=immutable.get("outgoing_path_manifest_sha256"),
+            )
         if plan["status"] == "pending_host_approval":
             result["approval_command"] = shlex.join([
                 "/usr/bin/python3", str(Path(__file__).with_name("approve-git-operation.py")),
@@ -1200,11 +1268,9 @@ class GitWorkflows:
                     self._workspace_paths(
                         workspace_snapshot, project, immutable.get("paths", ()), "write",
                     )
-                elif plan["action"] == "push" and workspace_snapshot is not None:
-                    self._validate_outgoing_history(
-                        workspace_snapshot, project, root,
-                        immutable["remote_head"] or immutable.get("base_head") or EMPTY_TREE,
-                        immutable["snapshot"]["head"],
+                elif plan["action"] == "push":
+                    self._revalidate_prepared_push_history(
+                        workspace_snapshot, project, root, immutable,
                     )
                 current = self._snapshot(root, immutable.get("paths", ()))
                 if current != immutable["snapshot"]:
@@ -1360,6 +1426,11 @@ class GitWorkflows:
                     or _git(root, "merge-base", "--is-ancestor", base_head,
                             immutable["snapshot"]["head"], check=False).returncode != 0):
                 raise ValueError("Verified origin/main base changed after approval")
+        if (immutable.get("large_push") is True
+                and (remote_head is None
+                     or _git(root, "merge-base", "--is-ancestor", remote_head,
+                             immutable["snapshot"]["head"], check=False).returncode != 0)):
+            raise ValueError("Large push is no longer a fast-forward")
         fixture_push = getattr(self.remote_adapter, "push", None)
         if fixture_push is None:
             result = _git(root, "push", trusted_target, f"HEAD:refs/heads/{branch}", authenticated=True)

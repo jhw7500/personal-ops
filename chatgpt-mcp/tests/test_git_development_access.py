@@ -74,6 +74,26 @@ class DevelopmentAccessTest(unittest.TestCase):
         self.access.open('repo',allow_push=True,push_limit=10)
         self.assertEqual(self.access.status('repo')['pushes_remaining'],0)
 
+    def test_large_push_never_reuses_development_push_grant(self):
+        self.remote()
+        for index in range(129):
+            self.repo.joinpath(f"large-{index:03d}.txt").write_text(f"{index}\n")
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-m", "large push fixture")
+        active = self.dev_approve()
+        plan = self.git.prepare({
+            "project": "repo", "action": "push", "branch": "feature/test",
+            "new_branch": False, "large_push": True,
+        })
+        self.assertTrue(plan["large_push"])
+        self.assertTrue(plan.get("approval_required", True))
+        stored = self.git._load_plan("repo", plan["operation_id"])
+        self.assertNotIn("development_grant_id", stored["immutable"])
+        self.assert_denied(lambda: self.execute(plan))
+        status = self.access.status("repo")
+        self.assertTrue(status["active"])
+        self.assertEqual(status["grant_id"], active["grant_id"])
+
     def test_existing_commit_only_grant_cannot_be_silently_upgraded(self):
         self.remote(); old=self.access.open('repo');self.access.confirm('repo',**self.args(old))
         card=self.dev_open()

@@ -152,6 +152,8 @@ class GitWorkflowTest(unittest.TestCase):
                 set(item), {"name", "title", "description", "inputSchema", "annotations"}
             )
             self.assertIn("project", item["inputSchema"]["properties"])
+        prepare = next(item for item in GIT_TOOL_SPECS if item["name"] == "prepare_git_operation")
+        self.assertIn("large_push", prepare["inputSchema"]["properties"])
 
     def test_pinned_canonical_commit_validator_accepts_v1_message(self):
         message_path = self.base / "valid-message.md"
@@ -381,6 +383,56 @@ class GitWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(completed["status"], "completed")
         self.assertIn("refs/heads/feature/test", run_git(remote, "show-ref").stdout)
+
+    def test_large_push_is_explicit_bounded_fast_forward_and_one_use(self):
+        remote = self.base / "large-path-remote.git"
+        run_git(self.base, "init", "--bare", str(remote))
+        run_git(self.repo, "remote", "add", "origin", str(remote))
+        run_git(self.repo, "push", "origin", "HEAD:refs/heads/feature/test")
+        base_head = run_git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        for index in range(git_workflows.MAX_PUSH_PATHS + 1):
+            self.repo.joinpath(f"bulk-{index:03d}.txt").write_text(f"{index}\n", encoding="utf-8")
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-m", "large path fixture")
+        head = run_git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        with self.assertRaisesRegex(ValueError, "path limit"):
+            self.workflows.prepare({
+                "project": "repo", "action": "push",
+                "branch": "feature/test", "new_branch": False,
+            })
+        with self.assertRaisesRegex(ValueError, "existing remote feature branch"):
+            self.workflows.prepare({
+                "project": "repo", "action": "push",
+                "branch": "feature/test", "new_branch": True, "large_push": True,
+            })
+
+        prepared = self.workflows.prepare({
+            "project": "repo", "action": "push",
+            "branch": "feature/test", "new_branch": False, "large_push": True,
+        })
+        self.assertTrue(prepared["large_push"])
+        self.assertEqual(prepared["outgoing_path_count"], git_workflows.MAX_PUSH_PATHS + 1)
+        self.assertEqual(len(prepared["outgoing_path_manifest_sha256"]), 64)
+        stored = self.workflows._load_plan("repo", prepared["operation_id"])["immutable"]
+        self.assertTrue(stored["large_push"])
+        self.assertEqual(stored["remote_head"], base_head)
+        self.assertEqual(stored["snapshot"]["head"], head)
+        self.assertNotIn("development_grant_id", stored)
+        self.assertIn("LARGE PUSH", stored["preview"])
+        self.assertIn(str(git_workflows.MAX_PUSH_PATHS + 1), stored["preview"])
+
+        approval = self.approve(prepared)
+        self.assertIn("LARGE PUSH", approval)
+        completed = self.workflows.execute({
+            "project": "repo", "operation_id": prepared["operation_id"],
+        })
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(run_git(remote, "rev-parse", "refs/heads/feature/test").stdout.strip(), head)
+        with self.assertRaisesRegex(ValueError, "not executable"):
+            self.workflows.execute({
+                "project": "repo", "operation_id": prepared["operation_id"],
+            })
 
     def test_large_outgoing_push_binds_blob_ids_and_keeps_one_use_and_stale_checks(self):
         remote = self.base / "large-remote.git"

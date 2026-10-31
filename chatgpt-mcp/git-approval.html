@@ -16,6 +16,9 @@ dt{font-size:12px;color:light-dark(#666a70,#b9bdc2)}
 dd{margin:0;font-weight:600;overflow-wrap:anywhere}
 code{font:12px/1.5 ui-monospace,monospace}
 .notice{padding:12px;margin:12px 0;border-radius:9px;background:light-dark(#f0f2f5,#35373c)}
+.danger{border:1px solid light-dark(#c73535,#e06b6b);background:light-dark(#fff1f1,#442727)}
+.large-confirm{display:flex;gap:9px;align-items:flex-start;font-weight:650;margin-top:10px}
+.large-confirm input{margin-top:4px}
 .actions{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
 button{min-height:44px;padding:10px 16px;border-radius:9px;font:inherit;font-weight:700;cursor:pointer;border:1px solid light-dark(#9da2a9,#888)}
 button:disabled{opacity:.55;cursor:default}
@@ -36,12 +39,15 @@ button:disabled{opacity:.55;cursor:default}
 <div><dt>고정 대상</dt><dd id="head">불러오는 중…</dd></div>
 <div><dt>실행할 Git 명령</dt><dd><code id="command">불러오는 중…</code></dd></div>
 <div><dt>선택 파일 / 브랜치</dt><dd id="scope">불러오는 중…</dd></div>
+<div><dt>Outgoing 커밋 / 경로 수</dt><dd id="outgoing">해당 없음</dd></div>
+<div><dt>경로 manifest SHA-256</dt><dd><code id="pathManifest">해당 없음</code></dd></div>
 <div><dt>커밋 메시지 SHA-256</dt><dd><code id="message">해당 없음</code></dd></div>
 <div><dt>작업 ID</dt><dd><code id="operation">불러오는 중…</code></dd></div>
 <div><dt>계획 SHA-256</dt><dd><code id="plan">불러오는 중…</code></dd></div>
 <div><dt>작업 트리 스냅샷 SHA-256</dt><dd><code id="snapshot">불러오는 중…</code></dd></div>
 <div><dt>만료</dt><dd id="expiry">불러오는 중…</dd></div>
 </dl>
+<div class="notice danger" id="largePushNotice" hidden><strong>대형 푸시</strong>입니다. 일반 128경로 한도를 넘는 변경을 exact remote HEAD와 path manifest에 고정했습니다.<label class="large-confirm"><input id="largePushConfirm" type="checkbox">표시된 경로 수·manifest·HEAD가 맞으며 이 대형 푸시를 1회 승인합니다.</label></div>
 <div class="notice">승인은 <strong>이 작업 ID에만 유효한 1회용 영수증</strong>을 발급합니다. 이 카드는 커밋·푸시를 실행하지 않습니다. PR/병합은 별도의 리뷰 절차입니다. 전체 차이는 Git 계획 및 diff에서 검토하세요.</div>
 <div class="actions">
 <button type="button" class="primary" id="approve" disabled>이 Git 계획 승인</button>
@@ -52,8 +58,8 @@ button:disabled{opacity:.55;cursor:default}
 </main>
 <script>
 "use strict";
-const el=Object.fromEntries(["project","action","head","command","scope","message",
-"operation","plan","snapshot","expiry","approve","cancel","status"].map(id=>[id,document.getElementById(id)]));
+const el=Object.fromEntries(["project","action","head","command","scope","outgoing","pathManifest","message",
+"operation","plan","snapshot","expiry","approve","cancel","status","largePushNotice","largePushConfirm"].map(id=>[id,document.getElementById(id)]));
 const pending=new Map();let seq=0,card=null,token=null,busy=false,locked=false,frame=null,lastSize=null;
 const id32=/^[0-9a-f]{32}$/,hex64=/^[0-9a-f]{64}$/;
 function resize(){
@@ -90,6 +96,8 @@ function valid(x){
   ["pending","approved","cancelled"].includes(x.state)&&
   hex64.test(x.plan_digest||"")&&hex64.test(x.snapshot_digest||"")&&
   typeof x.display_command==="string"&&Array.isArray(x.paths)&&
+  typeof x.large_push==="boolean"&&
+  (!x.large_push||(Number.isInteger(x.outgoing_path_count)&&x.outgoing_path_count>128&&hex64.test(x.outgoing_path_manifest_sha256||"")))&&
   x.executes_on_approval===false&&typeof x.expires_at==="string"&&
   !Number.isNaN(Date.parse(x.expires_at));
 }
@@ -98,8 +106,9 @@ function sync(){
  if(expired&&card?.state==="pending"){
   locked=true;token=null;status("승인 카드가 만료됐습니다. 정확한 계획 상태를 다시 확인하세요.",true);
  }
- const disabled=!card||card.state!=="pending"||!token||busy||locked||expired;
- el.approve.disabled=disabled;el.cancel.disabled=disabled;
+ const largeUnchecked=card?.large_push===true&&!el.largePushConfirm.checked;
+ const disabled=!card||card.state!=="pending"||!token||busy||locked||expired||largeUnchecked;
+ el.approve.disabled=disabled;el.cancel.disabled=!card||card.state!=="pending"||!token||busy||locked||expired;
 }
 function render(){
  if(!card){sync();return;}
@@ -108,6 +117,10 @@ function render(){
  el.head.textContent=card.head_target||"고정 계획";
  el.command.textContent=card.display_command;
  el.scope.textContent=card.paths.length?card.paths.join(", "):card.branch||"정확한 원격 브랜치";
+ el.outgoing.textContent=Number.isInteger(card.outgoing_path_count)?`${card.outgoing_commit_count??"?"} commit / ${card.outgoing_path_count} paths`:"해당 없음";
+ el.pathManifest.textContent=card.outgoing_path_manifest_sha256||"해당 없음";
+ el.largePushNotice.hidden=card.large_push!==true;
+ if(card.large_push!==true)el.largePushConfirm.checked=false;
  el.message.textContent=card.message_sha256||"해당 없음";
  el.operation.textContent=card.operation_id;
  el.plan.textContent=card.plan_digest;
@@ -154,6 +167,7 @@ async function submit(action){
   status("결과가 불확실합니다. 상태를 조회하거나 카드 다시 열기를 요청하세요.",true);
  }finally{busy=false;sync();}
 }
+el.largePushConfirm.addEventListener("change",sync);
 el.approve.addEventListener("click",()=>submit("confirm"));
 el.cancel.addEventListener("click",()=>submit("cancel"));
 window.addEventListener("message",event=>{
