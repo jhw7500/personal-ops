@@ -540,6 +540,49 @@ README와 미러 문서 두 개는 파일에 묶은 필수 문자열 검사로 �
 현재 스모크 범위 `280e882..39fb8df`는 복사 5, 보존 1, 미반입 0, 미삭제 2를 기대한다.
 이미 반입한 `.clangd`와 `.env.example`은 신규 파일로 세지 않는다.
 
+## GitLab 최소화 (2026-11-06)
+
+personal-ops 이슈 #72. 회사 GitLab 미러에는 소스·빌드 파일, 코드를 검증하는 테스트와 그 의존
+파일, 빌드·사용에 필요하거나 코드·README·빌드가 인용하는 문서, 미러 전용 패키지 출처 문서만
+둔다. 측정·실험 도구, 조사·검증 기록, 원시 데이터·로그, 에이전트 지침, CI·편집기 설정은 각
+conf 의 `UPSTREAM_ONLY` 로 막는다. 지울 경로는 스크립트의 `glob_to_ere()` 로 계산해 미러에서
+먼저 지운 뒤(정리 커밋) 싱크했다 — 정리 전에 새 conf 로 `--apply` 하면 `ASSERT_A` 가 막는다.
+
+| 쌍 | 미러에서 뺀 파일 | 반영한 upstream 구간 | 정리 후 싱크 기준 |
+|---|---|---|---|
+| `max9296` | 39 — FPS·360p 측정 도구와 그 테스트·픽스처, `dw100-spike/`, 360p 검증 기록, `RELEASE_NOTES.md`, `.clangd` | `fbd85f8..43b14c3` (신규 테스트 2개 반입) | `43b14c3` |
+| `gstApp` | 2 — `AGENTS.md`, 녹화 오차 측정 스크립트. 미러 전용 `README.md` 추가 | `f9dfa60..973b1d7` (소스 검사 3개 반입) | `973b1d7` |
+| `imx-vpu` | 79 — vendor 문서·PDF, `imx-player`·`gplay`, Android 빌드 파일, 빈 `AUTHORS` 류, `CHANGELOG.md` | `1f55ed4..d61eaf9` | `d61eaf9` |
+| `sc16is7xx` | 2 — 80 MHz 조사 문서, 루프백 측정기 | 반영할 파일 없음(`0b96d5e..98bbf1f` 은 공용 CI 뿐) | `98bbf1f` |
+| `pim-summit-backports` | 1 — `.clangd` | 없음 | `39fb8df` |
+
+정리한 네 쌍(`max9296`·`gstApp`·`imx-vpu`·`sc16is7xx`)은 미러를 새로 클론해 SDK 로 실제
+빌드했다(`make-for-imx8` / `build.sh`). `max9296` 은 `tests/run_health_tests.sh` 의 13개도
+통과했다. `pim-summit-backports` 는 `.clangd` 와 README 한 문장만 바뀌어 빌드하지 않았다.
+
+**싱크 기준은 이 표가 정본이다.** 회사 GitLab 커밋 메시지에는 실제 코드 수정 내역만 적는다 —
+이슈·PR 번호, URL, sha, 도구 이름, 경위, Change Evidence 헤딩을 넣지 않는다. 그래서 `--apply` 가
+만드는 `chore: sync curated mirror — upstream <from>..<to>` 메시지는 push 전에 실제 변경
+내용으로 다시 쓰고, 다음 싱크의 `--from` 은 이 표(또는 미러 트리와 같아지는 첫 upstream
+커밋)로 정한다. 커밋 제목만 보면 안 된다 — `gstApp` 의 2026-10-16 싱크(`2de96d5..f9dfa60`)도
+이렇게 다시 쓰여 제목에 범위가 없다.
+
+**`max9296` 은 GitLab 이력을 다시 썼다.** 2026-08-12~08-19 커밋에 남아 있던 세션 인계 파일과
+보드 사설 IP 를 이력에서 지웠다. 패키지 기준 태그(`pim-package-master-v2.3` = `a24ebac`)와
+`docs/pim-package-binary.md` 가 고정한 SHA 는 그보다 앞이라 바뀌지 않았다(커밋 122개 중 60개는
+해시 그대로). 바뀐 SHA 를 인용하던 두 곳은 새 SHA 로 고쳤다(`ec3bad4`→`660d9f6`,
+`219f877`→`8938924`). upstream 실기 검증 메모에도 보드 IP 가 있어 `CHANGELOG.md`·
+`docs/health-raw-v1.md` 는 IP 를 `<board-ip>` 로 바꾼 미러 판(`KEEP_MIRROR`)으로 두고, IP 2개와
+`jhw-control` 을 `FORBID` 로 막는다.
+
+**죽은 패턴 하나를 뺐다.** `imx-vpu` 의 `imx-vpuwrap/aarch64-poky-linux-libtool` 은 upstream 이
+2026-09-11 추적을 끊어 어느 트리에도 없다. 다시 생기면 `ASSERT_F` 가 신규 반입 승인을 요구한다.
+
+**스모크 기대값.** `max9296` 은 새 패턴의 파일이 모두 있는 `43b14c3` 으로 끝점을 옮겼다(`gstApp` 이
+2026-10-16 에 `f9dfa60` 으로 옮긴 것과 같은 이유). 각 쌍의 유출 정규식에 이번에 막은 경로를 더해
+규칙이 빠지면 스모크가 빨개진다 — 새 테스트 파일을 이전 conf 로 돌리면 23건이 실패하고, 그중
+5건이 유출 검사다.
+
 ## 쌍별 상태 (2026-09-05)
 
 아래는 당시 조사 기록이다. 이후 `pim-summit-backports` 규칙은 위의 2026-09-12 절을 따른다.
@@ -705,7 +748,7 @@ upstream 판의 **진부분집합**이라(줄 단위 비교에서 미러에만 �
 | 항목 | `max9296` | `gstApp` | `imx-vpu` | `sc16is7xx` | `pim-summit-backports` |
 |---|---|---|---|---|---|
 | upstream 기준 (`master`) | `4fa9881` | `77a2635` | `87deeb7` | `093e069` | `28997d8` |
-| mirror 기준 | `main` `ec3bad4` | `main` `cfaf40b` | `main` `f9e5699` | `main` `6c09f62` | `develop` `badf083` |
+| mirror 기준 | `main` `660d9f6` | `main` `cfaf40b` | `main` `f9e5699` | `main` `6c09f62` | `develop` `badf083` |
 | upstream 파일 수 | 341 | 131 | 312 | 22 | 7 |
 | mirror 파일 수 | 65 | 77 | 288 | 9 | 8 |
 | 공통 파일 | 64 | 76 | 287 | 8 | 6 |
@@ -717,6 +760,9 @@ upstream 판의 **진부분집합**이라(줄 단위 비교에서 미러에만 �
 | `MIRROR_ONLY` | 1 | 1 | 1 | 1 | 2 |
 | `FORBID` | 3 | 5 | 4 | 5 | 1 (`.cache/`) |
 | `MUST_SURVIVE` | 6 | 2 | 4 | 4 | 4 |
+
+`max9296` 의 mirror 기준 `660d9f6` 은 2026-11-06 GitLab 이력 정리 전 SHA `ec3bad4` 다(위
+[GitLab 최소화](#gitlab-최소화-2026-11-06) 절). 나머지 값은 측정 시점 그대로다.
 
 `KEEP_MIRROR` 개수는 다섯 쌍 모두 "공통 중 내용 다름" 과 정확히 같다 — 내용이 다른 공통 파일을
 빠짐없이 보존 대상으로 잡았다는 뜻이다.
@@ -787,7 +833,8 @@ clean 한 미러에서만 시작하므로 **싱크 자신이 A·D 위반을 만�
 위 [새 쌍 추가](#새-쌍-추가) 로 쌍을 늘렸으면 그 쌍의 `smoke_real_pair` 행도 같이 추가한다.
 기대값은 [실측 기준값](#실측-기준값)의 dry-run 합계를 그대로 쓰되, **그 쌍이 무엇을 정상으로
 보는지**까지 봐야 한다. `pim-summit-backports`는 2026-09-05에는 `.clangd` 신규 반입 1건을
-기대했지만, 2026-09-12 반영 후에는 신규 반입 없음과 빈 축 2개의 경고를 기대한다.
+기대했지만, 2026-09-12 반영 후에는 신규 반입 없음과 빈 축 2개의 경고를, 2026-11-06 에 `.clangd` 를
+`UPSTREAM_ONLY` 로 옮긴 뒤에는 빈 축 1개(`FORBID`)의 경고를 기대한다.
 
 ## 관련
 
