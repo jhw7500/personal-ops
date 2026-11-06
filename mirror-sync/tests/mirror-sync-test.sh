@@ -1522,11 +1522,33 @@ smoke_real_pair pim-summit-backports 280e882 39fb8df \
     "보존 1 · 미반입 1 · 미삭제 2" \
     'README\.md|\.clangd'
 
-# 2026-11-06 review-fix: 다섯 쌍 모두 보드 사설 주소 대역을 FORBID 로 막는다. FORBID 는 dry-run 분류에
+# 2026-11-06 편입한 두 쌍(이슈 #72). 미러는 upstream 이력 없이 스냅샷(imx-gst ed36938, imx-hantro c37edf1)
+# 으로 시작했으므로 upstream 첫 커밋부터 스냅샷까지 dry-run 한다. 보존·미반입 대상은 루트의 README.md 와
+# CHANGELOG.md 뿐이라 유출 정규식을 경로 전체에 고정한다(gst-plugins-good 안의 README.md 는 일반 복사다).
+# MIRROR_ONLY 는 미러 전용 파일이 없어 의도적으로 비웠다.
+smoke_real_pair imx-gst d4f8809 ed36938 \
+    "합계: 복사 1418 (쓰기 1418 / 삭제 0)" \
+    "보존 1 · 미반입 1 · 미삭제 0" \
+    '[[:space:]](README|CHANGELOG)\.md$' "" "" \
+    "의도적으로 비운 축 1개"
+
+smoke_real_pair imx-hantro 37ed64d c37edf1 \
+    "합계: 복사 7 (쓰기 7 / 삭제 0)" \
+    "보존 1 · 미반입 1 · 미삭제 0" \
+    '[[:space:]](README|CHANGELOG)\.md$' "" "" \
+    "의도적으로 비운 축 1개"
+
+# 2026-11-06 review-fix: 모든 쌍이 보드 사설 주소 대역을 FORBID 로 막는다. FORBID 는 dry-run 분류에
 # 나타나지 않으므로 배포 conf 를 직접 읽어 확인한다.
-for base in max9296 gstApp imx-vpu sc16is7xx pim-summit-backports; do
+for base in max9296 gstApp imx-vpu sc16is7xx pim-summit-backports imx-gst imx-hantro; do
     n="$(bash -c 'source "$1"; printf "%s\n" "${FORBID[@]}" | grep -cxF "192.168.214."' _ "$MODULE_DIR/config/curation/$base.conf")"
     check_eq "배포 conf($base): FORBID 가 보드 사설 주소 대역을 막는다" "1" "$n"
+done
+
+# 2026-11-06 편입한 두 쌍은 GitHub 저장소 링크도 막는다. upstream 에서 README.md 에만 있어 미러판의 앵커다.
+for base in imx-gst imx-hantro; do
+    n="$(bash -c 'source "$1"; printf "%s\n" "${FORBID[@]}" | grep -cxF "github.com/jhw7500"' _ "$MODULE_DIR/config/curation/$base.conf")"
+    check_eq "배포 conf($base): FORBID 가 GitHub 저장소 링크를 막는다" "1" "$n"
 done
 
 # ══════════════════════════════════════════════════════════════════════════

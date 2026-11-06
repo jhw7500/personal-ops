@@ -169,7 +169,8 @@ AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY FORBID )
 **2026-11-06 개정(지적 A-R1-004).** 회사 GitLab 에 push 하는 미러 커밋 메시지에는 실제 코드 수정 내역만
 적으므로, `--apply` 가 만든 메시지(이 절 포함)는 로컬 커밋까지만 남고 push 전에 다시 쓴다. 그래서 빈 축의
 영속 기록은 conf 의 `AXES_INTENTIONALLY_EMPTY` 선언과 [GitLab 최소화](#gitlab-최소화-2026-11-06) 절의 쌍별
-표다. 빈 축을 새로 선언하면 그 표에 함께 적는다. 2026-11-06 현재 다섯 쌍 모두 의도적으로 비운 축이 없다.
+표다. 빈 축을 새로 선언하면 그 표에 함께 적는다. 2026-11-06 현재 의도적으로 비운 축은 `imx-gst`·`imx-hantro`
+의 `MIRROR_ONLY` 뿐이다(미러에만 있는 파일이 없다).
 
 ```
 어서션 6종 통과:
@@ -442,7 +443,7 @@ git -C /home/jhw/ai/opencode/projects/max9296-gitlab push        # 사람이 직
 |---|---|
 | `bin/mirror-sync.sh` | **본체**. 분류 · dry-run 출력 · 복사 · 어서션 · 미러 로컬 커밋 (push 없음) |
 | `config/pairs.tsv` | **대상 쌍 단일 소스**. 탭 7컬럼 (base / github remote / gitlab remote / upstream 경로 / mirror 경로 / upstream 브랜치 / mirror 브랜치) |
-| `config/curation/<base>.conf` | 쌍별 큐레이션 규칙. 다섯 축을 **bash 배열**로 정의하고 `bin/mirror-sync.sh` 가 source 한다 (선택 축 `MUST_SURVIVE_IN` · `AXES_INTENTIONALLY_EMPTY` 포함). 현재 `max9296` · `gstApp` · `imx-vpu` · `sc16is7xx` · `pim-summit-backports` 5장 |
+| `config/curation/<base>.conf` | 쌍별 큐레이션 규칙. 다섯 축을 **bash 배열**로 정의하고 `bin/mirror-sync.sh` 가 source 한다 (선택 축 `MUST_SURVIVE_IN` · `AXES_INTENTIONALLY_EMPTY` 포함). 현재 `max9296` · `gstApp` · `imx-vpu` · `sc16is7xx` · `pim-summit-backports` · `imx-gst` · `imx-hantro` 7장 |
 | `tests/mirror-sync-test.sh` | mock git 저장소 기반 테스트. 어서션 6종이 **되돌리면 실패하는지**까지 확인하고, 실제 쌍이 있는 호스트에서는 배포 conf 를 dry-run 으로 스모크한다 |
 | `install.sh` | `~/.local/bin` 심링크 + 실행 비트. 재실행 안전 |
 | `README.md` | 이 문서 |
@@ -560,10 +561,20 @@ conf 의 `UPSTREAM_ONLY` 로 막는다. 지울 경로는 스크립트의 `glob_t
 | `imx-vpu` | 79 — vendor 문서·PDF, `imx-player`·`gplay`, Android 빌드 파일, 빈 `AUTHORS` 류, `CHANGELOG.md` | `1f55ed4..d61eaf9` | `d61eaf9` |
 | `sc16is7xx` | 2 — 80 MHz 조사 문서, 루프백 측정기 | 반영할 파일 없음(`0b96d5e..98bbf1f` 은 공용 CI 뿐) | `98bbf1f` |
 | `pim-summit-backports` | 1 — `.clangd` | 없음 | `39fb8df` |
+| `imx-gst` | 1 — `CHANGELOG.md`. `README.md` 는 미러판. 의도적으로 비운 축 `MIRROR_ONLY` | 없음 — upstream `ed36938` 스냅샷으로 시작(upstream 이력 없음) | `ed36938` |
+| `imx-hantro` | 1 — `CHANGELOG.md`. `README.md` 는 미러판. 의도적으로 비운 축 `MIRROR_ONLY` | 없음 — upstream `c37edf1` 스냅샷으로 시작(upstream 이력 없음) | `c37edf1` |
 
 정리한 네 쌍(`max9296`·`gstApp`·`imx-vpu`·`sc16is7xx`)은 미러를 새로 클론해 SDK 로 실제
 빌드했다(`make-for-imx8` / `build.sh`). `max9296` 은 `tests/run_health_tests.sh` 의 13개도
 통과했다. `pim-summit-backports` 는 `.clangd` 와 README 한 문장만 바뀌어 빌드하지 않았다.
+
+**`imx-gst`·`imx-hantro` 를 편입했다(2026-11-06).** 두 미러는 upstream 이력 없이 큐레이션 스냅샷 커밋
+하나로 시작했다. upstream 트리(`imx-gst` `ed36938`, `imx-hantro` `c37edf1`)에서 아무도 인용하지 않는
+`CHANGELOG.md` 를 빼고, `README.md` 는 GitHub 저장소·이슈 링크를 빼고 이력 없는 스냅샷에 맞지 않는
+커밋·`git log` 안내를 고친 미러판(`KEEP_MIRROR`)으로 바꿨다. 나머지 파일은 upstream 과 같다. `FORBID` 의
+`github.com/jhw7500` 은 upstream 에서 `README.md` 에만 있어 미러판의 앵커다. `imx-gst` 소스 트리 안의
+`192.168.x` 주소가 든 9개 파일은 GStreamer 원본 예제·테스트라 그대로 둔다. 미러에만 있는 파일이 없어
+`MIRROR_ONLY` 는 의도적으로 비웠다.
 
 **싱크 기준은 이 표가 정본이다.** 회사 GitLab 커밋 메시지에는 실제 코드 수정 내역만 적는다 —
 이슈·PR 번호, URL, sha, 도구 이름, 경위, Change Evidence 헤딩을 넣지 않는다. 그래서 `--apply` 가
@@ -587,7 +598,7 @@ tip 의 복사 대상 3파일(`docs/CAMERA_SYNC_VALIDATION.md`, `docs/RTSP_CLIEN
 판으로 두고, 보드에 배포해 도는 시험 스크립트 2개(`test/run-sync-config-cli-test.sh`,
 `test/run-cfgjson-test.sh`)는 `UPSTREAM_ONLY` 로 뺐다.
 
-**보드 사설 주소 대역 `192.168.214.` 은 다섯 쌍 모두 `FORBID` 로 막는다**(`max9296` 은 `jhw-control` 도).
+**보드 사설 주소 대역 `192.168.214.` 은 일곱 쌍 모두 `FORBID` 로 막는다**(`max9296` 은 `jhw-control` 도).
 `max9296` 의 `CHANGELOG.md`·`docs/health-raw-v1.md` 와 `gstApp` 의 검증 문서 2개는 IP 를 `<board-ip>` 로
 바꾼 미러 판이고, 이 대역이 그 앵커다. 다른 대역의 주소 3곳(`gstApp` 의 소스·단위 테스트 주석)과
 `pim-summit-backports` 문서의 회사 GitLab 주소는 그대로 둔다. 이로써 `pim-summit-backports` 에는
@@ -602,7 +613,7 @@ tip 의 복사 대상 3파일(`docs/CAMERA_SYNC_VALIDATION.md`, `docs/RTSP_CLIEN
 A-R1-003, 2026-11-06 실측: `max9296` 20/20, `gstApp` 6/6, `sc16is7xx` 2/2, `pim-summit-backports` 1/1,
 `imx-vpu` 는 `CHANGELOG.md` 만). `imx-vpu` 의 vendor 정리 패턴 11개는 스모크 범위(`d8e9590..87deeb7`)에서
 바뀐 파일이 없어 규칙이 빠져도 스모크가 잡지 못한다 — 실제 싱크에서 그 경로가 바뀌면 미러에 없는
-파일이라 `ASSERT_F`(신규 반입 승인)가 멈춘다. 보드 대역 `FORBID` 는 다섯 conf 를 직접 읽는 검사가 지킨다.
+파일이라 `ASSERT_F`(신규 반입 승인)가 멈춘다. 보드 대역 `FORBID` 는 일곱 conf 를 직접 읽는 검사가 지킨다.
 
 **남은 파일이 뺀 경로를 인용할 수 있다**(지적 A-R1-002). 소스 주석·분석 문서·이력 문서가 미러에서 뺀
 문서·도구를 가리키는 곳이 남는다. 2026-11-06 미러 끝을 뺀 경로의 주요 이름으로 grep 한 결과:
