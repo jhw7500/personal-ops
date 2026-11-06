@@ -1483,15 +1483,17 @@ smoke_real_pair max9296 fbd85f8 43b14c3 \
 # gstApp 은 2026-10-16 에 보드 측정 계열을 UPSTREAM_ONLY 에 넣었다. 그 파일들은
 # 77a2635 트리에 아직 없어서 예전 범위(46fd6fa..77a2635)로는 새 패턴이 죽은 패턴으로
 # 잡힌다. 그래서 끝점을 그 파일들과 새 테스트가 모두 있는 f9dfa60 으로 옮긴다.
+# 2026-11-06 review-fix: 보드 IP 가 든 검증 문서 2개는 치환 KEEP_MIRROR, 보드 실행 스크립트 2개는 UPSTREAM_ONLY.
+# 네 파일 모두 이 범위에서 바뀌므로 규칙이 빠지면 아래 유출 정규식이 잡는다.
 smoke_real_pair gstApp 46fd6fa f9dfa60 \
-    "합계: 복사 81 (쓰기 72 / 삭제 0 / 삭제생략 9)" \
-    "보존 1 · 미반입 75 · 미삭제 2" \
-    '\.github/|docs/superpowers/|todos/|\.vscode/|probe-|FPS_MEASUREMENT|run-fps-scenario|classify-freeze|run-skew55a|run-gate-selftest|commute-check|CHANNEL_STARTUP|RECORDING_QP|output\.txt|AGENTS\.md|run-record-sync-check'
+    "합계: 복사 77 (쓰기 68 / 삭제 0 / 삭제생략 9)" \
+    "보존 3 · 미반입 77 · 미삭제 2" \
+    '\.github/|docs/superpowers/|todos/|\.vscode/|probe-|FPS_MEASUREMENT|run-fps-scenario|classify-freeze|run-skew55a|run-gate-selftest|commute-check|CHANNEL_STARTUP|RECORDING_QP|output\.txt|AGENTS\.md|run-record-sync-check|CAMERA_SYNC_VALIDATION|RTSP_CLIENT_SYNC_REQUIREMENTS|run-sync-config-cli-test|run-cfgjson-test'
 
 smoke_real_pair gstApp 2de96d5 f9dfa60 \
     "합계: 복사 6 (쓰기 6 / 삭제 0)" \
     "보존 0 · 미반입 33 · 미삭제 2" \
-    '\.github/|probe-|FPS_MEASUREMENT|run-fps-scenario|run-skew55a|run-gate-selftest|commute-check|NEXT-PR-TASKS|SECURITY-NOTES|AGENTS\.md|run-record-sync-check'
+    '\.github/|probe-|FPS_MEASUREMENT|run-fps-scenario|run-skew55a|run-gate-selftest|commute-check|NEXT-PR-TASKS|SECURITY-NOTES|AGENTS\.md|run-record-sync-check|CAMERA_SYNC_VALIDATION|RTSP_CLIENT_SYNC_REQUIREMENTS|run-sync-config-cli-test|run-cfgjson-test'
 
 smoke_real_pair imx-vpu d8e9590 87deeb7 \
     "합계: 복사 6 (쓰기 6 / 삭제 0)" \
@@ -1514,14 +1516,18 @@ smoke_real_pair sc16is7xx 093e069 0b96d5e \
 #   ① **미러 브랜치가 develop 이다** (main 이 아니다). pairs.tsv 7번 컬럼을 쓴다.
 #   ② clangd 와 .env 배선을 반영해 .gitignore / make-for-imx8 은 일반 복사다.
 #      README 만 보존한다. 2026-11-06 부터 편집기 설정 .clangd 는 UPSTREAM_ONLY 다.
-#   ③ 의도적으로 비운 축은 FORBID 하나이며 그 경고를 확인한다.
+#   ③ 2026-11-06 부터 의도적으로 비운 축이 없다(FORBID 에 보드 사설 주소 대역).
 smoke_real_pair pim-summit-backports 280e882 39fb8df \
     "합계: 복사 4 (쓰기 4 / 삭제 0)" \
     "보존 1 · 미반입 1 · 미삭제 2" \
-    'README\.md|\.clangd' \
-    "" "" \
-    "[주의] 의도적으로 비운 축 1개 (conf 의 AXES_INTENTIONALLY_EMPTY):" \
-    "FORBID — 금지 문자열이 없다. ASSERT_B 는 아무것도 검사하지 않는다."
+    'README\.md|\.clangd'
+
+# 2026-11-06 review-fix: 다섯 쌍 모두 보드 사설 주소 대역을 FORBID 로 막는다. FORBID 는 dry-run 분류에
+# 나타나지 않으므로 배포 conf 를 직접 읽어 확인한다.
+for base in max9296 gstApp imx-vpu sc16is7xx pim-summit-backports; do
+    n="$(bash -c 'source "$1"; printf "%s\n" "${FORBID[@]}" | grep -cxF "192.168.214."' _ "$MODULE_DIR/config/curation/$base.conf")"
+    check_eq "배포 conf($base): FORBID 가 보드 사설 주소 대역을 막는다" "1" "$n"
+done
 
 # ══════════════════════════════════════════════════════════════════════════
 printf '\n=== 집계 ===\n'
