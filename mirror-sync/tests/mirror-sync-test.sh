@@ -1477,10 +1477,18 @@ smoke_real_pair max9296 4fa9881 fbd85f8 \
     "보존 4 · 미반입 17 · 미삭제 1" \
     '\.gitignore|README\.md|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
 
-smoke_real_pair gstApp 46fd6fa 77a2635 \
-    "합계: 복사 84 (쓰기 75 / 삭제 0 / 삭제생략 9)" \
-    "보존 1 · 미반입 54 · 미삭제 1" \
-    '\.github/|docs/superpowers/|todos/|\.vscode/'
+# gstApp 은 2026-10-16 에 보드 측정 계열을 UPSTREAM_ONLY 에 넣었다. 그 파일들은
+# 77a2635 트리에 아직 없어서 예전 범위(46fd6fa..77a2635)로는 새 패턴이 죽은 패턴으로
+# 잡힌다. 그래서 끝점을 그 파일들과 새 테스트가 모두 있는 f9dfa60 으로 옮긴다.
+smoke_real_pair gstApp 46fd6fa f9dfa60 \
+    "합계: 복사 83 (쓰기 74 / 삭제 0 / 삭제생략 9)" \
+    "보존 1 · 미반입 73 · 미삭제 1" \
+    '\.github/|docs/superpowers/|todos/|\.vscode/|probe-|FPS_MEASUREMENT|run-fps-scenario|classify-freeze|run-skew55a|run-gate-selftest|commute-check|CHANNEL_STARTUP|RECORDING_QP|output\.txt'
+
+smoke_real_pair gstApp 2de96d5 f9dfa60 \
+    "합계: 복사 6 (쓰기 6 / 삭제 0)" \
+    "보존 0 · 미반입 33 · 미삭제 1" \
+    '\.github/|probe-|FPS_MEASUREMENT|run-fps-scenario|run-skew55a|run-gate-selftest|commute-check|NEXT-PR-TASKS|SECURITY-NOTES'
 
 smoke_real_pair imx-vpu d8e9590 87deeb7 \
     "합계: 복사 6 (쓰기 6 / 삭제 0)" \

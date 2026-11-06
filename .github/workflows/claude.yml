@@ -16,7 +16,7 @@ jobs:
       contents: read
       id-token: write
       issues: read
-      pull-requests: read
-    uses: jhw7500/automation/.github/workflows/claude.yml@444a7347aee169ed178aae80e8bd8d10eca52e02
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/claude.yml@345cc7916e051e19fcf1480ddd503cf45a6a5ee1
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
