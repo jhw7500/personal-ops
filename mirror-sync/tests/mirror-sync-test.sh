@@ -1467,59 +1467,67 @@ smoke_real_pair() {
 # base / from / to / 기대 복사줄 / 기대 보존·미반입·미삭제 줄 / 유출 검사 ERE
 # from·to 는 저장소가 전진해도 결과가 변하지 않도록 sha 로 못박는다(2026-09-05 실측).
 # GitHub workflow 전용 테스트 제외 패턴이 생긴 현재 트리까지 검사한다.
-smoke_real_pair max9296 3f5915f fbd85f8 \
-    "합계: 복사 65 (쓰기 65 / 삭제 0)" \
-    "보존 8 · 미반입 279 · 미삭제 1" \
-    'artifacts/|docs/superpowers/|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
+# 2026-11-06: 정리 경로(AGENTS.md·CLAUDE.md·docs/exposure-limits.md 등)가 모두 있는 43b14c3 까지로
+# 끝점을 옮겼다. 그 전 끝점에서는 새 패턴이 죽은 패턴으로 잡힌다. 유출 정규식에도 정리 경로를 더했다.
+smoke_real_pair max9296 3f5915f 43b14c3 \
+    "합계: 복사 30 (쓰기 30 / 삭제 0)" \
+    "보존 8 · 미반입 496 · 미삭제 1" \
+    'artifacts/|docs/superpowers/|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh|CHANGELOG\.md|health-raw-v1|AGENTS\.md|CLAUDE\.md|exposure-limits|dw100-spike/|cam_fps_|cam_360p_resource|build_360p_candidates|run_360p_readout_compare|frame_check|tests/fixtures/|RELEASE_NOTES|\.clangd|360p-readout-120fps-validation'
 
-smoke_real_pair max9296 4fa9881 fbd85f8 \
-    "합계: 복사 14 (쓰기 14 / 삭제 0)" \
-    "보존 4 · 미반입 17 · 미삭제 1" \
-    '\.gitignore|README\.md|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
+# 2026-11-06 싱크 구간. CHANGELOG.md·docs/health-raw-v1.md 는 보드 IP 치환본이라 수동 이식 대상이다.
+smoke_real_pair max9296 fbd85f8 43b14c3 \
+    "합계: 복사 15 (쓰기 15 / 삭제 0)" \
+    "보존 5 · 미반입 196 · 미삭제 1" \
+    '\.gitignore|README\.md|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh|CHANGELOG\.md|health-raw-v1|AGENTS\.md|CLAUDE\.md|exposure-limits|dw100-spike/|cam_fps_|cam_360p_resource|build_360p_candidates|run_360p_readout_compare|frame_check|tests/fixtures/|RELEASE_NOTES|\.clangd|360p-readout-120fps-validation'
 
 # gstApp 은 2026-10-16 에 보드 측정 계열을 UPSTREAM_ONLY 에 넣었다. 그 파일들은
 # 77a2635 트리에 아직 없어서 예전 범위(46fd6fa..77a2635)로는 새 패턴이 죽은 패턴으로
 # 잡힌다. 그래서 끝점을 그 파일들과 새 테스트가 모두 있는 f9dfa60 으로 옮긴다.
+# 2026-11-06 review-fix: 보드 IP 가 든 검증 문서 2개는 치환 KEEP_MIRROR, 보드 실행 스크립트 2개는 UPSTREAM_ONLY.
+# 네 파일 모두 이 범위에서 바뀌므로 규칙이 빠지면 아래 유출 정규식이 잡는다.
 smoke_real_pair gstApp 46fd6fa f9dfa60 \
-    "합계: 복사 83 (쓰기 74 / 삭제 0 / 삭제생략 9)" \
-    "보존 1 · 미반입 73 · 미삭제 1" \
-    '\.github/|docs/superpowers/|todos/|\.vscode/|probe-|FPS_MEASUREMENT|run-fps-scenario|classify-freeze|run-skew55a|run-gate-selftest|commute-check|CHANNEL_STARTUP|RECORDING_QP|output\.txt'
+    "합계: 복사 77 (쓰기 68 / 삭제 0 / 삭제생략 9)" \
+    "보존 3 · 미반입 77 · 미삭제 2" \
+    '\.github/|docs/superpowers/|todos/|\.vscode/|probe-|FPS_MEASUREMENT|run-fps-scenario|classify-freeze|run-skew55a|run-gate-selftest|commute-check|CHANNEL_STARTUP|RECORDING_QP|output\.txt|AGENTS\.md|run-record-sync-check|CAMERA_SYNC_VALIDATION|RTSP_CLIENT_SYNC_REQUIREMENTS|run-sync-config-cli-test|run-cfgjson-test'
 
 smoke_real_pair gstApp 2de96d5 f9dfa60 \
     "합계: 복사 6 (쓰기 6 / 삭제 0)" \
-    "보존 0 · 미반입 33 · 미삭제 1" \
-    '\.github/|probe-|FPS_MEASUREMENT|run-fps-scenario|run-skew55a|run-gate-selftest|commute-check|NEXT-PR-TASKS|SECURITY-NOTES'
+    "보존 0 · 미반입 33 · 미삭제 2" \
+    '\.github/|probe-|FPS_MEASUREMENT|run-fps-scenario|run-skew55a|run-gate-selftest|commute-check|NEXT-PR-TASKS|SECURITY-NOTES|AGENTS\.md|run-record-sync-check|CAMERA_SYNC_VALIDATION|RTSP_CLIENT_SYNC_REQUIREMENTS|run-sync-config-cli-test|run-cfgjson-test'
 
 smoke_real_pair imx-vpu d8e9590 87deeb7 \
     "합계: 복사 6 (쓰기 6 / 삭제 0)" \
-    "보존 5 · 미반입 18 · 미삭제 1" \
-    '\.github/|make-for-imx8\.sh'
+    "보존 4 · 미반입 19 · 미삭제 1" \
+    '\.github/|make-for-imx8\.sh|CHANGELOG\.md|imx-gst1\.0-plugin/doc/|imx-player/|tools/gplay/|haarcascade|Android\.bp|vpu_wrapper\.go|imx-vpuwrap/docs/'
 
 smoke_real_pair sc16is7xx 9f71cb9 093e069 \
-    "합계: 복사 4 (쓰기 3 / 삭제 0 / 삭제생략 1)" \
-    "보존 3 · 미반입 14 · 미삭제 1" \
-    '\.clangd|\.github/|sc16is7xx-ext-ko-provenance'
+    "합계: 복사 3 (쓰기 2 / 삭제 0 / 삭제생략 1)" \
+    "보존 2 · 미반입 16 · 미삭제 1" \
+    '\.clangd|\.github/|sc16is7xx-ext-ko-provenance|sc16is752-80mhz-investigation|serial_loopback_error_rate'
 
 # .env / Kbuild 재진입 가드 반영 구간. 두 빌드 파일은 계속 수동 이식 대상이며,
 # 회사 패키지 기준 문서는 미러 전용으로 보존한다.
 smoke_real_pair sc16is7xx 093e069 0b96d5e \
     "합계: 복사 3 (쓰기 3 / 삭제 0)" \
     "보존 2 · 미반입 11 · 미삭제 1" \
-    '\.gitignore|make-for-imx8|\.github/|docs/'
+    '\.gitignore|make-for-imx8|\.github/|docs/|serial_loopback_error_rate'
 
 # 다섯 번째 쌍 (이슈 #41, 2026-09-12 동기화 기준).
 #   ① **미러 브랜치가 develop 이다** (main 이 아니다). pairs.tsv 7번 컬럼을 쓴다.
 #   ② clangd 와 .env 배선을 반영해 .gitignore / make-for-imx8 은 일반 복사다.
-#      README 만 보존하며, 기존 .clangd 와 .env.example 은 신규 반입이 아니다.
-#   ③ UPSTREAM_ONLY / FORBID 두 축을 의도적으로 비운 상태의 경고를 모두 확인한다.
+#      README 만 보존한다. 2026-11-06 부터 편집기 설정 .clangd 는 UPSTREAM_ONLY 다.
+#   ③ 2026-11-06 부터 의도적으로 비운 축이 없다(FORBID 에 보드 사설 주소 대역).
 smoke_real_pair pim-summit-backports 280e882 39fb8df \
-    "합계: 복사 5 (쓰기 5 / 삭제 0)" \
-    "보존 1 · 미반입 0 · 미삭제 2" \
-    'README\.md' \
-    "" "" \
-    "[주의] 의도적으로 비운 축 2개 (conf 의 AXES_INTENTIONALLY_EMPTY):" \
-    "UPSTREAM_ONLY — 반입 금지 목록이 없다. upstream 전용 파일이 전부 복사 대상이 된다." \
-    "FORBID — 금지 문자열이 없다. ASSERT_B 는 아무것도 검사하지 않는다."
+    "합계: 복사 4 (쓰기 4 / 삭제 0)" \
+    "보존 1 · 미반입 1 · 미삭제 2" \
+    'README\.md|\.clangd'
+
+# 2026-11-06 review-fix: 다섯 쌍 모두 보드 사설 주소 대역을 FORBID 로 막는다. FORBID 는 dry-run 분류에
+# 나타나지 않으므로 배포 conf 를 직접 읽어 확인한다.
+for base in max9296 gstApp imx-vpu sc16is7xx pim-summit-backports; do
+    n="$(bash -c 'source "$1"; printf "%s\n" "${FORBID[@]}" | grep -cxF "192.168.214."' _ "$MODULE_DIR/config/curation/$base.conf")"
+    check_eq "배포 conf($base): FORBID 가 보드 사설 주소 대역을 막는다" "1" "$n"
+done
 
 # ══════════════════════════════════════════════════════════════════════════
 printf '\n=== 집계 ===\n'
