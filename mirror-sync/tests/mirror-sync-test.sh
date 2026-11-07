@@ -673,6 +673,16 @@ check_out_has "--apply 어서션 D 통과" "[PASS] ASSERT_D_MIRROR_ONLY_DELETED"
 check_out_has "--apply 어서션 E 통과" "[PASS] ASSERT_E_STAGED_AS_REPORTED"
 check_out_has "--apply 어서션 F 통과" "[PASS] ASSERT_F_NEW_FILE_INFLOW"
 check_out_has "--apply 는 push 하지 않았음을 알린다" "push 는 하지 않았다"
+# 회사 GitLab 에는 실제 코드 수정 내역만 적은 메시지를 올리므로, push 안내보다 커밋 메시지
+# 재작성(commit --amend) 안내가 먼저 나와야 한다 (README 'GitLab 최소화 (2026-11-06)' 절).
+AMEND_AT="$(printf '%s\n' "$RUN_OUT" | grep -nF -- "commit --amend" | head -1 | cut -d: -f1)"
+PUSH_AT="$(printf '%s\n' "$RUN_OUT" | grep -nE -- 'git -C .+ push$' | head -1 | cut -d: -f1)"
+if [[ -n "$AMEND_AT" && -n "$PUSH_AT" ]] && (( AMEND_AT < PUSH_AT )); then
+    pass "--apply 는 push 안내보다 커밋 메시지 재작성 안내를 먼저 찍는다"
+else
+    fail "--apply 는 push 안내보다 커밋 메시지 재작성 안내를 먼저 찍는다" \
+        "commit --amend 줄이 push 줄보다 앞" "amend=${AMEND_AT:-없음} push=${PUSH_AT:-없음}"
+fi
 # A·B 의 [PASS] 문구는 검사 기준의 종수를 함께 찍는다. 축이 살아 있는 이 세계에서
 # '0종' 이 나오면 축이 죽었다는 뜻이다.
 check_out_lacks "--apply 어서션 A·B 의 기준 종수가 0이 아니다" "0종 기준"
