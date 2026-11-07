@@ -673,6 +673,18 @@ check_out_has "--apply 어서션 D 통과" "[PASS] ASSERT_D_MIRROR_ONLY_DELETED"
 check_out_has "--apply 어서션 E 통과" "[PASS] ASSERT_E_STAGED_AS_REPORTED"
 check_out_has "--apply 어서션 F 통과" "[PASS] ASSERT_F_NEW_FILE_INFLOW"
 check_out_has "--apply 는 push 하지 않았음을 알린다" "push 는 하지 않았다"
+# 회사 GitLab 에는 실제 코드 수정 내역만 적은 메시지를 올리므로, 커밋 메시지 재작성(commit --amend)
+# 안내와 push 직전 확인 명령(@{u}..HEAD)이 push 안내보다 이 순서로 먼저 나와야 한다
+# (README 'GitLab 최소화 (2026-11-06)' 절).
+AMEND_AT="$(printf '%s\n' "$RUN_OUT" | grep -nF -- "commit --amend" | head -1 | cut -d: -f1)"
+CHECK_AT="$(printf '%s\n' "$RUN_OUT" | grep -nF -- "@{u}..HEAD" | head -1 | cut -d: -f1)"
+PUSH_AT="$(printf '%s\n' "$RUN_OUT" | grep -nE -- 'git -C .+ push$' | head -1 | cut -d: -f1)"
+if [[ -n "$AMEND_AT" && -n "$CHECK_AT" && -n "$PUSH_AT" ]] && (( AMEND_AT < CHECK_AT && CHECK_AT < PUSH_AT )); then
+    pass "--apply 는 재작성 안내 → push 직전 확인 → push 안내 순서로 찍는다"
+else
+    fail "--apply 는 재작성 안내 → push 직전 확인 → push 안내 순서로 찍는다" \
+        "amend < check < push" "amend=${AMEND_AT:-없음} check=${CHECK_AT:-없음} push=${PUSH_AT:-없음}"
+fi
 # A·B 의 [PASS] 문구는 검사 기준의 종수를 함께 찍는다. 축이 살아 있는 이 세계에서
 # '0종' 이 나오면 축이 죽었다는 뜻이다.
 check_out_lacks "--apply 어서션 A·B 의 기준 종수가 0이 아니다" "0종 기준"
@@ -743,10 +755,41 @@ if grep -qE '(^| )push( |$)' "$GIT_LOG"; then
 else
     pass "push 검증: git push 를 한 번도 실행하지 않았다 ($(wc -l < "$GIT_LOG")회 git 호출 관측)"
 fi
+# --apply 가 안내한 push 직전 확인 명령. 아래에서 이 명령 자체가 남은 자동 메시지를 잡는지 본다.
+PUSH_CHECK_CMD="git -C $W_MI log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync'"
+check_out_has "push 검증: push 직전 확인 명령을 안내한다" "  $PUSH_CHECK_CMD"
 
 run_sync --pair mock --from "$W_FROM" --to "$W_TO" --push
 check_eq "push 검증: --push 플래그는 종료 코드 1 로 거부" "1" "$RUN_RC"
 check_out_has "push 검증: 거부 사유를 알린다" "push 는 이 스크립트가 하지 않는다"
+
+# 안내한 확인 명령이 실제로 남은 자동 메시지를 잡는가. 미러가 origin/main 을 upstream 으로 두고
+# --apply 의 싱크 커밋이 아직 push 되지 않은 상태에서 시작한다. 싱크 커밋 뒤에 이식 커밋을 만들고
+# 그 커밋만 amend 하는 순서(commit --amend 는 HEAD 만 고친다)에서도 잡아야 하고, 아직 push 하지
+# 않은 커밋을 모두 다시 쓰면 아무것도 나오지 않아야 한다.
+git -C "$W_MI" fetch -q origin
+git -C "$W_MI" branch -q --set-upstream-to=origin/main main
+PUSH_CHECK_OUT="$(bash -c "$PUSH_CHECK_CMD" 2>&1)"
+if printf '%s\n' "$PUSH_CHECK_OUT" | grep -qF "sync curated mirror"; then
+    pass "push 직전 확인: 다시 쓰지 않은 싱크 커밋의 자동 메시지를 잡는다"
+else
+    fail "push 직전 확인: 다시 쓰지 않은 싱크 커밋의 자동 메시지를 잡는다" "sync curated mirror 포함" "$PUSH_CHECK_OUT"
+fi
+wfile "$W_MI" "docs/ported-note.md" <<'EOF'
+수동 이식분 (테스트용)
+EOF
+commit_all "$W_MI" "port: mirror note"
+git -C "$W_MI" commit -q --amend -m "Update the mirror note"
+PUSH_CHECK_OUT="$(bash -c "$PUSH_CHECK_CMD" 2>&1)"
+if printf '%s\n' "$PUSH_CHECK_OUT" | grep -qF "sync curated mirror"; then
+    pass "push 직전 확인: 이식 커밋만 amend 해도 그 아래 싱크 커밋의 자동 메시지를 잡는다"
+else
+    fail "push 직전 확인: 이식 커밋만 amend 해도 그 아래 싱크 커밋의 자동 메시지를 잡는다" "sync curated mirror 포함" "$PUSH_CHECK_OUT"
+fi
+git -C "$W_MI" reset -q --soft '@{u}'
+git -C "$W_MI" commit -q -m "Update sources and the mirror note"
+PUSH_CHECK_OUT="$(bash -c "$PUSH_CHECK_CMD" 2>&1)"
+check_eq "push 직전 확인: 아직 push 하지 않은 커밋을 모두 다시 쓰면 아무것도 나오지 않는다" "" "$PUSH_CHECK_OUT"
 
 # ══════════════════════════════════════════════════════════════════════════
 printf -- '\n--- 5. 어서션 — 되돌리면 실패하는가 (최소 쌍) ---\n'
@@ -1467,59 +1510,89 @@ smoke_real_pair() {
 # base / from / to / 기대 복사줄 / 기대 보존·미반입·미삭제 줄 / 유출 검사 ERE
 # from·to 는 저장소가 전진해도 결과가 변하지 않도록 sha 로 못박는다(2026-09-05 실측).
 # GitHub workflow 전용 테스트 제외 패턴이 생긴 현재 트리까지 검사한다.
-smoke_real_pair max9296 3f5915f fbd85f8 \
-    "합계: 복사 65 (쓰기 65 / 삭제 0)" \
-    "보존 8 · 미반입 279 · 미삭제 1" \
-    'artifacts/|docs/superpowers/|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
+# 2026-11-06: 정리 경로(AGENTS.md·CLAUDE.md·docs/exposure-limits.md 등)가 모두 있는 43b14c3 까지로
+# 끝점을 옮겼다. 그 전 끝점에서는 새 패턴이 죽은 패턴으로 잡힌다. 유출 정규식에도 정리 경로를 더했다.
+smoke_real_pair max9296 3f5915f 43b14c3 \
+    "합계: 복사 30 (쓰기 30 / 삭제 0)" \
+    "보존 8 · 미반입 496 · 미삭제 1" \
+    'artifacts/|docs/superpowers/|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh|CHANGELOG\.md|health-raw-v1|AGENTS\.md|CLAUDE\.md|exposure-limits|dw100-spike/|cam_fps_|cam_360p_resource|build_360p_candidates|run_360p_readout_compare|frame_check|tests/fixtures/|RELEASE_NOTES|\.clangd|360p-readout-120fps-validation'
 
-smoke_real_pair max9296 4fa9881 fbd85f8 \
-    "합계: 복사 14 (쓰기 14 / 삭제 0)" \
-    "보존 4 · 미반입 17 · 미삭제 1" \
-    '\.gitignore|README\.md|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh'
+# 2026-11-06 싱크 구간. CHANGELOG.md·docs/health-raw-v1.md 는 보드 IP 치환본이라 수동 이식 대상이다.
+smoke_real_pair max9296 fbd85f8 43b14c3 \
+    "합계: 복사 15 (쓰기 15 / 삭제 0)" \
+    "보존 5 · 미반입 196 · 미삭제 1" \
+    '\.gitignore|README\.md|\.github/|max9296_ci_contract_test|make-for-imx8|tests/run_health_tests\.sh|CHANGELOG\.md|health-raw-v1|AGENTS\.md|CLAUDE\.md|exposure-limits|dw100-spike/|cam_fps_|cam_360p_resource|build_360p_candidates|run_360p_readout_compare|frame_check|tests/fixtures/|RELEASE_NOTES|\.clangd|360p-readout-120fps-validation'
 
 # gstApp 은 2026-10-16 에 보드 측정 계열을 UPSTREAM_ONLY 에 넣었다. 그 파일들은
 # 77a2635 트리에 아직 없어서 예전 범위(46fd6fa..77a2635)로는 새 패턴이 죽은 패턴으로
 # 잡힌다. 그래서 끝점을 그 파일들과 새 테스트가 모두 있는 f9dfa60 으로 옮긴다.
+# 2026-11-06 review-fix: 보드 IP 가 든 검증 문서 2개는 치환 KEEP_MIRROR, 보드 실행 스크립트 2개는 UPSTREAM_ONLY.
+# 네 파일 모두 이 범위에서 바뀌므로 규칙이 빠지면 아래 유출 정규식이 잡는다.
 smoke_real_pair gstApp 46fd6fa f9dfa60 \
-    "합계: 복사 83 (쓰기 74 / 삭제 0 / 삭제생략 9)" \
-    "보존 1 · 미반입 73 · 미삭제 1" \
-    '\.github/|docs/superpowers/|todos/|\.vscode/|probe-|FPS_MEASUREMENT|run-fps-scenario|classify-freeze|run-skew55a|run-gate-selftest|commute-check|CHANNEL_STARTUP|RECORDING_QP|output\.txt'
+    "합계: 복사 77 (쓰기 68 / 삭제 0 / 삭제생략 9)" \
+    "보존 3 · 미반입 77 · 미삭제 2" \
+    '\.github/|docs/superpowers/|todos/|\.vscode/|probe-|FPS_MEASUREMENT|run-fps-scenario|classify-freeze|run-skew55a|run-gate-selftest|commute-check|CHANNEL_STARTUP|RECORDING_QP|output\.txt|AGENTS\.md|run-record-sync-check|CAMERA_SYNC_VALIDATION|RTSP_CLIENT_SYNC_REQUIREMENTS|run-sync-config-cli-test|run-cfgjson-test'
 
 smoke_real_pair gstApp 2de96d5 f9dfa60 \
     "합계: 복사 6 (쓰기 6 / 삭제 0)" \
-    "보존 0 · 미반입 33 · 미삭제 1" \
-    '\.github/|probe-|FPS_MEASUREMENT|run-fps-scenario|run-skew55a|run-gate-selftest|commute-check|NEXT-PR-TASKS|SECURITY-NOTES'
+    "보존 0 · 미반입 33 · 미삭제 2" \
+    '\.github/|probe-|FPS_MEASUREMENT|run-fps-scenario|run-skew55a|run-gate-selftest|commute-check|NEXT-PR-TASKS|SECURITY-NOTES|AGENTS\.md|run-record-sync-check|CAMERA_SYNC_VALIDATION|RTSP_CLIENT_SYNC_REQUIREMENTS|run-sync-config-cli-test|run-cfgjson-test'
 
 smoke_real_pair imx-vpu d8e9590 87deeb7 \
     "합계: 복사 6 (쓰기 6 / 삭제 0)" \
-    "보존 5 · 미반입 18 · 미삭제 1" \
-    '\.github/|make-for-imx8\.sh'
+    "보존 4 · 미반입 19 · 미삭제 1" \
+    '\.github/|make-for-imx8\.sh|CHANGELOG\.md|imx-gst1\.0-plugin/doc/|imx-player/|tools/gplay/|haarcascade|Android\.bp|vpu_wrapper\.go|imx-vpuwrap/docs/'
 
 smoke_real_pair sc16is7xx 9f71cb9 093e069 \
-    "합계: 복사 4 (쓰기 3 / 삭제 0 / 삭제생략 1)" \
-    "보존 3 · 미반입 14 · 미삭제 1" \
-    '\.clangd|\.github/|sc16is7xx-ext-ko-provenance'
+    "합계: 복사 3 (쓰기 2 / 삭제 0 / 삭제생략 1)" \
+    "보존 2 · 미반입 16 · 미삭제 1" \
+    '\.clangd|\.github/|sc16is7xx-ext-ko-provenance|sc16is752-80mhz-investigation|serial_loopback_error_rate'
 
 # .env / Kbuild 재진입 가드 반영 구간. 두 빌드 파일은 계속 수동 이식 대상이며,
 # 회사 패키지 기준 문서는 미러 전용으로 보존한다.
 smoke_real_pair sc16is7xx 093e069 0b96d5e \
     "합계: 복사 3 (쓰기 3 / 삭제 0)" \
     "보존 2 · 미반입 11 · 미삭제 1" \
-    '\.gitignore|make-for-imx8|\.github/|docs/'
+    '\.gitignore|make-for-imx8|\.github/|docs/|serial_loopback_error_rate'
 
 # 다섯 번째 쌍 (이슈 #41, 2026-09-12 동기화 기준).
 #   ① **미러 브랜치가 develop 이다** (main 이 아니다). pairs.tsv 7번 컬럼을 쓴다.
 #   ② clangd 와 .env 배선을 반영해 .gitignore / make-for-imx8 은 일반 복사다.
-#      README 만 보존하며, 기존 .clangd 와 .env.example 은 신규 반입이 아니다.
-#   ③ UPSTREAM_ONLY / FORBID 두 축을 의도적으로 비운 상태의 경고를 모두 확인한다.
+#      README 만 보존한다. 2026-11-06 부터 편집기 설정 .clangd 는 UPSTREAM_ONLY 다.
+#   ③ 2026-11-06 부터 의도적으로 비운 축이 없다(FORBID 에 보드 사설 주소 대역).
 smoke_real_pair pim-summit-backports 280e882 39fb8df \
-    "합계: 복사 5 (쓰기 5 / 삭제 0)" \
-    "보존 1 · 미반입 0 · 미삭제 2" \
-    'README\.md' \
-    "" "" \
-    "[주의] 의도적으로 비운 축 2개 (conf 의 AXES_INTENTIONALLY_EMPTY):" \
-    "UPSTREAM_ONLY — 반입 금지 목록이 없다. upstream 전용 파일이 전부 복사 대상이 된다." \
-    "FORBID — 금지 문자열이 없다. ASSERT_B 는 아무것도 검사하지 않는다."
+    "합계: 복사 4 (쓰기 4 / 삭제 0)" \
+    "보존 1 · 미반입 1 · 미삭제 2" \
+    'README\.md|\.clangd'
+
+# 2026-11-06 편입한 두 쌍(이슈 #72). 미러는 upstream 이력 없이 스냅샷(imx-gst ed36938, imx-hantro c37edf1)
+# 으로 시작했으므로 upstream 첫 커밋부터 스냅샷까지 dry-run 한다. 보존·미반입 대상은 루트의 README.md 와
+# CHANGELOG.md 뿐이라 유출 정규식을 경로 전체에 고정한다(gst-plugins-good 안의 README.md 는 일반 복사다).
+# MIRROR_ONLY 는 미러 전용 파일이 없어 의도적으로 비웠다.
+smoke_real_pair imx-gst d4f8809 ed36938 \
+    "합계: 복사 1418 (쓰기 1418 / 삭제 0)" \
+    "보존 1 · 미반입 1 · 미삭제 0" \
+    '[[:space:]](README|CHANGELOG)\.md$' "" "" \
+    "의도적으로 비운 축 1개"
+
+smoke_real_pair imx-hantro 37ed64d c37edf1 \
+    "합계: 복사 7 (쓰기 7 / 삭제 0)" \
+    "보존 1 · 미반입 1 · 미삭제 0" \
+    '[[:space:]](README|CHANGELOG)\.md$' "" "" \
+    "의도적으로 비운 축 1개"
+
+# 2026-11-06 review-fix: 모든 쌍이 보드 사설 주소 대역을 FORBID 로 막는다. FORBID 는 dry-run 분류에
+# 나타나지 않으므로 배포 conf 를 직접 읽어 확인한다.
+for base in max9296 gstApp imx-vpu sc16is7xx pim-summit-backports imx-gst imx-hantro; do
+    n="$(bash -c 'source "$1"; printf "%s\n" "${FORBID[@]}" | grep -cxF "192.168.214."' _ "$MODULE_DIR/config/curation/$base.conf")"
+    check_eq "배포 conf($base): FORBID 가 보드 사설 주소 대역을 막는다" "1" "$n"
+done
+
+# 2026-11-06 편입한 두 쌍은 GitHub 저장소 링크도 막는다. upstream 에서 README.md 에만 있어 미러판의 앵커다.
+for base in imx-gst imx-hantro; do
+    n="$(bash -c 'source "$1"; printf "%s\n" "${FORBID[@]}" | grep -cxF "github.com/jhw7500"' _ "$MODULE_DIR/config/curation/$base.conf")"
+    check_eq "배포 conf($base): FORBID 가 GitHub 저장소 링크를 막는다" "1" "$n"
+done
 
 # ══════════════════════════════════════════════════════════════════════════
 printf '\n=== 집계 ===\n'

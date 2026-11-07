@@ -166,6 +166,12 @@ AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY FORBID )
 축이 빌 수 없어 그 문장이 항상 참이었지만, 표식이 그것을 거짓으로 만들 수 있게 했다.
 그래서 `--apply` 가 만드는 커밋 메시지에 같은 사실을 적는다.
 
+**2026-11-06 개정(지적 A-R1-004).** 회사 GitLab 에 push 하는 미러 커밋 메시지에는 실제 코드 수정 내역만
+적으므로, `--apply` 가 만든 메시지(이 절 포함)는 로컬 커밋까지만 남고 push 전에 다시 쓴다. 그래서 빈 축의
+영속 기록은 conf 의 `AXES_INTENTIONALLY_EMPTY` 선언과 [GitLab 최소화](#gitlab-최소화-2026-11-06) 절의 쌍별
+표다. 빈 축을 새로 선언하면 그 표에 함께 적는다. 2026-11-06 현재 의도적으로 비운 축은 `imx-gst`·`imx-hantro`
+의 `MIRROR_ONLY` 뿐이다(미러에만 있는 파일이 없다).
+
 ```
 어서션 6종 통과:
   ASSERT_A_UPSTREAM_ONLY_INFLOW
@@ -195,7 +201,7 @@ AXES_INTENTIONALLY_EMPTY=( UPSTREAM_ONLY FORBID )
 없음`). `[주의]` 블록은 분류 표 앞에 나와 긴 쌍에서는 화면 밖으로 밀리지만, 어서션 블록은
 사람이 go/no-go 를 판단하는 마지막 화면이라 그 자리에도 `0종` 이 드러나야 하기 때문이다.
 축별 대가는 위 [축이 비면 무엇이 꺼지는가](#축이-비면-무엇이-꺼지는가) 표에 있고, 같은 사실이
-`--apply` 의 커밋 메시지에도 남는다.
+`--apply` 의 로컬 커밋 메시지에도 남는다(push 전에 다시 쓴다 — [커밋 메시지에도 남는다](#커밋-메시지에도-남는다) 절).
 
 | 어서션 | 무엇을 막는가 | 오라클 |
 |---|---|---|
@@ -392,7 +398,9 @@ mirror-sync — 큐레이션 미러 싱크
 
 이식한 결과는 `--apply` 전에 커밋해 두거나(미러가 dirty 하면 `--apply` 가 거부한다), 아니면
 `--apply` 를 먼저 돌려 싱크 커밋을 만든 뒤 별도 커밋으로 이식한다. 어느 쪽이든 이식분과 자동
-복사분이 한 커밋에 섞이지 않는 편이 나중에 읽기 쉽다.
+복사분이 한 커밋에 섞이지 않는 편이 나중에 읽기 쉽다. 후자라면 이식 커밋을 만들기 전에 4단계의
+메시지 재작성(`commit --amend`)부터 한다 — 이식 커밋을 만든 뒤에는 `--amend` 가 싱크 커밋이 아니라
+이식 커밋을 고친다.
 
 **3) `--apply` 로 적용한다.** 복사 → 어서션 → 미러 **로컬 커밋**까지다.
 
@@ -413,11 +421,18 @@ chore: sync curated mirror — upstream <from_short>..<to_short>
 본문에는 범위·4분류 합계·통과한 어서션 6종 이름·신규 반입 목록·수동 이식 대기 `KEEP_MIRROR`
 목록이 들어간다. 스테이지된 변경이 없으면 커밋을 생략하고 0 으로 끝난다.
 
-**4) 사람이 확인하고 push 한다.** 스크립트는 여기까지 오지 않는다.
+**4) 사람이 확인하고, 커밋 메시지를 다시 쓴 뒤 push 한다.** 스크립트는 여기까지 오지 않는다.
+회사 GitLab 커밋 메시지에는 실제 코드 수정 내역만 적으므로 `--apply` 가 만든 메시지는 push 전에
+다시 쓴다([GitLab 최소화](#gitlab-최소화-2026-11-06) 절). `commit --amend` 는 HEAD 하나만 고치므로
+싱크 커밋을 만든 직후, 다른 커밋을 만들기 전에 다시 쓴다. push 직전에는 아직 push 하지 않은
+커밋(`@{u}..HEAD`)에 자동 메시지가 남지 않았는지 확인하고, 남아 있으면 `git -C <미러> rebase -i @{u}`
+에서 그 커밋을 `reword` 로 고친다. `--apply` 를 여러 번 돌려 싱크 커밋이 여럿인 경우도 이 확인이 잡는다.
 
 ```bash
-git -C /home/jhw/ai/opencode/projects/max9296-gitlab log -1 -p   # 내용 확인
-git -C /home/jhw/ai/opencode/projects/max9296-gitlab push        # 사람이 직접
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab log -1 -p        # 내용 확인
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab commit --amend   # 메시지를 실제 코드 수정 내역으로 다시 쓴다
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync'   # 아무것도 안 나와야 한다
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab push             # 사람이 직접
 ```
 
 ### 종료 코드
@@ -437,7 +452,7 @@ git -C /home/jhw/ai/opencode/projects/max9296-gitlab push        # 사람이 직
 |---|---|
 | `bin/mirror-sync.sh` | **본체**. 분류 · dry-run 출력 · 복사 · 어서션 · 미러 로컬 커밋 (push 없음) |
 | `config/pairs.tsv` | **대상 쌍 단일 소스**. 탭 7컬럼 (base / github remote / gitlab remote / upstream 경로 / mirror 경로 / upstream 브랜치 / mirror 브랜치) |
-| `config/curation/<base>.conf` | 쌍별 큐레이션 규칙. 다섯 축을 **bash 배열**로 정의하고 `bin/mirror-sync.sh` 가 source 한다 (선택 축 `MUST_SURVIVE_IN` · `AXES_INTENTIONALLY_EMPTY` 포함). 현재 `max9296` · `gstApp` · `imx-vpu` · `sc16is7xx` · `pim-summit-backports` 5장 |
+| `config/curation/<base>.conf` | 쌍별 큐레이션 규칙. 다섯 축을 **bash 배열**로 정의하고 `bin/mirror-sync.sh` 가 source 한다 (선택 축 `MUST_SURVIVE_IN` · `AXES_INTENTIONALLY_EMPTY` 포함). 현재 `max9296` · `gstApp` · `imx-vpu` · `sc16is7xx` · `pim-summit-backports` · `imx-gst` · `imx-hantro` 7장 |
 | `tests/mirror-sync-test.sh` | mock git 저장소 기반 테스트. 어서션 6종이 **되돌리면 실패하는지**까지 확인하고, 실제 쌍이 있는 호스트에서는 배포 conf 를 dry-run 으로 스모크한다 |
 | `install.sh` | `~/.local/bin` 심링크 + 실행 비트. 재실행 안전 |
 | `README.md` | 이 문서 |
@@ -540,6 +555,84 @@ README와 미러 문서 두 개는 파일에 묶은 필수 문자열 검사로 �
 현재 스모크 범위 `280e882..39fb8df`는 복사 5, 보존 1, 미반입 0, 미삭제 2를 기대한다.
 이미 반입한 `.clangd`와 `.env.example`은 신규 파일로 세지 않는다.
 
+## GitLab 최소화 (2026-11-06)
+
+personal-ops 이슈 #72. 회사 GitLab 미러에는 소스·빌드 파일, 코드를 검증하는 테스트와 그 의존
+파일, 빌드·사용에 필요하거나 코드·README·빌드가 인용하는 문서, 미러 전용 패키지 출처 문서만
+둔다. 측정·실험 도구, 조사·검증 기록, 원시 데이터·로그, 에이전트 지침, CI·편집기 설정은 각
+conf 의 `UPSTREAM_ONLY` 로 막는다. 지울 경로는 스크립트의 `glob_to_ere()` 로 계산해 미러에서
+먼저 지운 뒤(정리 커밋) 싱크했다 — 정리 전에 새 conf 로 `--apply` 하면 `ASSERT_A` 가 막는다.
+
+| 쌍 | 미러에서 뺀 파일 | 반영한 upstream 구간 | 정리 후 싱크 기준 |
+|---|---|---|---|
+| `max9296` | 39 — FPS·360p 측정 도구와 그 테스트·픽스처, `dw100-spike/`, 360p 검증 기록, `RELEASE_NOTES.md`, `.clangd` | `fbd85f8..43b14c3` (신규 테스트 2개 반입) | `43b14c3` |
+| `gstApp` | 4 — `AGENTS.md`, 녹화 오차 측정 스크립트, 보드 실행 시험 스크립트 2개. 미러 전용 `README.md` 추가, 검증 문서 2개는 보드 IP 치환본 | `f9dfa60..973b1d7` (소스 검사 3개 반입) | `973b1d7` |
+| `imx-vpu` | 79 — vendor 문서·PDF, `imx-player`·`gplay`, Android 빌드 파일, 빈 `AUTHORS` 류, `CHANGELOG.md` | `1f55ed4..d61eaf9` | `d61eaf9` |
+| `sc16is7xx` | 2 — 80 MHz 조사 문서, 루프백 측정기 | 반영할 파일 없음(`0b96d5e..98bbf1f` 은 공용 CI 뿐) | `98bbf1f` |
+| `pim-summit-backports` | 1 — `.clangd` | 없음 | `39fb8df` |
+| `imx-gst` | 1 — `CHANGELOG.md`. `README.md` 는 미러판. 의도적으로 비운 축 `MIRROR_ONLY` | 없음 — upstream `ed36938` 스냅샷으로 시작(upstream 이력 없음) | `ed36938` |
+| `imx-hantro` | 1 — `CHANGELOG.md`. `README.md` 는 미러판. 의도적으로 비운 축 `MIRROR_ONLY` | 없음 — upstream `c37edf1` 스냅샷으로 시작(upstream 이력 없음) | `c37edf1` |
+
+정리한 네 쌍(`max9296`·`gstApp`·`imx-vpu`·`sc16is7xx`)은 미러를 새로 클론해 SDK 로 실제
+빌드했다(`make-for-imx8` / `build.sh`). `max9296` 은 `tests/run_health_tests.sh` 의 13개도
+통과했다. `pim-summit-backports` 는 `.clangd` 와 README 한 문장만 바뀌어 빌드하지 않았다.
+
+**`imx-gst`·`imx-hantro` 를 편입했다(2026-11-06).** 두 미러는 upstream 이력 없이 큐레이션 스냅샷 커밋
+하나로 시작했다. upstream 트리(`imx-gst` `ed36938`, `imx-hantro` `c37edf1`)에서 아무도 인용하지 않는
+`CHANGELOG.md` 를 빼고, `README.md` 는 GitHub 저장소·이슈 링크를 빼고 이력 없는 스냅샷에 맞지 않는
+커밋·`git log` 안내를 고친 미러판(`KEEP_MIRROR`)으로 바꿨다. 나머지 파일은 upstream 과 같다. `FORBID` 의
+`github.com/jhw7500` 은 upstream 에서 `README.md` 에만 있어 미러판의 앵커다. `imx-gst` 소스 트리 안의
+`192.168.x` 주소가 든 9개 파일은 GStreamer 원본 예제·테스트라 그대로 둔다. 미러에만 있는 파일이 없어
+`MIRROR_ONLY` 는 의도적으로 비웠다.
+
+**싱크 기준은 이 표가 정본이다.** 회사 GitLab 커밋 메시지에는 실제 코드 수정 내역만 적는다 —
+이슈·PR 번호, URL, sha, 도구 이름, 경위, Change Evidence 헤딩을 넣지 않는다. 그래서 `--apply` 가
+만드는 `chore: sync curated mirror — upstream <from>..<to>` 메시지는 push 전에 실제 변경
+내용으로 다시 쓴다. 다음 싱크의 `--from` 은 이 표의 싱크 기준으로 정하고, 싱크한 뒤에는 이 표를
+갱신한다 — 표를 갱신하지 않은 채 `--from` 을 새로 잡으면 그 사이 upstream 변경이 조용히 빠진다.
+커밋 제목만 보면 안 된다 — `gstApp` 의 2026-10-16 싱크(`2de96d5..f9dfa60`)도
+이렇게 다시 쓰여 제목에 범위가 없다.
+
+**`max9296` 은 GitLab 이력을 다시 썼다.** 2026-08-12~08-19 커밋에 남아 있던 세션 인계 파일과
+보드 사설 IP 를 이력에서 지웠다. 패키지 기준 태그(`pim-package-master-v2.3` = `a24ebac`)와
+`docs/pim-package-binary.md` 가 고정한 SHA 는 그보다 앞이라 바뀌지 않았다(커밋 122개 중 60개는
+해시 그대로). 바뀐 SHA 를 인용하던 두 곳은 새 SHA 로 고쳤다(`ec3bad4`→`660d9f6`,
+`219f877`→`8938924`).
+
+**`gstApp` 도 GitLab 이력을 다시 썼다**(review-fix round 1, 지적 A-R1-001). 2026-08-13 부터 이력 7커밋과
+tip 의 복사 대상 3파일(`docs/CAMERA_SYNC_VALIDATION.md`, `docs/RTSP_CLIENT_SYNC_REQUIREMENTS.md`,
+`test/run-sync-config-cli-test.sh`)에 보드 대역 IP 가 있었다. 이력의 IP 를 `<board-ip>` 로 바꿨고(커밋
+278개 중 93개 SHA 변경, 패키지 기준 태그 `pim-package-master-v2.0` = `984c887` 은 그보다 앞이라 불변),
+바뀐 SHA 인용 `cfaf40b`→`efc22ce` 를 고쳤다. 코드가 인용하는 검증 문서 2개는 IP 치환 `KEEP_MIRROR`
+판으로 두고, 보드에 배포해 도는 시험 스크립트 2개(`test/run-sync-config-cli-test.sh`,
+`test/run-cfgjson-test.sh`)는 `UPSTREAM_ONLY` 로 뺐다.
+
+**보드 사설 주소 대역 `192.168.214.` 은 일곱 쌍 모두 `FORBID` 로 막는다**(`max9296` 은 `jhw-control` 도).
+`max9296` 의 `CHANGELOG.md`·`docs/health-raw-v1.md` 와 `gstApp` 의 검증 문서 2개는 IP 를 `<board-ip>` 로
+바꾼 미러 판이고, 이 대역이 그 앵커다. 다른 대역의 주소 3곳(`gstApp` 의 소스·단위 테스트 주석)과
+`pim-summit-backports` 문서의 회사 GitLab 주소는 그대로 둔다. 이로써 `pim-summit-backports` 에는
+의도적으로 비운 축이 없다.
+
+**죽은 패턴 하나를 뺐다.** `imx-vpu` 의 `imx-vpuwrap/aarch64-poky-linux-libtool` 은 upstream 이
+2026-09-11 추적을 끊어 어느 트리에도 없다. 다시 생기면 `ASSERT_F` 가 신규 반입 승인을 요구한다.
+
+**스모크 기대값.** `max9296` 은 새 패턴의 파일이 모두 있는 `43b14c3` 으로 끝점을 옮겼다(`gstApp` 이
+2026-10-16 에 `f9dfa60` 으로 옮긴 것과 같은 이유). 각 쌍의 유출 정규식에 이번에 막은 경로를 더해
+규칙이 빠지면 스모크가 실패하게 했다. 단 막은 경로가 스모크 범위에서 바뀌는 경우에만 성립한다(지적
+A-R1-003, 2026-11-06 실측: `max9296` 20/20, `gstApp` 6/6, `sc16is7xx` 2/2, `pim-summit-backports` 1/1,
+`imx-vpu` 는 `CHANGELOG.md` 만). `imx-vpu` 의 vendor 정리 패턴 11개는 스모크 범위(`d8e9590..87deeb7`)에서
+바뀐 파일이 없어 규칙이 빠져도 스모크가 잡지 못한다 — 실제 싱크에서 그 경로가 바뀌면 미러에 없는
+파일이라 `ASSERT_F`(신규 반입 승인)가 멈춘다. 보드 대역 `FORBID` 는 일곱 conf 를 직접 읽는 검사가 지킨다.
+
+**남은 파일이 뺀 경로를 인용할 수 있다**(지적 A-R1-002). 소스 주석·분석 문서·이력 문서가 미러에서 뺀
+문서·도구를 가리키는 곳이 남는다. 2026-11-06 미러 끝을 뺀 경로의 주요 이름으로 grep 한 결과:
+`max9296` 은 `exposure-limits` 를 3파일(`max9296_360p_policy.h` 포함), `cam_fps_` 를 6파일이 가리키고
+`CHANGELOG.md` 가 360p 검증 기록과 `RELEASE_NOTES.md` 를 언급한다. `gstApp` 은 검증 문서 1파일,
+`imx-vpu` 는 4파일(`.gitignore`·`Makefile.am`·`recorder_engine.c`·`SCR-imx-vpuwrap.txt`),
+`pim-summit-backports` 는 `make-for-imx8` 주석 1곳이다. 이 파일들을 미러 전용판으로 고치면 upstream 이
+바뀔 때마다 수동 이식이 늘어나므로 그대로 두고, GitLab 에서 그 링크는 깨진다. 정리 후 빌드는 실제 빌드로
+확인했지만, 인용 대상이 런타임 경로에서 쓰이는지는 확인하지 않았다.
+
 ## 쌍별 상태 (2026-09-05)
 
 아래는 당시 조사 기록이다. 이후 `pim-summit-backports` 규칙은 위의 2026-09-12 절을 따른다.
@@ -621,7 +714,8 @@ upstream 로컬 클론이 다른 브랜치에 체크아웃돼 있거나 dirty �
 - upstream 전용 파일이 전부 복사 대상이 된다. 남는 경로 단위 방어선은 `ASSERT_F` 뿐이다 —
   미러에 없던 파일의 신규 반입에 `--allow-new` 승인을 요구한다. 실제로 전 범위 dry-run 이
   `.clangd` 1건을 '신규 반입' 으로 세워 보여 준다.
-- 같은 사실이 `--apply` 의 미러 커밋 메시지에도 `의도적으로 비운 축` 절로 남는다.
+- 같은 사실이 `--apply` 의 로컬 커밋 메시지에도 `의도적으로 비운 축` 절로 남는다(2026-11-06 부터 push 전에
+  다시 쓰며, 영속 기록은 [GitLab 최소화](#gitlab-최소화-2026-11-06) 절의 표다).
 
 `FORBID` 는 비우지 않았다. 위 정정대로 `.cache/` 한 줄을 쓰고, 그것이 `KEEP_MIRROR` 의
 `.gitignore` 앵커다 — 미러 판이 upstream 판의 **순수 부분집합**이라 `MUST_SURVIVE` 로는
@@ -705,7 +799,7 @@ upstream 판의 **진부분집합**이라(줄 단위 비교에서 미러에만 �
 | 항목 | `max9296` | `gstApp` | `imx-vpu` | `sc16is7xx` | `pim-summit-backports` |
 |---|---|---|---|---|---|
 | upstream 기준 (`master`) | `4fa9881` | `77a2635` | `87deeb7` | `093e069` | `28997d8` |
-| mirror 기준 | `main` `ec3bad4` | `main` `cfaf40b` | `main` `f9e5699` | `main` `6c09f62` | `develop` `badf083` |
+| mirror 기준 | `main` `660d9f6` | `main` `efc22ce` | `main` `f9e5699` | `main` `6c09f62` | `develop` `badf083` |
 | upstream 파일 수 | 341 | 131 | 312 | 22 | 7 |
 | mirror 파일 수 | 65 | 77 | 288 | 9 | 8 |
 | 공통 파일 | 64 | 76 | 287 | 8 | 6 |
@@ -717,6 +811,10 @@ upstream 판의 **진부분집합**이라(줄 단위 비교에서 미러에만 �
 | `MIRROR_ONLY` | 1 | 1 | 1 | 1 | 2 |
 | `FORBID` | 3 | 5 | 4 | 5 | 1 (`.cache/`) |
 | `MUST_SURVIVE` | 6 | 2 | 4 | 4 | 4 |
+
+`max9296` 의 mirror 기준 `660d9f6` 은 2026-11-06 GitLab 이력 정리 전 SHA `ec3bad4` 이고, `gstApp` 의
+`efc22ce` 는 같은 날 정리 전 SHA `cfaf40b` 다(위 [GitLab 최소화](#gitlab-최소화-2026-11-06) 절). 나머지 값은
+측정 시점 그대로다.
 
 `KEEP_MIRROR` 개수는 다섯 쌍 모두 "공통 중 내용 다름" 과 정확히 같다 — 내용이 다른 공통 파일을
 빠짐없이 보존 대상으로 잡았다는 뜻이다.
@@ -787,7 +885,8 @@ clean 한 미러에서만 시작하므로 **싱크 자신이 A·D 위반을 만�
 위 [새 쌍 추가](#새-쌍-추가) 로 쌍을 늘렸으면 그 쌍의 `smoke_real_pair` 행도 같이 추가한다.
 기대값은 [실측 기준값](#실측-기준값)의 dry-run 합계를 그대로 쓰되, **그 쌍이 무엇을 정상으로
 보는지**까지 봐야 한다. `pim-summit-backports`는 2026-09-05에는 `.clangd` 신규 반입 1건을
-기대했지만, 2026-09-12 반영 후에는 신규 반입 없음과 빈 축 2개의 경고를 기대한다.
+기대했지만, 2026-09-12 반영 후에는 신규 반입 없음과 빈 축 2개의 경고를, 2026-11-06 에 `.clangd` 를
+`UPSTREAM_ONLY` 로 옮긴 뒤에는 빈 축 1개(`FORBID`)의 경고를 기대한다.
 
 ## 관련
 

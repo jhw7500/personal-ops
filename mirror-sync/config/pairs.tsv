@@ -69,3 +69,9 @@ sc16is7xx	https://github.com/jhw7500/sc16is7xx.git	http://192.168.10.2:31406/hwj
 #
 # 미러 기본 브랜치는 main 이 아니라 develop 이다 (2026-09-05 당시 둘 다 badf083).
 pim-summit-backports	https://github.com/jhw7500/pim-summit-backports.git	http://192.168.10.2:31406/hwjo/pim-summit-backports	/home/jhw/ai/opencode/projects/pim-summit-backports	/home/jhw/ai/opencode/projects/pim-summit-backports-gitlab	master	develop
+
+# ── imx-gst · imx-hantro — 2026-11-06 편입 (이슈 #72) ─────────────────────────
+# upstream 이력 없이 큐레이션 스냅샷(imx-gst ed36938, imx-hantro c37edf1)으로 미러를 시작했다.
+# 두 쌍 모두 upstream master → mirror main 이다. 싱크 기준은 mirror-sync/README.md 의 쌍별 표가 정본이다.
+imx-gst	https://github.com/jhw7500/imx-gst.git	http://192.168.10.2:31406/hwjo/imx-gst	/home/jhw/ai/opencode/projects/imx-gst	/home/jhw/ai/opencode/projects/imx-gst-gitlab	master	main
+imx-hantro	https://github.com/jhw7500/imx-hantro.git	http://192.168.10.2:31406/hwjo/imx-hantro	/home/jhw/ai/opencode/projects/imx-hantro	/home/jhw/ai/opencode/projects/imx-hantro-gitlab	master	main
