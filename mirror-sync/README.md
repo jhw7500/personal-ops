@@ -427,11 +427,14 @@ chore: sync curated mirror — upstream <from_short>..<to_short>
 싱크 커밋을 만든 직후, 다른 커밋을 만들기 전에 다시 쓴다. push 직전에는 아직 push 하지 않은
 커밋(`@{u}..HEAD`)에 자동 메시지가 남지 않았는지 확인하고, 남아 있으면 `git -C <미러> rebase -i @{u}`
 에서 그 커밋을 `reword` 로 고친다. `--apply` 를 여러 번 돌려 싱크 커밋이 여럿인 경우도 이 확인이 잡는다.
+확인 패턴은 자동 메시지의 문단마다 있는 표지(제목, 범위 줄의 `upstream <sha>..<sha>`, `ASSERT_` 이름,
+`AXES_INTENTIONALLY_EMPTY`, `--allow-new`, `KEEP_MIRROR`, `mirror-sync`)를 잡으므로, 제목만 고치고 나머지
+문단을 남긴 메시지도 걸린다.
 
 ```bash
 git -C /home/jhw/ai/opencode/projects/max9296-gitlab log -1 -p        # 내용 확인
 git -C /home/jhw/ai/opencode/projects/max9296-gitlab commit --amend   # 메시지를 실제 코드 수정 내역으로 다시 쓴다
-git -C /home/jhw/ai/opencode/projects/max9296-gitlab log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync'   # 아무것도 안 나와야 한다
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync|upstream [0-9a-f]{7,}\.\.[0-9a-f]{7,}|ASSERT_[A-F]_|AXES_INTENTIONALLY_EMPTY|KEEP_MIRROR|--allow-new'   # 아무것도 안 나와야 한다
 git -C /home/jhw/ai/opencode/projects/max9296-gitlab push             # 사람이 직접
 ```
 
