@@ -1299,9 +1299,12 @@ EOF
     msg ""
     msg "미러 로컬 커밋 완료: $new_sha  ($MI_REPO, 브랜치 $MI_BRANCH)"
     msg "push 는 하지 않았다 — 이 스크립트의 최대 범위는 로컬 커밋이다."
-    msg "내용을 확인한 뒤, push 전에 이 커밋 메시지를 실제 코드 수정 내역으로 다시 써라"
+    msg "내용을 확인한 뒤, 다른 커밋을 만들기 전에 이 커밋 메시지를 실제 코드 수정 내역으로 다시 써라"
     msg "(회사 GitLab 커밋 메시지 규칙, README 'GitLab 최소화 (2026-11-06)' 절):"
     msg "  git -C $MI_REPO commit --amend"
+    msg "push 직전에는 아직 push 하지 않은 커밋에 자동 메시지가 남지 않았는지 확인해라(아무것도 안 나와야 한다):"
+    msg "  git -C $MI_REPO log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync'"
+    msg "남아 있으면 git -C $MI_REPO rebase -i @{u} 에서 그 커밋을 reword 로 고친다."
     msg "그다음 사람이 직접 push 해라:  git -C $MI_REPO push"
 
     print_manual_block

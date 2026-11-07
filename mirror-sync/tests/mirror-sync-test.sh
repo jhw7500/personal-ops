@@ -673,15 +673,17 @@ check_out_has "--apply 어서션 D 통과" "[PASS] ASSERT_D_MIRROR_ONLY_DELETED"
 check_out_has "--apply 어서션 E 통과" "[PASS] ASSERT_E_STAGED_AS_REPORTED"
 check_out_has "--apply 어서션 F 통과" "[PASS] ASSERT_F_NEW_FILE_INFLOW"
 check_out_has "--apply 는 push 하지 않았음을 알린다" "push 는 하지 않았다"
-# 회사 GitLab 에는 실제 코드 수정 내역만 적은 메시지를 올리므로, push 안내보다 커밋 메시지
-# 재작성(commit --amend) 안내가 먼저 나와야 한다 (README 'GitLab 최소화 (2026-11-06)' 절).
+# 회사 GitLab 에는 실제 코드 수정 내역만 적은 메시지를 올리므로, 커밋 메시지 재작성(commit --amend)
+# 안내와 push 직전 확인 명령(@{u}..HEAD)이 push 안내보다 이 순서로 먼저 나와야 한다
+# (README 'GitLab 최소화 (2026-11-06)' 절).
 AMEND_AT="$(printf '%s\n' "$RUN_OUT" | grep -nF -- "commit --amend" | head -1 | cut -d: -f1)"
+CHECK_AT="$(printf '%s\n' "$RUN_OUT" | grep -nF -- "@{u}..HEAD" | head -1 | cut -d: -f1)"
 PUSH_AT="$(printf '%s\n' "$RUN_OUT" | grep -nE -- 'git -C .+ push$' | head -1 | cut -d: -f1)"
-if [[ -n "$AMEND_AT" && -n "$PUSH_AT" ]] && (( AMEND_AT < PUSH_AT )); then
-    pass "--apply 는 push 안내보다 커밋 메시지 재작성 안내를 먼저 찍는다"
+if [[ -n "$AMEND_AT" && -n "$CHECK_AT" && -n "$PUSH_AT" ]] && (( AMEND_AT < CHECK_AT && CHECK_AT < PUSH_AT )); then
+    pass "--apply 는 재작성 안내 → push 직전 확인 → push 안내 순서로 찍는다"
 else
-    fail "--apply 는 push 안내보다 커밋 메시지 재작성 안내를 먼저 찍는다" \
-        "commit --amend 줄이 push 줄보다 앞" "amend=${AMEND_AT:-없음} push=${PUSH_AT:-없음}"
+    fail "--apply 는 재작성 안내 → push 직전 확인 → push 안내 순서로 찍는다" \
+        "amend < check < push" "amend=${AMEND_AT:-없음} check=${CHECK_AT:-없음} push=${PUSH_AT:-없음}"
 fi
 # A·B 의 [PASS] 문구는 검사 기준의 종수를 함께 찍는다. 축이 살아 있는 이 세계에서
 # '0종' 이 나오면 축이 죽었다는 뜻이다.
@@ -753,10 +755,41 @@ if grep -qE '(^| )push( |$)' "$GIT_LOG"; then
 else
     pass "push 검증: git push 를 한 번도 실행하지 않았다 ($(wc -l < "$GIT_LOG")회 git 호출 관측)"
 fi
+# --apply 가 안내한 push 직전 확인 명령. 아래에서 이 명령 자체가 남은 자동 메시지를 잡는지 본다.
+PUSH_CHECK_CMD="git -C $W_MI log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync'"
+check_out_has "push 검증: push 직전 확인 명령을 안내한다" "  $PUSH_CHECK_CMD"
 
 run_sync --pair mock --from "$W_FROM" --to "$W_TO" --push
 check_eq "push 검증: --push 플래그는 종료 코드 1 로 거부" "1" "$RUN_RC"
 check_out_has "push 검증: 거부 사유를 알린다" "push 는 이 스크립트가 하지 않는다"
+
+# 안내한 확인 명령이 실제로 남은 자동 메시지를 잡는가. 미러가 origin/main 을 upstream 으로 두고
+# --apply 의 싱크 커밋이 아직 push 되지 않은 상태에서 시작한다. 싱크 커밋 뒤에 이식 커밋을 만들고
+# 그 커밋만 amend 하는 순서(commit --amend 는 HEAD 만 고친다)에서도 잡아야 하고, 아직 push 하지
+# 않은 커밋을 모두 다시 쓰면 아무것도 나오지 않아야 한다.
+git -C "$W_MI" fetch -q origin
+git -C "$W_MI" branch -q --set-upstream-to=origin/main main
+PUSH_CHECK_OUT="$(bash -c "$PUSH_CHECK_CMD" 2>&1)"
+if printf '%s\n' "$PUSH_CHECK_OUT" | grep -qF "sync curated mirror"; then
+    pass "push 직전 확인: 다시 쓰지 않은 싱크 커밋의 자동 메시지를 잡는다"
+else
+    fail "push 직전 확인: 다시 쓰지 않은 싱크 커밋의 자동 메시지를 잡는다" "sync curated mirror 포함" "$PUSH_CHECK_OUT"
+fi
+wfile "$W_MI" "docs/ported-note.md" <<'EOF'
+수동 이식분 (테스트용)
+EOF
+commit_all "$W_MI" "port: mirror note"
+git -C "$W_MI" commit -q --amend -m "Update the mirror note"
+PUSH_CHECK_OUT="$(bash -c "$PUSH_CHECK_CMD" 2>&1)"
+if printf '%s\n' "$PUSH_CHECK_OUT" | grep -qF "sync curated mirror"; then
+    pass "push 직전 확인: 이식 커밋만 amend 해도 그 아래 싱크 커밋의 자동 메시지를 잡는다"
+else
+    fail "push 직전 확인: 이식 커밋만 amend 해도 그 아래 싱크 커밋의 자동 메시지를 잡는다" "sync curated mirror 포함" "$PUSH_CHECK_OUT"
+fi
+git -C "$W_MI" reset -q --soft '@{u}'
+git -C "$W_MI" commit -q -m "Update sources and the mirror note"
+PUSH_CHECK_OUT="$(bash -c "$PUSH_CHECK_CMD" 2>&1)"
+check_eq "push 직전 확인: 아직 push 하지 않은 커밋을 모두 다시 쓰면 아무것도 나오지 않는다" "" "$PUSH_CHECK_OUT"
 
 # ══════════════════════════════════════════════════════════════════════════
 printf -- '\n--- 5. 어서션 — 되돌리면 실패하는가 (최소 쌍) ---\n'
