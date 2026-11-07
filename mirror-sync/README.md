@@ -398,7 +398,9 @@ mirror-sync — 큐레이션 미러 싱크
 
 이식한 결과는 `--apply` 전에 커밋해 두거나(미러가 dirty 하면 `--apply` 가 거부한다), 아니면
 `--apply` 를 먼저 돌려 싱크 커밋을 만든 뒤 별도 커밋으로 이식한다. 어느 쪽이든 이식분과 자동
-복사분이 한 커밋에 섞이지 않는 편이 나중에 읽기 쉽다.
+복사분이 한 커밋에 섞이지 않는 편이 나중에 읽기 쉽다. 후자라면 이식 커밋을 만들기 전에 4단계의
+메시지 재작성(`commit --amend`)부터 한다 — 이식 커밋을 만든 뒤에는 `--amend` 가 싱크 커밋이 아니라
+이식 커밋을 고친다.
 
 **3) `--apply` 로 적용한다.** 복사 → 어서션 → 미러 **로컬 커밋**까지다.
 
@@ -419,11 +421,18 @@ chore: sync curated mirror — upstream <from_short>..<to_short>
 본문에는 범위·4분류 합계·통과한 어서션 6종 이름·신규 반입 목록·수동 이식 대기 `KEEP_MIRROR`
 목록이 들어간다. 스테이지된 변경이 없으면 커밋을 생략하고 0 으로 끝난다.
 
-**4) 사람이 확인하고 push 한다.** 스크립트는 여기까지 오지 않는다.
+**4) 사람이 확인하고, 커밋 메시지를 다시 쓴 뒤 push 한다.** 스크립트는 여기까지 오지 않는다.
+회사 GitLab 커밋 메시지에는 실제 코드 수정 내역만 적으므로 `--apply` 가 만든 메시지는 push 전에
+다시 쓴다([GitLab 최소화](#gitlab-최소화-2026-11-06) 절). `commit --amend` 는 HEAD 하나만 고치므로
+싱크 커밋을 만든 직후, 다른 커밋을 만들기 전에 다시 쓴다. push 직전에는 아직 push 하지 않은
+커밋(`@{u}..HEAD`)에 자동 메시지가 남지 않았는지 확인하고, 남아 있으면 `git -C <미러> rebase -i @{u}`
+에서 그 커밋을 `reword` 로 고친다. `--apply` 를 여러 번 돌려 싱크 커밋이 여럿인 경우도 이 확인이 잡는다.
 
 ```bash
-git -C /home/jhw/ai/opencode/projects/max9296-gitlab log -1 -p   # 내용 확인
-git -C /home/jhw/ai/opencode/projects/max9296-gitlab push        # 사람이 직접
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab log -1 -p        # 내용 확인
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab commit --amend   # 메시지를 실제 코드 수정 내역으로 다시 쓴다
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync'   # 아무것도 안 나와야 한다
+git -C /home/jhw/ai/opencode/projects/max9296-gitlab push             # 사람이 직접
 ```
 
 ### 종료 코드
