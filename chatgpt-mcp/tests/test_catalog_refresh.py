@@ -128,6 +128,79 @@ class CatalogRefreshTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["status"], "notification_sent")
         self.assertFalse(status["catalog_refetched"])
 
+    async def test_successful_external_list_is_observed_after_the_catalog_is_complete(self):
+        observed = []
+        refresh = CatalogRefresh(
+            {"personal-ops": object()},
+            catalog_observer=lambda tools, generation: observed.append((tools, generation)),
+            generation_factory=lambda: "a" * 64)
+        session = Session()
+        catalog = [{"name": "one"}, {"name": "two"}]
+
+        listed = await refresh.list_tools(
+            session, lambda: asyncio.sleep(0, result=catalog), client_requested=True)
+
+        self.assertIs(listed, catalog)
+        self.assertEqual(observed, [(catalog, "a" * 64)])
+
+    async def test_catalog_observation_failure_does_not_break_external_list(self):
+        def fail(_tools, _generation):
+            raise RuntimeError("private observation detail")
+
+        refresh = CatalogRefresh(
+            {"personal-ops": object()}, catalog_observer=fail)
+        session = Session()
+
+        with self.assertLogs("catalog_refresh", level="WARNING") as logs:
+            listed = await refresh.list_tools(session, self._catalog, client_requested=True)
+
+        self.assertEqual(listed, ["one", "two"])
+        self.assertEqual(refresh.observation_failures, 1)
+        self.assertEqual(refresh.last_observation_code, "CATALOG_OBSERVATION_FAILED")
+        self.assertEqual(logs.output, ["WARNING:catalog_refresh:CATALOG_OBSERVATION_FAILED"])
+        self.assertNotIn("private observation detail", logs.output[0])
+
+    async def test_generation_failure_is_nonfatal_and_reports_bounded_diagnostic(self):
+        def fail_generation():
+            raise RuntimeError("private generation detail")
+
+        refresh = CatalogRefresh(
+            {"personal-ops": object()}, catalog_observer=lambda _tools, _generation: None,
+            generation_factory=fail_generation)
+
+        with self.assertLogs("catalog_refresh", level="WARNING") as logs:
+            listed = await refresh.list_tools(
+                Session(), self._catalog, client_requested=True)
+
+        self.assertEqual(listed, ["one", "two"])
+        self.assertEqual(refresh.observation_failures, 1)
+        self.assertEqual(refresh.last_observation_code, "CATALOG_OBSERVATION_FAILED")
+        self.assertEqual(logs.output, ["WARNING:catalog_refresh:CATALOG_OBSERVATION_FAILED"])
+        self.assertNotIn("private generation detail", logs.output[0])
+
+    async def test_internal_catalog_build_is_not_observed(self):
+        observed = []
+        refresh = CatalogRefresh(
+            {"personal-ops": object()},
+            catalog_observer=lambda tools, generation: observed.append((tools, generation)))
+
+        await refresh.list_tools(Session(), self._catalog, client_requested=False)
+
+        self.assertEqual(observed, [])
+
+    async def test_distinct_external_sessions_use_distinct_evidence_generations(self):
+        observed = []
+        generations = iter(("a" * 64, "b" * 64))
+        refresh = CatalogRefresh(
+            {"personal-ops": object()},
+            catalog_observer=lambda tools, generation: observed.append(generation),
+            generation_factory=lambda: next(generations))
+
+        await refresh.list_tools(Session(), self._catalog, client_requested=True)
+        await refresh.list_tools(Session(), self._catalog, client_requested=True)
+
+        self.assertEqual(observed, ["a" * 64, "b" * 64])
+
     async def test_transport_failure_is_bounded_and_status_reports_failure(self):
         refresh = CatalogRefresh({"personal-ops": object()})
         session = Session(failure=RuntimeError("private transport detail"))

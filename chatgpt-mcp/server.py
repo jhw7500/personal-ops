@@ -15,6 +15,7 @@ import sys
 import uuid
 
 import catalog_refresh
+import runtime_verification
 import project_resume
 from execution import ExecutionPolicy
 from git_workflows import GIT_TOOL_SPECS, GitWorkflows
@@ -278,7 +279,11 @@ async def serve(projects):
     rollout_names = {spec["name"] for spec in rollout_specs}
     rollout_approvals = (runtime_rollout_ui.RuntimeRolloutApprovalTools(runtime_rollouts)
                          if runtime_rollouts is not None else None)
-    catalog = catalog_refresh.CatalogRefresh(projects)
+    catalog = catalog_refresh.CatalogRefresh(
+        projects,
+        catalog_observer=runtime_verification.catalog_observer_for_runtime(
+            MODULE_DIR, state_dir),
+    )
     catalog_specs = catalog_refresh.tool_specs(projects)
     job_specs = job_tool_specs(workspace_enabled=workspace.enabled)
     job_names = {spec["name"] for spec in job_specs}

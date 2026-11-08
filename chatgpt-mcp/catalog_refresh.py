@@ -4,10 +4,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import json
+import logging
+import secrets
 import weakref
 
 
 NAMES = frozenset({"refresh_mcp_catalog", "get_mcp_catalog_refresh_status"})
+LOGGER = logging.getLogger(__name__)
+MAX_OBSERVATION_FAILURES = 2**31 - 1
 
 
 class CatalogRefreshError(ValueError):
@@ -21,6 +25,7 @@ class _SessionState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     request_sequence: int = 0
     status: str = "idle"
+    catalog_generation: str = ""
 
 
 def _schema():
@@ -97,10 +102,14 @@ def tool_specs(projects):
 
 
 class CatalogRefresh:
-    def __init__(self, projects):
+    def __init__(self, projects, *, catalog_observer=None, generation_factory=None):
         self.enabled = "personal-ops" in projects
         self.names = NAMES if self.enabled else frozenset()
         self._states = weakref.WeakKeyDictionary()
+        self._catalog_observer = catalog_observer
+        self._generation_factory = generation_factory or (lambda: secrets.token_hex(32))
+        self.observation_failures = 0
+        self.last_observation_code = None
 
     def validate_arguments(self, name, arguments):
         if name not in self.names:
@@ -155,6 +164,19 @@ class CatalogRefresh:
         async with state.lock:
             observed_sequence = state.request_sequence
         result = await build()
+        if self._catalog_observer is not None:
+            try:
+                if not state.catalog_generation:
+                    state.catalog_generation = self._generation_factory()
+                self._catalog_observer(result, state.catalog_generation)
+            except Exception:
+                # Observation is evidence only. It must never change tools/list.
+                first_failure = self.observation_failures == 0
+                self.observation_failures = min(
+                    self.observation_failures + 1, MAX_OBSERVATION_FAILURES)
+                self.last_observation_code = "CATALOG_OBSERVATION_FAILED"
+                if first_failure:
+                    LOGGER.warning("CATALOG_OBSERVATION_FAILED")
         async with state.lock:
             if (observed_sequence > 0 and state.request_sequence == observed_sequence
                     and state.status == "notification_sent"):

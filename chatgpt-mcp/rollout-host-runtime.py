@@ -61,7 +61,7 @@ TESTS = (
     "tests.test_runtime_install", "tests.test_admin_server",
     "tests.test_rollout_host_runtime", "tests.test_rollout_admin",
     "tests.test_rollout_diagnostics", "tests.test_rollout_tunnel",
-    "tests.test_rollout_catalog",
+    "tests.test_rollout_catalog", "tests.test_runtime_verification", "tests.test_scoped_bootstrap",
     "tests.test_agent_tasks", "tests.test_admin_agent_approval",
     "tests.test_agent_results", "tests.test_agent_runtime_registration",
     "tests.test_agent_bootstrap", "tests.test_agent_probe", "tests.test_agent_code_mode",

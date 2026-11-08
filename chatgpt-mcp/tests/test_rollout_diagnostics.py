@@ -262,6 +262,23 @@ class RolloutDiagnosticsTest(unittest.TestCase):
         self.assertFalse(result["result"]["switched"])
         self.assertEqual(result["result"]["snapshot"], "c" * 20)
 
+    def test_verify_receipt_pins_detail_without_claiming_active_runtime_or_raw_paths(self):
+        receipt = RolloutReceipt(self.root, mode="verify")
+        detail = {"status": "verification_required", "runtime_verified": False,
+                  "tools_registered": False, "server_process_manifest_verified": True,
+                  "server_path_sha256": "a" * 64, "verification_sha256": "b" * 64}
+        receipt.finish(detail, 2)
+        saved = json.loads(receipt.path.read_text())
+        self.assertEqual(saved["exit_code"], 2)
+        self.assertEqual(saved["result"], detail)
+        for invalid in ({"server_process_manifest_verified": 1},
+                        {"server_path_sha256": "/private/server.py"},
+                        {"verification_sha256": "b" * 63},
+                        {"server_path": "/private/server.py"}):
+            with self.subTest(field=next(iter(invalid))):
+                with self.assertRaises(ValueError):
+                    receipt.event("verification", "failed", **invalid)
+
     def test_receipt_rejects_symlink_and_unsafe_metadata(self):
         target = self.root / "other"
         target.mkdir()

@@ -48,11 +48,13 @@ _NODE_LOCATION_SUFFIX = re.compile(rb":[1-9][0-9]{0,9}:[1-9][0-9]{0,9}\Z")
 _LABEL_FIELDS = {"status", "admin_status", "rollback_status", "catalog_status"}
 _CODE_FIELDS = {"code", "cause_code", "output_code"}
 _DIGEST_FIELDS = {"snapshot", "previous_snapshot", "live_snapshot"}
-_HASH_FIELDS = {"stdout_sha256", "stderr_sha256", "control_sha256", "cgroup_sha256"}
+_HASH_FIELDS = {"stdout_sha256", "stderr_sha256", "control_sha256", "cgroup_sha256",
+                "server_path_sha256", "verification_sha256"}
 _TEST_LIST_FIELDS = {"failed_tests"}
 _TEST_FILE_LIST_FIELDS = {"failed_test_files"}
 _BOOL_FIELDS = {"installed", "switched", "tunnel_healthy", "tunnel_id_available",
                 "profile_aligned", "service_aligned", "runtime_verified",
+                "server_process_manifest_verified",
                 "schema_013_applied", "tools_registered", "connector_schemas_verified",
                 "cli_sessions_preserved", "cli_observation_complete", "cgroup_observed",
                 "exit_status_available"}
