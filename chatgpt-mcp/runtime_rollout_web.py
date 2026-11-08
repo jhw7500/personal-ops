@@ -20,6 +20,7 @@ import stat
 import subprocess
 
 import host_access
+from runtime_rollout_scoped_source import select_scoped_source
 from host_runtime_config import HostRuntimeError, TRUSTED_APPROVAL_ORIGIN, private_dir
 from host_runtime_operations import (_digest, _lock, _read_private_json,
                                      _save_private_json, _verified_installation,
@@ -366,6 +367,7 @@ class RuntimeRolloutWeb:
         if PROJECT not in projects:
             raise HostRuntimeError("ROLLOUT_SCOPE_UNAVAILABLE")
         self.root = Path(projects[PROJECT]).resolve(strict=True)
+        self.project_root = self.root
         self.state_root = Path(state_dir).absolute() / "runtime-rollout-web"
         self.activation_authority_dir = self.state_root.parent / "workspace-authority"
         if self.state_root.resolve(strict=False).is_relative_to(self.root):
@@ -566,15 +568,26 @@ class RuntimeRolloutWeb:
         self._save(plan)
         return plan
 
+    def _source_root(self):
+        # No unregistered chat-provided source root. The owner-only
+        # policy is revalidated on every prepare/approval/claim.
+        return select_scoped_source(
+            self.project_root, catalog=_catalog,
+            expected_snapshots=_expected_snapshots)
+
     def _check_source(self, plan):
         fixed = plan["immutable"]
+        source_root, source_mode, policy_digest = self._source_root()
+        if (fixed.get("source_mode", "project") != source_mode
+                or fixed.get("source_policy_digest", "0" * 64) != policy_digest):
+            raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
         frozen = self.snapshots_dir / plan["operation_id"]
         if frozen.is_symlink() or not frozen.is_dir():
             raise HostRuntimeError("ROLLOUT_SNAPSHOT_MISSING")
-        snapshots = [_catalog(self.root), _catalog(frozen)]
+        snapshots = [_catalog(source_root), _catalog(frozen)]
         if any(catalog["digest"] != fixed["source_digest"] for catalog in snapshots):
             raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
-        current_target, current_control = _expected_snapshots(self.root)
+        current_target, current_control = _expected_snapshots(source_root)
         frozen_target, frozen_control = _expected_snapshots(frozen)
         if (current_target != fixed["target_snapshot"] or frozen_target != current_target
                 or current_control != fixed["control_digest"] or frozen_control != current_control):
@@ -609,6 +622,7 @@ class RuntimeRolloutWeb:
         self._trusted_only()
         if project != PROJECT or not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
+        source_root, source_mode, policy_digest = self._source_root()
         from host_runtime_operations import _lock
         with _lock(self.lock):
             for path in self.plans_dir.glob("*.json"):
@@ -628,15 +642,17 @@ class RuntimeRolloutWeb:
             frozen = self.snapshots_dir / operation_id
             frozen.mkdir(mode=0o700)
             try:
-                base = _catalog(self.root, copy_to=frozen)
+                base = _catalog(source_root, copy_to=frozen)
                 staged = _catalog(frozen)
                 if base["digest"] != staged["digest"]:
                     raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
                 target, control = _expected_snapshots(frozen)
-                if _catalog(self.root)["digest"] != base["digest"]:
+                if _catalog(source_root)["digest"] != base["digest"]:
                     raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
                 fixed = {"project": PROJECT, "operation_id": operation_id,
                          "source_digest": base["digest"],
+                         "source_mode": source_mode,
+                         "source_policy_digest": policy_digest,
                          "target_snapshot": target, "control_digest": control,
                          "source_files": base["count"], "source_bytes": base["bytes"],
                          "approval_context": self._current_approval_context(),

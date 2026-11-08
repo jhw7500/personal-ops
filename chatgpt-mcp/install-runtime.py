@@ -18,7 +18,7 @@ FILES = ("server.py", "catalog_refresh.py", "runtime_verification.py", "verify-r
          "host_runtime_tools.py", "host_runtime_web.py", "host_db_migration.py", "host_schema014.py",
          "toss_console_evidence.py", "toss_console_tools.py", "toss_console_sdk_bridge.py",
          "toss_console_codex.py",
-         "runtime_rollout_web.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py", "runtime_rollout_ui.py", "runtime-rollout-approval.html",
+         "runtime_rollout_web.py", "runtime_rollout_scoped_source.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py", "runtime_rollout_ui.py", "runtime-rollout-approval.html",
          "approve-host-operation.py",
          "postgres_job.py", "git_workflows.py", "approve-git-operation.py", "context.yml",
          "project-picker.html", "project_state.py", "admin_server.py",

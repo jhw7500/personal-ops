@@ -69,7 +69,7 @@ TESTS = (
     "tests.test_agent_supervised_runner", "tests.test_agent_host_broker",
     "tests.test_agent_proofs", "tests.test_agent_smoke", "tests.test_agent_profile_setup",
     "tests.test_host_backup_validation",
-    "tests.test_runtime_rollout_web", "tests.test_runtime_rollout_worker",
+    "tests.test_runtime_rollout_web", "tests.test_runtime_rollout_scoped_source", "tests.test_runtime_rollout_worker",
     "tests.test_rollout_bootstrap_compat",
     "tests.test_rollout_workspace_authority",
     "tests.test_admin_runtime_rollout_approval",

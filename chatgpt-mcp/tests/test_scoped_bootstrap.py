@@ -22,7 +22,8 @@ DEFER = ('"list_host_command_profiles", "prepare_host_command",',
          '"list_host_command_profiles", "inspect_host_command_blockers", "prepare_host_command",')
 
 
-def package_bytes(*, extra=None, duplicate=False, manifest_hash=None, special_member=False):
+def package_bytes(*, extra=None, duplicate=False, manifest_hash=None, special_member=False,
+                  unresolved_test_imports=False):
     transforms = {
         "chatgpt-mcp/runtime_rollout_web.py": [("# web anchor\n", "# scoped web\n")],
         "chatgpt-mcp/install-runtime.py": [("# installer anchor\n", "# scoped installer\n")],
@@ -37,10 +38,22 @@ def package_bytes(*, extra=None, duplicate=False, manifest_hash=None, special_me
         "runtime_rollout_scoped_source.py", "scoped-source-release-v1.json",
         "README.md", "INTEGRATION.md", "tests/test_scoped_delivery.py",
         "tests/test_runtime_rollout_scoped_source.py", "tests/test_make_official_rollout_patch.py")}
+    files["runtime_rollout_scoped_source.py"] = (
+        'import json\n\nclass HostRuntimeError(RuntimeError):\n    pass\n\n'
+        'def select_policy(path, project_root):\n'
+        '    if not path.exists() and not path.is_symlink():\n'
+        '        return project_root, "project", "0" * 64\n'
+        '    return "policy"\n\n'
+        'def parse_policy(data):\n    try:\n        return json.loads(data)\n'
+        '    except (ValueError, UnicodeError, TypeError) as exc:\n'
+        '        raise ValueError("SCOPED_POLICY_INVALID") from exc\n').encode()
     # If preparation imports or executes this generator, the fixture fails.
     files["make_official_rollout_patch.py"] = (
         "raise RuntimeError('ZIP CODE MUST NOT EXECUTE')\nROOT_FILES = " + repr(transforms)
         + "\nNEW_FILES = " + repr(new) + "\n").encode()
+    if unresolved_test_imports:
+        files["tests/test_runtime_rollout_scoped_source.py"] = (
+            b"import owner_scoped_delivery\nfrom tests import test_scoped_delivery\n")
     manifest = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
     if manifest_hash:
         manifest["runtime_rollout_scoped_source.py"] = manifest_hash
@@ -95,6 +108,12 @@ class BootstrapPreparationTests(unittest.TestCase):
         self.package = self.base / "approved.zip"
         self.package.write_bytes(package_bytes())
         self.output = self.base / "review"
+        self.native_test = self.base / "native-scoped-test.py"
+        self.native_test.write_text(
+            "import unittest\n\nclass NativeScopedTest(unittest.TestCase):\n"
+            "    def test_repository_native_verification(self):\n"
+            "        self.assertEqual(1 + 1, 2)\n")
+        self.native_test_sha256 = hashlib.sha256(self.native_test.read_bytes()).hexdigest()
 
     def git(self, *args):
         return subprocess.check_output([
@@ -110,7 +129,10 @@ class BootstrapPreparationTests(unittest.TestCase):
         # Only the in-process fixture trust constant changes; CLI has no hash override.
         module = importlib.import_module("scoped_bootstrap")
         digest = hashlib.sha256(self.package.read_bytes()).hexdigest()
-        with patch.object(module, "APPROVED_PACKAGE_SHA256", digest):
+        with patch.object(module, "APPROVED_PACKAGE_SHA256", digest), \
+                patch.object(module, "NATIVE_BOOTSTRAP_TEST", self.native_test, create=True), \
+                patch.object(module, "NATIVE_BOOTSTRAP_TEST_SHA256", self.native_test_sha256,
+                             create=True):
             return module.prepare(self.package, self.source, self.output, **kwargs)
 
     def rejected(self, code):
@@ -154,7 +176,9 @@ class BootstrapPreparationTests(unittest.TestCase):
         # An independent consumer can parse/apply the text only in this disposable fixture.
         self.git("apply", "--check", str(self.output / "bootstrap.patch"))
         self.git("apply", str(self.output / "bootstrap.patch"))
-        self.assertEqual((self.source / "chatgpt-mcp/runtime_rollout_scoped_source.py").read_text(), "# fixture\n")
+        adapter = self.source / "chatgpt-mcp/runtime_rollout_scoped_source.py"
+        self.assertEqual(hashlib.sha256(adapter.read_bytes()).hexdigest(),
+                         result["prepared_file_sha256"]["chatgpt-mcp/runtime_rollout_scoped_source.py"])
         self.assertIn("# scoped web", (self.source / "chatgpt-mcp/runtime_rollout_web.py").read_text())
 
     def test_wrong_outer_hash_is_not_a_cli_override(self):
@@ -169,6 +193,72 @@ class BootstrapPreparationTests(unittest.TestCase):
     def test_inner_hash_mismatch_rejected(self):
         self.package.write_bytes(package_bytes(manifest_hash="0" * 64))
         self.rejected("PACKAGE_CONTENT_MISMATCH")
+
+    def test_bootstrap_uses_reviewed_native_test_instead_of_unprovided_bundle_helpers(self):
+        self.package.write_bytes(package_bytes(unresolved_test_imports=True))
+        result = self.prepare()
+        self.git("apply", str(self.output / "bootstrap.patch"))
+        run = subprocess.run([
+            sys.executable, "-B", "-m", "unittest", "discover", "-s", "chatgpt-mcp/tests",
+            "-p", "test_runtime_rollout_scoped_source.py"], cwd=self.source,
+            capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("Ran 1 test", run.stderr)
+        origin = result["bootstrap_test"]
+        self.assertEqual(origin["origin"], "generator_pinned_source")
+        self.assertEqual(origin["sha256"], hashlib.sha256(self.native_test.read_bytes()).hexdigest())
+        self.assertNotEqual(origin["sha256"], result["package_files"]["tests/test_runtime_rollout_scoped_source.py"])
+
+    def test_bootstrap_adapter_keeps_policy_errors_bounded_and_never_selects_default(self):
+        self.native_test.write_text(
+            'import sys, unittest\nfrom pathlib import Path\n'
+            'sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n'
+            'import runtime_rollout_scoped_source as adapter\n\n'
+            'class NativeAdapterTest(unittest.TestCase):\n'
+            '    def test_unavailable_policy(self):\n'
+            '        class Unavailable:\n'
+            '            def exists(self): return False\n'
+            '            def is_symlink(self): return False\n'
+            '            def lstat(self): raise PermissionError("denied")\n'
+            '        with self.assertRaisesRegex(adapter.HostRuntimeError, "SCOPED_POLICY_UNAVAILABLE"):\n'
+            '            adapter.select_policy(Unavailable(), "project")\n'
+            '    def test_deep_json(self):\n'
+            '        data = "[" * 16000 + "0" + "]" * 16000\n'
+            '        with self.assertRaisesRegex(ValueError, "SCOPED_POLICY_INVALID"):\n'
+            '            adapter.parse_policy(data)\n')
+        self.native_test_sha256 = hashlib.sha256(self.native_test.read_bytes()).hexdigest()
+        result = self.prepare()
+        self.git("apply", str(self.output / "bootstrap.patch"))
+        run = subprocess.run([
+            sys.executable, "-B", "-m", "unittest", "discover", "-s", "chatgpt-mcp/tests",
+            "-p", "test_runtime_rollout_scoped_source.py"], cwd=self.source,
+            capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("Ran 2 tests", run.stderr)
+        self.assertEqual(result["bootstrap_adapter"]["origin"], "package_with_exact_hardening")
+        self.assertNotEqual(result["bootstrap_adapter"]["sha256"],
+                            result["package_files"]["runtime_rollout_scoped_source.py"])
+
+    def test_invalid_native_test_template_rejected_before_review_is_published(self):
+        self.native_test.write_text("def broken(\n")
+        self.native_test_sha256 = hashlib.sha256(self.native_test.read_bytes()).hexdigest()
+        self.rejected("BOOTSTRAP_TEST_TEMPLATE_INVALID")
+
+    def test_symlink_native_test_template_rejected(self):
+        self.native_test.unlink()
+        self.native_test.symlink_to(self.package)
+        self.rejected("BOOTSTRAP_TEST_TEMPLATE_UNSAFE")
+
+    def test_native_template_with_untrusted_writers_is_rejected(self):
+        for mode in (0o660, 0o666):
+            with self.subTest(mode=oct(mode)):
+                self.output = self.base / ("review-" + oct(mode))
+                self.native_test.chmod(mode)
+                self.rejected("BOOTSTRAP_TEST_TEMPLATE_UNSAFE")
+
+    def test_native_template_must_match_the_generator_pin(self):
+        self.native_test.write_text(self.native_test.read_text().replace("1 + 1, 2", "1 + 1, 3"))
+        self.rejected("BOOTSTRAP_TEST_TEMPLATE_HASH_MISMATCH")
 
     def test_duplicate_entry_rejected(self):
         self.package.write_bytes(package_bytes(duplicate=True))

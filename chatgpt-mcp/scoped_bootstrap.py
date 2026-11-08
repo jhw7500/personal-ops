@@ -35,13 +35,28 @@ DEFERRED_CANDIDATE_PATHS = ["chatgpt-mcp/" + name for name in (
     "tests/test_host_command_approval_ui.mjs", "tests/test_host_command_tools.py")]
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024
 MAX_MEMBER_BYTES = 512 * 1024
+NATIVE_TEST_TARGET = "chatgpt-mcp/tests/test_runtime_rollout_scoped_source.py"
+NATIVE_BOOTSTRAP_TEST = Path(__file__).parent / "tests/test_runtime_rollout_scoped_source.py"
+NATIVE_BOOTSTRAP_TEST_SHA256 = "c138c90f6fa64ee104c477983b1b3ff88a762f1d27d2ce1ad0c4121391411fdd"
+ADAPTER_HARDENINGS = (
+    ('    if not path.exists() and not path.is_symlink():\n'
+     '        return project_root, "project", "0" * 64\n',
+     '    try:\n'
+     '        path.lstat()\n'
+     '    except FileNotFoundError:\n'
+     '        return project_root, "project", "0" * 64\n'
+     '    except OSError as exc:\n'
+     '        raise HostRuntimeError("SCOPED_POLICY_UNAVAILABLE") from exc\n'),
+    ('    except (ValueError, UnicodeError, TypeError) as exc:\n',
+     '    except (ValueError, UnicodeError, TypeError, RecursionError) as exc:\n'),
+)
 
 
 class PreparationError(ValueError):
     """Public errors contain a bounded code, never source text or paths."""
 
 
-def _regular_bytes(path: Path, limit: int, code: str) -> bytes:
+def _regular_bytes(path: Path, limit: int, code: str, *, deny_untrusted_writers=False) -> bytes:
     try:
         if path.absolute() != path.resolve(strict=True):
             raise PreparationError(code)
@@ -49,7 +64,8 @@ def _regular_bytes(path: Path, limit: int, code: str) -> bytes:
         try:
             before = os.fstat(fd)
             if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
-                    or before.st_size > limit):
+                    or before.st_size > limit
+                    or deny_untrusted_writers and before.st_mode & 0o022):
                 raise PreparationError(code)
             with os.fdopen(os.dup(fd), "rb") as stream:
                 data = stream.read(limit + 1)
@@ -154,10 +170,38 @@ def _transform_data(files: dict[str, bytes]):
         raise PreparationError("PACKAGE_TRANSFORMS_UNSAFE") from None
 
 
+def _bootstrap_test_bytes() -> bytes:
+    """Use pinned repo tests; the ZIP test imports helpers outside its patch."""
+    data = _regular_bytes(NATIVE_BOOTSTRAP_TEST, MAX_MEMBER_BYTES, "BOOTSTRAP_TEST_TEMPLATE_UNSAFE",
+                          deny_untrusted_writers=True)
+    if hashlib.sha256(data).hexdigest() != NATIVE_BOOTSTRAP_TEST_SHA256:
+        raise PreparationError("BOOTSTRAP_TEST_TEMPLATE_HASH_MISMATCH")
+    try:
+        tree = ast.parse(data)
+        if not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name.startswith("test_") for node in ast.walk(tree)):
+            raise ValueError
+    except (SyntaxError, UnicodeError, ValueError, RecursionError):
+        raise PreparationError("BOOTSTRAP_TEST_TEMPLATE_INVALID") from None
+    return data
+
+
+def _bootstrap_adapter_bytes(data: bytes) -> bytes:
+    """Apply only the two reviewed fail-closed fixes to the pinned package."""
+    source = data.decode("utf-8")
+    for before, after in ADAPTER_HARDENINGS:
+        if source.count(before) != 1:
+            raise PreparationError("PACKAGE_ADAPTER_VERSION_MISMATCH")
+        source = source.replace(before, after, 1)
+    return source.encode("utf-8")
+
+
 def _build_patch(root: Path, files: dict[str, bytes], catalog: dict):
     transforms = _transform_data(files)
     chunks = []
     outputs = {}
+    test_origin = None
+    adapter_origin = None
     catalog_hashes = {record["path"]: record["sha256"] for record in catalog["files"]}
     for name in ROOT_FILES:
         data, _mode = _source_bytes(root / name, root)
@@ -178,11 +222,23 @@ def _build_patch(root: Path, files: dict[str, bytes], catalog: dict):
         path = root / target
         if path.exists() or path.is_symlink():
             raise PreparationError("SOURCE_ALREADY_INTEGRATED")
-        data = files[member].decode("utf-8")
-        outputs[target] = hashlib.sha256(files[member]).hexdigest()
+        payload = (_bootstrap_test_bytes() if target == NATIVE_TEST_TARGET
+                   else _bootstrap_adapter_bytes(files[member]))
+        data = payload.decode("utf-8")
+        outputs[target] = hashlib.sha256(payload).hexdigest()
+        if target == NATIVE_TEST_TARGET:
+            test_origin = {"origin": "generator_pinned_source", "path": target,
+                           "sha256": outputs[target], "replaced_package_path": member,
+                           "replaced_package_sha256": hashlib.sha256(files[member]).hexdigest()}
+        else:
+            adapter_origin = {"origin": "package_with_exact_hardening", "package_path": member,
+                              "package_sha256": hashlib.sha256(files[member]).hexdigest(),
+                              "sha256": outputs[target],
+                              "hardening": ["unavailable_policy_never_falls_back",
+                                            "nested_json_errors_are_bounded"]}
         chunks.extend(difflib.unified_diff([], data.splitlines(keepends=True),
                                            fromfile="/dev/null", tofile="b/" + target))
-    return "".join(chunks).encode(), outputs
+    return "".join(chunks).encode(), outputs, test_origin, adapter_origin
 
 
 def _open_output_directory(path: Path) -> int:
@@ -282,7 +338,7 @@ def _prepare_review(root: Path, output: Path, files: dict[str, bytes], commit: s
     try:
         catalog = _catalog(root)
         source_target, source_control = _expected_snapshots(root)
-        patch, outputs = _build_patch(root, files, catalog)
+        patch, outputs, test_origin, adapter_origin = _build_patch(root, files, catalog)
         if _catalog(root) != catalog:
             raise PreparationError("SOURCE_CHANGED")
         try:
@@ -301,6 +357,8 @@ def _prepare_review(root: Path, output: Path, files: dict[str, bytes], commit: s
         "source_runtime_snapshot": source_target, "source_control_sha256": source_control,
         "package_files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(files.items())},
         "affected_paths": list(ROOT_FILES) + list(NEW_FILES), "prepared_file_sha256": outputs,
+        "bootstrap_test": test_origin,
+        "bootstrap_adapter": adapter_origin,
         "patch_sha256": hashlib.sha256(patch).hexdigest(), "patch_bytes": len(patch),
         "deferred_candidate_paths": DEFERRED_CANDIDATE_PATHS,
         "deferred_tool": "inspect_host_command_blockers",
