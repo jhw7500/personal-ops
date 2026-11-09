@@ -379,7 +379,12 @@ class ActivationCoordinator:
             _fail("ACTIVATION_ABI_INCOMPATIBLE")
         candidate = pin_owner_file(policy_candidate, self.projects)
         snapshot = WorkspacePolicy(self.projects, candidate["path"]).load(required=True)
-        if any("read" in rule["operations"] and not rule["fields"]
+        if (snapshot.version >= 2
+                and min(target_abi, rollback_abi, minimum_abi) < 3):
+            _fail("ACTIVATION_ABI_INCOMPATIBLE")
+        if any("read" in rule["operations"]
+               and rule.get("content_mode", "json_fields") == "json_fields"
+               and not rule["fields"]
                for rule in snapshot.artifacts):
             _fail("ACTIVATION_ARTIFACT_FIELDS_REQUIRED")
         projects_pin = pin_owner_file(projects_path, self.projects)

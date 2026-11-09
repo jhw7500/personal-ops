@@ -18,6 +18,8 @@ from unittest import mock
 
 from host_runtime_config import HostRuntimeError, TRUSTED_APPROVAL_ORIGIN
 import runtime_rollout_web
+from rollout_layout import known_layout
+import rollout_target
 from runtime_rollout_web import (
     PLAN_TTL, PROJECT, RuntimeRolloutWeb, WebRolloutGrant, _catalog,
     _expected_snapshots, _observe_unit, _utc,
@@ -39,12 +41,14 @@ class RuntimeRolloutWebTest(unittest.TestCase):
         self.runtime_identity = "a" * 64
         self.boot_id = "11111111-2222-3333-4444-555555555555"
         self.uid = os.getuid()
+        self.layout = known_layout("wsl-pc1", self.base / "owner")
         self.ops = RuntimeRolloutWeb(
             {PROJECT: self.root}, state_dir=self.base / "state",
             launcher=lambda argv: self.started.append(argv) or True,
             runtime_reader=lambda: self.runtime_identity,
             boot_reader=lambda: self.boot_id,
             uid_reader=lambda: self.uid,
+            layout_reader=lambda: self.layout,
             test_only=True,
         )
         self.assertGreater(_catalog(self.root)["count"], 40)
@@ -78,76 +82,35 @@ class RuntimeRolloutWebTest(unittest.TestCase):
         self.assertEqual(target_after, target_before)
         self.assertNotEqual(control_after, control_before)
 
-    def test_control_approval_accepts_only_current_and_previous_bootstrap_digest(self):
-        script = self.root / "chatgpt-mcp/rollout-host-runtime.py"
-        spec = importlib.util.spec_from_file_location("control_compat_rollout", script)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        observed = module.control_inventory()
-        _target, current = _expected_snapshots(self.root)
-        legacy_map = dict(observed)
-        self.assertIn(runtime_rollout_web.LEGACY_CONTROL_OMIT, legacy_map)
-        legacy_map.pop(runtime_rollout_web.LEGACY_CONTROL_OMIT)
-        legacy = hashlib.sha256(
-            json.dumps(legacy_map, sort_keys=True).encode()
-        ).hexdigest()
-        self.assertNotEqual(current, legacy)
-        self.assertTrue(
-            runtime_rollout_web._approved_control_matches(current, current, observed)
-        )
-        self.assertTrue(
-            runtime_rollout_web._approved_control_matches(legacy, current, observed)
-        )
-        self.assertFalse(
-            runtime_rollout_web._approved_control_matches("0" * 64, current, observed)
-        )
-        tampered = dict(observed)
-        key = next(key for key in tampered if key != runtime_rollout_web.LEGACY_CONTROL_OMIT)
-        tampered[key] = "f" * 64
-        self.assertFalse(
-            runtime_rollout_web._approved_control_matches(legacy, current, tampered)
-        )
-
-    def test_web_grant_accepts_previous_bootstrap_control_digest(self):
-        script = self.root / "chatgpt-mcp/rollout-host-runtime.py"
-        spec = importlib.util.spec_from_file_location("legacy_grant_rollout", script)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        installer = module._import_installer()
-        source = _catalog(self.root)
-        target, current = _expected_snapshots(self.root)
-        observed = module.control_inventory()
-        legacy_map = dict(observed)
-        legacy_map.pop(runtime_rollout_web.LEGACY_CONTROL_OMIT)
-        legacy = hashlib.sha256(
-            json.dumps(legacy_map, sort_keys=True).encode()
-        ).hexdigest()
-        self.assertNotEqual(current, legacy)
-
-        state_root = self.base / "grant-state"
-        plans = state_root / "plans"
-        plans.mkdir(parents=True, mode=0o700)
-        operation_id = "a" * 32
-        fixed = {
-            "source_digest": source["digest"],
-            "target_snapshot": target,
-            "control_digest": legacy,
+    def test_control_contract_v3_is_exact_union_without_redefining_v1_or_v2(self):
+        self.assertEqual(rollout_target.CONTROL_CONTRACT_VERSION, 3)
+        self.assertEqual(rollout_target.CONTROL_V2,
+                         (*rollout_target.CONTROL_V1, "rollout_layout.py",
+                          "rollout_target.py", "rollout_authority.py"))
+        self.assertEqual(rollout_target.CONTROL_V3,
+                         (*rollout_target.CONTROL_V2,
+                          "tossapp_neutral_ab24_command.js"))
+        inventories = {
+            version: rollout_target.control_inventory(
+                self.root, contract_version=version)
+            for version in (1, 2, 3)
         }
-        plan = {
-            "state": "running",
-            "worker_pid": os.getpid(),
-            "immutable": fixed,
-            "plan_digest": runtime_rollout_web._digest(fixed),
-        }
-        runtime_rollout_web._save_private_json(
-            plans / (operation_id + ".json"), plan
-        )
-        grant = WebRolloutGrant(
-            operation_id, source["digest"], target, legacy, state_root
-        )
-        grant.verify(
-            self.root, installer, module.inventory, module.control_inventory
-        )
+        self.assertNotIn("tossapp_neutral_ab24_command.js", inventories[1])
+        self.assertNotIn("tossapp_neutral_ab24_command.js", inventories[2])
+        self.assertIn("tossapp_neutral_ab24_command.js", inventories[3])
+
+    def test_only_named_v1_toss_bootstrap_digest_is_legacy_exception(self):
+        bootstrap = rollout_target._bootstrap_v1_control_digest(self.root)
+        fixed = {"control_digest": bootstrap}
+        self.assertEqual(rollout_target.approved_control_digest(self.root, fixed),
+                         bootstrap)
+        for invalid in ("0" * 64,
+                        rollout_target.expected_rollout_snapshots(
+                            self.root, contract_version=2)[1]):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(RuntimeError, "WEB_ROLLOUT_SOURCE_CHANGED"):
+                    rollout_target.approved_control_digest(
+                        self.root, {"control_digest": invalid})
 
     def test_no_execution_before_web_approval(self):
         plan = self.prepare()
@@ -158,7 +121,7 @@ class RuntimeRolloutWebTest(unittest.TestCase):
                          TRUSTED_APPROVAL_ORIGIN + "/runtime-rollouts?operation_id="
                          + plan["operation_id"])
         self.assertEqual(plan["impact"]["restart"],
-                         ["personal-ops-tunnel.service", "personal-ops-admin.service"])
+                         ["personal-ops-coding-wsl-pc1.service", "personal-ops-admin.service"])
         self.assertFalse(self.started)
         self.assert_error("ROLLOUT_NOT_APPROVED",
                           lambda: self.ops.execute(PROJECT, plan["operation_id"]))

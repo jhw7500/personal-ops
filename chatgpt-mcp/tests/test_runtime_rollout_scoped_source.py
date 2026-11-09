@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from host_runtime_config import HostRuntimeError
+from rollout_layout import known_layout
 import runtime_rollout_scoped_source as scoped_source
 import runtime_rollout_web
 from runtime_rollout_web import (
@@ -40,6 +41,7 @@ class RuntimeRolloutScopedSourceTests(unittest.TestCase):
             runtime_reader=lambda: "a" * 64,
             boot_reader=lambda: "11111111-2222-3333-4444-555555555555",
             uid_reader=os.getuid,
+            layout_reader=lambda: known_layout("wsl-pc1", self.home),
             test_only=True,
         )
 

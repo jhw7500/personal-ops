@@ -90,7 +90,9 @@ class WorkspaceRouterTests(unittest.IsolatedAsyncioTestCase):
                             job_id = started.structuredContent["job_id"]
                             for _ in range(100):
                                 status = await client.call_tool("get_job", {"project": "alpha", "job_id": job_id})
-                                if status.structuredContent["state"] not in {"queued", "running", "canceling"}:
+                                # Output freezing completes after the command reaches a terminal state.
+                                if (status.structuredContent["state"] not in {"queued", "running", "canceling"}
+                                        and status.structuredContent["termination_verified"] is True):
                                     break
                                 await asyncio.sleep(.02)
                             self.assertEqual(status.structuredContent["state"], "succeeded", status)

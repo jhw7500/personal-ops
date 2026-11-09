@@ -357,6 +357,36 @@ class WorkspaceGitTest(unittest.TestCase):
                     run_git(bare, "rev-parse", "refs/heads/feature/test").strip(), remote_head,
                 )
 
+    def test_large_push_uses_bounded_preview_and_keeps_owner_wip(self):
+        bare, remote_head = self.remote_at_head()
+        payload = "".join(f"line-{index:06d}: {'X' * 70}\n" for index in range(10000))
+        self.assertGreater(len(payload.encode("utf-8")), git_workflows.MAX_CAPTURE)
+        self.repo.joinpath("normal.txt").write_text(payload)
+        run_git(self.repo, "add", "normal.txt")
+        run_git(self.repo, "commit", "-m", "large ordinary source update")
+        untracked = self.repo / "owner-wip.txt"
+        untracked.write_text("preserve owner work\n")
+
+        prepared = self.prepare_push()
+        preview = self.workflows._load_plan("repo", prepared["operation_id"])["immutable"]["preview"]
+        self.assertIn("OUTGOING_DIFF_SUMMARY_ONLY", preview)
+        self.assertIn("normal.txt", preview)
+        self.assertIn(remote_head, preview)
+        self.assertNotIn("line-000001", preview)
+        self.assertLess(len(preview.encode("utf-8")), git_workflows.MAX_TEXT_BYTES)
+        self.assertEqual(run_git(bare, "rev-parse", "refs/heads/feature/test").strip(), remote_head)
+
+        self.approve(prepared)
+        completed = self.workflows.execute({
+            "project": "repo", "operation_id": prepared["operation_id"],
+        })
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(
+            run_git(bare, "rev-parse", "refs/heads/feature/test").strip(),
+            run_git(self.repo, "rev-parse", "HEAD").strip(),
+        )
+        self.assertEqual(untracked.read_text(), "preserve owner work\n")
+
     def test_push_rejects_intermediate_hidden_add_then_delete(self):
         bare, remote_head = self.remote_at_head()
         transient = self.repo / "protected" / "transient.txt"

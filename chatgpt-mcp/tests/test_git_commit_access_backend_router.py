@@ -128,12 +128,27 @@ class GitCommitAccessBackendRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(active.structuredContent['grant_expires_at'],expiry)
             revoked=await self.ok(client,'revoke_git_commit_access',args)
             self.assertEqual(revoked.structuredContent['state'],'revoked')
+            before_third=run_git(fx['root'],'rev-parse','HEAD').stdout.strip()
             plan=await self.plan(client,fx,4)
-            self.assertIn('approval_command',plan.structuredContent)
-            before_denied=run_git(fx['root'],'rev-parse','HEAD').stdout.strip()
+            public=plan.structuredContent
+            self.assertEqual(public['component'],'git_operation')
+            self.assertEqual(public['state'],'pending')
+            self.assertTrue(public['approval_required'])
+            self.assertFalse(public['authorization_verified'])
+            self.assertFalse(public['receipt_verified'])
+            self.assertFalse(public['executes_on_approval'])
+            self.assertNotIn('approval_command',public)
+            self.assertNotIn('approval_command',public['plan'])
+            capability=plan.meta['git_operation_confirmation']
+            self.assertNotIn(capability,text_reply(plan))
+            self.assertNotIn(capability,json.dumps(public))
+            self.assertEqual(before_third,run_git(fx['root'],'rev-parse','HEAD').stdout.strip())
+            self.assertFalse((await self.ok(
+                client,'get_git_commit_access',{'project':'tossApp'}
+            )).structuredContent['active'])
             denied=await client.call_tool('execute_git_operation',{'project':'tossApp','operation_id':plan.structuredContent['operation_id']})
             self.assertTrue(denied.isError)
-            self.assertEqual(before_denied,run_git(fx['root'],'rev-parse','HEAD').stdout.strip())
+            self.assertEqual(before_third,run_git(fx['root'],'rev-parse','HEAD').stdout.strip())
             self.assertFalse((await self.ok(client,'get_git_commit_access',{'project':'tossApp'})).structuredContent['active'])
 
 if __name__ == '__main__': unittest.main()

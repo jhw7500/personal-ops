@@ -31,8 +31,8 @@ import host_access,server
 from host_operation_fixtures import fake_registered_manager
 host_access._installed_runtime_identity=lambda:"a"*64
 origin_git=server.GitWorkflows
-def git_factory(projects,state_dir,workspace=None):
-    return origin_git(projects,state_dir,workspace=workspace,
+def git_factory(projects,state_dir,workspace=None,host_access=None):
+    return origin_git(projects,state_dir,workspace=workspace,host_access=host_access,
         message_validator=lambda path:None, reference_checker=lambda uri:None)
 server.GitWorkflows=git_factory
 def registered_factory(projects,state_dir=None,workspace=None):
@@ -51,6 +51,8 @@ class ExtendedChatApprovalRouterTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory(prefix="extended-chat-approval-router-") as folder:
             root=Path(folder)
             fx=write_registered_fixture(root)
+            run_git(fx["root"], "config", "--local", "user.name", "Router Fixture")
+            run_git(fx["root"], "config", "--local", "user.email", "fixture@example.invalid")
             # Change a previously reviewed file in the private fixture repo.
             (fx["root"]/"server/src/main.ts").write_text("export default 2;\n")
             launcher=root/"launcher.py"
@@ -103,9 +105,13 @@ class ExtendedChatApprovalRouterTest(unittest.IsolatedAsyncioTestCase):
                             log.flush()
                             self.assertFalse(git_plan.isError,text_reply(git_plan)+
                                 (root/"mcp-stderr.log").read_text()[-1000:])
-                            self.assertEqual(git_plan.structuredContent["status"],
+                            inline=git_plan.structuredContent
+                            self.assertEqual(inline["component"],"git_operation")
+                            self.assertEqual(inline["state"],"pending")
+                            self.assertTrue(inline["approval_required"])
+                            self.assertEqual(inline["plan"]["status"],
                                              "pending_host_approval")
-                            g_id=git_plan.structuredContent["operation_id"]
+                            g_id=inline["operation_id"]
                             git_card=await client.call_tool("open_git_approval",{
                                 "project":"tossApp","operation_id":g_id})
                             self.assertFalse(git_card.isError,text_reply(git_card))
@@ -128,9 +134,14 @@ class ExtendedChatApprovalRouterTest(unittest.IsolatedAsyncioTestCase):
                                 "request_id":"registered-chat-1",
                             })
                             self.assertFalse(host_plan.isError,text_reply(host_plan))
-                            self.assertEqual(host_plan.structuredContent["state"],
+                            host_inline=host_plan.structuredContent
+                            self.assertEqual(host_inline["component"],"operation")
+                            self.assertEqual(host_inline["family"],"registered")
+                            self.assertEqual(host_inline["state"],"pending")
+                            self.assertTrue(host_inline["approval_required"])
+                            self.assertEqual(host_inline["plan"]["state"],
                                              "pending_host_approval")
-                            h_id=host_plan.structuredContent["operation_id"]
+                            h_id=host_inline["operation_id"]
                             host_card=await client.call_tool("open_registered_host_approval",{
                                 "project":"tossApp","target":"tarororo-test",
                                 "operation_id":h_id})

@@ -77,6 +77,17 @@ def configure_child(tools, setup):
     """Runs inside the launched server before serving."""
     tools.CONFIG_PATH = Path(setup["config"])
     if setup["fake"]:
+        import operation_approval_ui
+
+        # The fake source server also needs an explicit fixture identity for its
+        # inline approval card; production children keep installed-runtime checks.
+        original_approvals = operation_approval_ui.OperationApprovals
+
+        def create_approvals(family, operations):
+            return original_approvals(
+                family, operations, trusted_runtime=lambda: "a" * 64)
+
+        operation_approval_ui.OperationApprovals = create_approvals
         runner = PersistentRunner(Path(setup["effects"]))
 
         def create(projects, state_dir=None):
@@ -301,15 +312,23 @@ class RegisteredStdioTest(unittest.IsolatedAsyncioTestCase):
         receipts = self.host_state / "registered" / "receipts"
         scope = f"?project={PROJECT}&target={TARGET}"
         async with self.child(fake=True) as client:
-            is_error, plan = await self.call(client, "prepare_host_operation", {
+            is_error, card = await self.call(client, "prepare_host_operation", {
                 "project": PROJECT, "target": TARGET, "action": "compose.restart",
                 "parameters": {"services": ["api"]}, "request_id": "e2e-1"})
-            self.assertFalse(is_error, plan)
+            self.assertFalse(is_error, card)
+            self.assertEqual((card["component"], card["family"], card["state"]),
+                             ("operation", "registered", "pending"))
+            self.assertTrue(card["approval_required"])
+            self.assertFalse(card["executes_on_approval"])
+            self.assertFalse(card["receipt_verified"])
+            self.assertEqual(self.child_effects(), [])
+            self.assertEqual(list(receipts.iterdir()), [])
+            self.assertNotIn("approval_url", card)
+            plan = card["plan"]
+            self.assertNotIn("approval_url", plan)
+            self.assertNotIn("approval_command", plan)
             op = plan["operation_id"]
             self.assertEqual((plan["kind"], plan["state"]), ("registered", "pending_host_approval"))
-            self.assertEqual(plan["approval_url"], "https://cantopsbuildserver.tail661d29.ts.net:8443"
-                                                   "/host-operations?project=tossApp"
-                                                   "&target=tarororo-test&operation_id=" + op)
             self.assertEqual(plan["impact"]["preserved"], ["worker", "db"])
             # Same request ID and input: the same plan, never a second one.
             is_error, again = await self.call(client, "prepare_host_operation", {

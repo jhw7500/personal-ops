@@ -19,14 +19,16 @@ from workspace_paths import (
 )
 
 
-VERSION = 1
+VERSION = 2
+SUPPORTED_VERSIONS = frozenset({1, 2})
 MAX_POLICY_BYTES = 1024 * 1024
 DEFAULT_BASE_ROOT = Path("/home/jhw/ai/opencode/projects")
 _POLICY_FIELDS = frozenset({"version", "base_root", "artifacts", "protected_paths"})
 _REQUIRED_POLICY_FIELDS = frozenset({"version", "base_root", "artifacts"})
-_ARTIFACT_FIELDS = frozenset({
+_V1_ARTIFACT_FIELDS = frozenset({
     "project", "path", "kind", "operations", "fields", "recursive", "max_file_bytes",
 })
+_V2_ARTIFACT_FIELDS = _V1_ARTIFACT_FIELDS | {"content_mode"}
 _OPERATIONS = frozenset({"list", "read", "write"})
 _ARTIFACT_OPERATIONS = frozenset({"list", "read"})
 
@@ -108,8 +110,9 @@ def _string_tuple(value, *, allow_empty: bool) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _artifact(value, projects: Mapping[str, Path]) -> Mapping:
-    if not isinstance(value, dict) or set(value) != _ARTIFACT_FIELDS:
+def _artifact(value, projects: Mapping[str, Path], version: int) -> Mapping:
+    expected_fields = _V1_ARTIFACT_FIELDS if version == 1 else _V2_ARTIFACT_FIELDS
+    if not isinstance(value, dict) or set(value) != expected_fields:
         raise WorkspaceError("INVALID_POLICY")
     project = value["project"]
     if not isinstance(project, str) or project not in projects:
@@ -126,10 +129,15 @@ def _artifact(value, projects: Mapping[str, Path]) -> Mapping:
     if type(value["recursive"]) is not bool:
         raise WorkspaceError("INVALID_POLICY")
     fields = _string_tuple(value["fields"], allow_empty=True)
+    content_mode = value.get("content_mode", "json_fields")
+    if content_mode not in ("json_fields", "text"):
+        raise WorkspaceError("INVALID_POLICY")
+    if content_mode == "text" and fields:
+        raise WorkspaceError("INVALID_POLICY")
     limit = value["max_file_bytes"]
     if type(limit) is not int or not 0 < limit <= MAX_POLICY_BYTES:
         raise WorkspaceError("INVALID_POLICY")
-    return MappingProxyType({
+    artifact = {
         "project": project,
         "path": relative,
         "kind": kind,
@@ -137,7 +145,10 @@ def _artifact(value, projects: Mapping[str, Path]) -> Mapping:
         "fields": fields,
         "recursive": value["recursive"],
         "max_file_bytes": limit,
-    })
+    }
+    if version >= 2:
+        artifact["content_mode"] = content_mode
+    return MappingProxyType(artifact)
 
 
 def _validate_artifact_namespaces(artifacts: tuple[Mapping, ...]) -> None:
@@ -233,8 +244,10 @@ class WorkspacePolicy:
             raise WorkspaceError(translations.get(exc.code, exc.code)) from None
 
         document = _parse_policy(policy_file.data)
-        if type(document["version"]) is not int or document["version"] != VERSION:
+        if (type(document["version"]) is not int
+                or document["version"] not in SUPPORTED_VERSIONS):
             raise WorkspaceError("INVALID_POLICY")
+        version = document["version"]
         base_root = _canonical_directory(
             _normal_absolute(document["base_root"]), "INVALID_POLICY"
         )
@@ -247,7 +260,9 @@ class WorkspacePolicy:
         raw_artifacts = document["artifacts"]
         if not isinstance(raw_artifacts, list):
             raise WorkspaceError("INVALID_POLICY")
-        artifacts = tuple(_artifact(value, project_paths) for value in raw_artifacts)
+        artifacts = tuple(
+            _artifact(value, project_paths, version) for value in raw_artifacts
+        )
         _validate_artifact_namespaces(artifacts)
 
         protected = document.get("protected_paths", [])
@@ -258,7 +273,7 @@ class WorkspacePolicy:
         if config_parent not in protected_paths:
             protected_paths += (config_parent,)
         return PolicySnapshot(
-            VERSION,
+            version,
             policy_file.sha256,
             base_root,
             artifacts,

@@ -1,8 +1,8 @@
-"""Guarded activation of the existing personal-ops tunnel user service.
+"""Guarded activation of a recognized personal-ops tunnel user service.
 
-The module never discovers or creates a tunnel.  It accepts only the known
-oneshot unit/profile shape, freezes the actual live MCP child from ``/proc``,
-and changes the MCP command while preserving every other setting.
+The module never creates a tunnel. It accepts the legacy oneshot layout or
+the pinned WSL simple service, freezes the actual MCP child from ``/proc``,
+and changes its command while preserving the existing launch environment.
 """
 from __future__ import annotations
 
@@ -17,10 +17,15 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from urllib.parse import urlsplit
 
 from workspace_control import (DEFAULT_CONTROLLER_DIR, WorkspaceControlError,
                                transition_release, verify_controller, verify_launch)
+from rollout_layout import (LayoutError, assert_wrapper, decode_isolated_process,
+                            freeze_owned_file, managed_command, parse_managed_command,
+                            process_environment, validate_environment,
+                            validate_layout, validate_wsl_unit, verify_managed_interpreter)
 
 
 ALIAS = "personal-ops-coding"
@@ -47,6 +52,17 @@ class TunnelSwitchError(RuntimeError):
         if rollback_status:
             parts.append("ROLLBACK_" + rollback_status.upper())
         super().__init__(":".join(parts))
+
+
+class _TunnelHealthUnavailable(TunnelSwitchError):
+    """Internal process proof carried without claiming health or readiness."""
+    def __init__(self, code, live, tunnel_argv, recheck):
+        if code not in {"TUNNEL_HEALTH_URL_UNAVAILABLE", "TUNNEL_HEALTH_OWNER_MISMATCH"}:
+            raise ValueError("unexpected startup health failure")
+        super().__init__(code)
+        self.live = dict(live)
+        self.tunnel_argv = tuple(tunnel_argv)
+        self.recheck = recheck
 
 
 def _owned_directory(path: Path, mode: int = 0o700) -> None:
@@ -241,18 +257,30 @@ def freeze_live_runtime(status, releases=RELEASE_ROOT, proc_root=Path("/proc"),
                 if argv == ["codex", "app-server"]:
                     codex_candidates.append((pid, started))
                     continue
-                if len(argv) != 2 or Path(argv[1]).name != "server.py":
+                managed = None
+                if argv[1:3] == ["-I", "-c"]:
+                    try:
+                        managed = decode_isolated_process(argv, home=Path(releases).parents[3])
+                        managed["launch_environment"] = validate_environment(
+                            process_environment(pid, proc_root), Path(releases).parents[3])
+                        script = Path(argv[5])
+                    except LayoutError as exc:
+                        candidate_errors.append(TunnelSwitchError(exc.code))
+                        continue
+                elif len(argv) == 2 and Path(argv[1]).name == "server.py":
+                    script = Path(argv[1])
+                else:
                     continue
                 try:
                     interpreter = _approved_interpreter(
                         Path(argv[0]), approved_interpreters)
-                    runtime = _verify_runtime(Path(argv[1]).parent, releases)
+                    runtime = _verify_runtime(script.parent, releases)
                 except TunnelSwitchError as exc:
                     candidate_errors.append(exc)
                     continue
-                if runtime["server"] != Path(argv[1]):
+                if runtime["server"] != script:
                     continue
-                candidates.append((pid, started, interpreter, runtime))
+                candidates.append((pid, started, interpreter, runtime, managed))
             except (OSError, TunnelSwitchError):
                 continue
         if candidate_errors:
@@ -263,11 +291,21 @@ def freeze_live_runtime(status, releases=RELEASE_ROOT, proc_root=Path("/proc"),
             raise TunnelSwitchError("AMBIGUOUS_MCP_CHILD")
         if len(codex_candidates) > 1:
             raise TunnelSwitchError("AMBIGUOUS_CODEX_CHILD")
-        mcp_pid, mcp_ticks, interpreter, runtime = candidates[0]
+        mcp_pid, mcp_ticks, interpreter, runtime, managed = candidates[0]
         if _process_identity(proc_root, tunnel_pid) != (tunnel_ppid, tunnel_ticks):
             raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED")
         if _process_identity(proc_root, mcp_pid) != (tunnel_pid, mcp_ticks):
             raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED")
+        expected_argv = (managed["command_argv"] if managed is not None else
+                         [str(interpreter), str(runtime["server"])])
+        if _process_argv(proc_root, mcp_pid) != expected_argv:
+            raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED")
+        if managed is not None:
+            try:
+                if process_environment(mcp_pid, proc_root) != managed["launch_environment"]:
+                    raise LayoutError("RUNTIME_ENVIRONMENT_CHANGED")
+            except LayoutError as exc:
+                raise TunnelSwitchError(exc.code) from exc
         if codex_candidates:
             codex_pid, codex_ticks = codex_candidates[0]
             if _process_identity(proc_root, codex_pid) != (tunnel_pid, codex_ticks):
@@ -282,6 +320,9 @@ def freeze_live_runtime(status, releases=RELEASE_ROOT, proc_root=Path("/proc"),
     }
     if codex_candidates:
         result.update(codex_pid=codex_pid, codex_start_ticks=codex_ticks)
+    if managed is not None:
+        result.update({key: managed[key] for key in (
+            "command_argv", "application_args", "isolated", "launch_environment")})
     return result
 
 
@@ -323,9 +364,25 @@ def _unit_context(unit_text: str) -> tuple[tuple[str, ...], tuple[tuple[str, str
     return tuple(sections), tuple(directives)
 
 
-def _parse_unit(unit_text: str, client: Path, profile_path: Path) -> dict:
+def _parse_unit(unit_text: str, client: Path, profile_path: Path, layout=None) -> dict:
     starts = _effective_commands(unit_text, "ExecStart")
     stops = _effective_commands(unit_text, "ExecStop")
+    if layout is not None and layout["name"] == "wsl-pc1":
+        try:
+            validate_layout(layout)
+            validate_wsl_unit(unit_text, home=layout["home"])
+            if len(starts) != 1 or stops:
+                raise LayoutError("UNRECOGNIZED_WSL_UNIT")
+            start = shlex.split(starts[0])
+        except (LayoutError, ValueError) as exc:
+            raise TunnelSwitchError("UNRECOGNIZED_TUNNEL_UNIT") from exc
+        expected = [str(layout["client"]), "run", "--profile-dir",
+                    str(layout["profile_path"].parent), "--profile", layout["alias"],
+                    "--log.file=stdout"]
+        if (start != expected or client != layout["client"]
+                or profile_path != layout["profile_path"]):
+            raise TunnelSwitchError("UNRECOGNIZED_TUNNEL_UNIT")
+        return {"argv": start, "mcp_index": None}
     if len(starts) != 1 or len(stops) != 1:
         raise TunnelSwitchError("UNRECOGNIZED_TUNNEL_UNIT")
     if any(marker in starts[0] + stops[0] for marker in ("$", "%", "\\", "\n")):
@@ -474,28 +531,59 @@ def _read_unit(unit_fn) -> bytes:
 
 def preflight_tunnel(live, *, unit_fn, profile_path=PROFILE,
                      override_path=OVERRIDE, releases=RELEASE_ROOT,
-                     client=None, approved_interpreters=None) -> dict:
+                     client=None, approved_interpreters=None, layout=None) -> dict:
     """Validate the existing live identity, unit and profile without writing."""
     releases = Path(releases).absolute()
     profile_path = Path(profile_path).absolute()
     override_path = Path(override_path).absolute()
     client = Path(client or (Path.home() / ".local/bin/tunnel-client")).absolute()
+    try:
+        if layout is not None:
+            validate_layout(layout)
+            if (profile_path != layout["profile_path"]
+                    or override_path != layout["override_path"] or client != layout["client"]):
+                raise LayoutError("UNRECOGNIZED_RUNTIME_LAYOUT")
+    except LayoutError as exc:
+        raise TunnelSwitchError(exc.code) from exc
     runtime = _verify_runtime(Path(live["server"]).parent, releases)
     if (runtime["snapshot"] != live.get("snapshot")
             or str(runtime["server"]) != live.get("server")):
         raise TunnelSwitchError("LIVE_RUNTIME_MISMATCH")
     _approved_interpreter(Path(live["interpreter"]), approved_interpreters)
     _owned_tunnel_client(client)
-    _owned_directory(profile_path.parent)
-    _owned_file(profile_path)
-    profile_bytes = profile_path.read_bytes()
+    if layout is not None and layout["name"] == "wsl-pc1":
+        try:
+            profile_bytes = freeze_owned_file(
+                profile_path, layout["home"], exact_mode=0o600, limit=131072)["bytes"]
+        except LayoutError as exc:
+            raise TunnelSwitchError(exc.code) from exc
+    else:
+        _owned_directory(profile_path.parent)
+        _owned_file(profile_path)
+        profile_bytes = profile_path.read_bytes()
     profile_data = _parse_profile(profile_bytes)
     profile_command = profile_data["mcp"]["commands"][0]["command"]
-    _validate_mcp_command(profile_command, releases, approved_interpreters)
+    managed = None
+    if layout is not None and layout["name"] == "wsl-pc1":
+        try:
+            managed = parse_managed_command(shlex.split(profile_command), home=layout["home"])
+            if (live.get("command_argv") != managed["command_argv"]
+                    or live.get("isolated") is not True):
+                raise LayoutError("LIVE_RUNTIME_MISMATCH")
+            environment = validate_environment(live.get("launch_environment"), layout["home"])
+            if managed["environment"] is not None and managed["environment"] != environment:
+                raise LayoutError("LIVE_RUNTIME_ENVIRONMENT_MISMATCH")
+            managed["environment"] = environment
+        except (LayoutError, ValueError) as exc:
+            raise TunnelSwitchError(getattr(exc, "code", "UNRECOGNIZED_MCP_COMMAND")) from exc
+    else:
+        _validate_mcp_command(profile_command, releases, approved_interpreters)
     unit_bytes = _read_unit(unit_fn)
-    unit = _parse_unit(unit_bytes.decode("utf8", errors="strict"), client, profile_path)
-    service_command = unit["argv"][unit["mcp_index"]]
-    _validate_mcp_command(service_command, releases, approved_interpreters)
+    unit = _parse_unit(unit_bytes.decode("utf8", errors="strict"), client, profile_path, layout)
+    service_command = (unit["argv"][unit["mcp_index"]]
+                       if unit["mcp_index"] is not None else profile_command)
+    if managed is None:
+        _validate_mcp_command(service_command, releases, approved_interpreters)
     live_argv = [live["interpreter"], live["server"]]
     if override_path.exists() or override_path.is_symlink():
         _owned_directory(override_path.parent)
@@ -512,8 +600,10 @@ def preflight_tunnel(live, *, unit_fn, profile_path=PROFILE,
         "profile_path": profile_path, "profile_bytes": profile_bytes,
         "profile_data": profile_data, "override_path": override_path,
         "override_bytes": override_bytes, "client": client,
-        "profile_aligned": shlex.split(profile_command) == live_argv,
-        "service_aligned": shlex.split(service_command) == live_argv,
+        "profile_aligned": managed is not None or shlex.split(profile_command) == live_argv,
+        "service_aligned": managed is not None or shlex.split(service_command) == live_argv,
+        "service": layout["service"] if layout is not None else SERVICE,
+        "layout": layout, "managed": managed,
     }
 
 
@@ -548,6 +638,7 @@ def _current_file(path: Path) -> bytes | None:
 
 
 def _cas_ok(plan) -> None:
+    _assert_launch_resources(plan)
     if (_read_unit(plan["unit_fn"]) != plan["unit_bytes"]
             or _current_file(plan["profile_path"]) != plan["profile_bytes"]
             or _current_override(plan) != plan["override_bytes"]):
@@ -560,7 +651,8 @@ def _target_bytes(plan, command_argv) -> tuple[bytes, bytes, list[str]]:
     profile["mcp"]["commands"][0]["command"] = command
     profile_bytes = json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
     argv = list(plan["unit_argv"])
-    argv[plan["unit_mcp_index"]] = command
+    if plan["unit_mcp_index"] is not None:
+        argv[plan["unit_mcp_index"]] = command
     override = ("[Service]\nExecStart=\nExecStart=" + shlex.join(argv) + "\n").encode()
     return profile_bytes, override, argv
 
@@ -652,6 +744,7 @@ def _wait_stopped(live, proc_root: Path, attempts: int, sleep_fn,
 _TRANSIENT_RUNTIME_CODES = {
     "TUNNEL_RUNTIME_STATUS_FAILED", "UNEXPECTED_TUNNEL_STATUS",
     "PROCESS_IDENTITY_CHANGED", "LIVE_MCP_CHILD_NOT_FOUND",
+    "TUNNEL_HEALTH_OWNER_MISMATCH", "TUNNEL_HEALTH_URL_UNAVAILABLE",
 }
 
 
@@ -670,23 +763,56 @@ def _is_interrupt(error) -> bool:
             or _error_code(error) == "ROLLOUT_TERMINATED")
 
 
+def _runtime_observation(status_fn, releases, proc_root, approved_interpreters):
+    try:
+        return status_fn(), None
+    except _TunnelHealthUnavailable as exc:
+        # A health failure is not ownership evidence by itself. Recheck the
+        # selected service and launch resources, then independently freeze the
+        # same parent/child identity before exposing its unready observation.
+        try:
+            current = exc.recheck()
+            status = {"process": {"pid": exc.live["tunnel_pid"]},
+                      "process_running": True, "healthy": False, "ready": False}
+            live = freeze_live_runtime(status, releases, proc_root, approved_interpreters)
+            if (not _same_live(current, exc.live) or not _same_live(live, exc.live)
+                    or tuple(_process_argv(proc_root, live["tunnel_pid"])) != exc.tunnel_argv):
+                raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED")
+        except OSError as cause:
+            raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED") from cause
+        return status, live
+
+
 def _wait_runtime(status_fn, snapshot: str, interpreter: Path, releases: Path,
                   proc_root: Path, approved_interpreters, attempts: int,
-                  sleep_fn, deadline: float, clock_fn) -> dict:
+                  sleep_fn, deadline: float, clock_fn, expected_launch=None,
+                  observe_fn=None) -> dict:
     mismatch = False
+    first_live = None
     for _ in range(attempts):
         try:
-            status = status_fn()
-            ready = (isinstance(status, dict)
-                     and all(status.get(key) is True
-                             for key in ("process_running", "healthy", "ready")))
-            if ready:
-                live = freeze_live_runtime(status, releases, proc_root,
-                                           approved_interpreters)
+            status, live = _runtime_observation(
+                status_fn, releases, proc_root, approved_interpreters)
+            running = isinstance(status, dict) and status.get("process_running") is True
+            ready = running and all(status.get(key) is True for key in ("healthy", "ready"))
+            if running:
+                if live is None:
+                    live = freeze_live_runtime(status, releases, proc_root,
+                                               approved_interpreters)
                 if (live["snapshot"] == snapshot
-                        and Path(live["interpreter"]) == interpreter):
-                    return live
-                mismatch = True
+                        and Path(live["interpreter"]) == interpreter
+                        and (expected_launch is None or all(
+                            live.get(key) == value for key, value in expected_launch.items()))):
+                    if first_live is None:
+                        first_live = dict(live)
+                    elif not _same_live(first_live, live):
+                        raise TunnelSwitchError("LIVE_RUNTIME_CHANGED")
+                    if observe_fn is not None:
+                        observe_fn(live)
+                    if ready:
+                        return live
+                else:
+                    mismatch = True
         except BaseException as exc:
             code = _error_code(exc)
             if _is_interrupt(exc) or code not in _TRANSIENT_RUNTIME_CODES:
@@ -699,7 +825,27 @@ def _wait_runtime(status_fn, snapshot: str, interpreter: Path, releases: Path,
     raise TunnelSwitchError("TUNNEL_START_NOT_READY")
 
 
+def _assert_launch_resources(plan) -> None:
+    managed = plan.get("managed")
+    if managed is not None:
+        try:
+            assert_wrapper(managed["wrapper"])
+            verify_managed_interpreter(managed["home"])
+            freeze_owned_file(plan["profile_path"], managed["home"],
+                              exact_mode=0o600, limit=131072)
+            override = plan["override_path"]
+            if override.exists() or override.is_symlink():
+                freeze_owned_file(override, managed["home"],
+                                  exact_mode=0o600, limit=131072)
+            controller = verify_controller(managed["controller_dir"])
+            if controller["manifest"] != managed["controller_manifest"]:
+                raise LayoutError("WORKSPACE_CONTROLLER_CHANGED")
+        except (LayoutError, WorkspaceControlError) as exc:
+            raise TunnelSwitchError(exc.code) from exc
+
+
 def _assert_resources(plan, state) -> None:
+    _assert_launch_resources(plan)
     current_profile = _current_file(plan["profile_path"])
     try:
         profile_matches = (current_profile is not None
@@ -717,7 +863,7 @@ def _assert_unit_argv(plan, expected) -> None:
     if _unit_context(unit_text) != plan["unit_context"]:
         raise TunnelSwitchError("TUNNEL_UNIT_CHANGED")
     unit = _parse_unit(unit_text,
-                       plan["client"], plan["profile_path"])
+                       plan["client"], plan["profile_path"], plan.get("layout"))
     if unit["argv"] != expected:
         raise TunnelSwitchError("TUNNEL_UNIT_CHANGED")
 
@@ -725,8 +871,184 @@ def _assert_unit_argv(plan, expected) -> None:
 def _same_live(left, right) -> bool:
     keys = ("snapshot", "tunnel_pid", "tunnel_start_ticks", "mcp_pid",
             "mcp_start_ticks", "server", "interpreter", "codex_pid",
-            "codex_start_ticks")
+            "codex_start_ticks", "command_argv", "application_args", "isolated",
+            "launch_environment")
     return all(left.get(key) == right.get(key) for key in keys)
+
+
+def _wsl_service_state(layout, command_fn):
+    raw = _run(command_fn, [
+        "systemctl", "--user", "show", layout["service"],
+        "--property=MainPID,ActiveState,SubState", "--no-pager",
+    ])
+    try:
+        lines = raw.decode("ascii", errors="strict").splitlines()
+        pairs = [line.split("=", 1) for line in lines if line]
+        data = dict(pairs)
+    except (UnicodeError, ValueError) as exc:
+        raise TunnelSwitchError("UNEXPECTED_TUNNEL_STATUS") from exc
+    if (set(data) != {"MainPID", "ActiveState", "SubState"} or len(pairs) != len(data)
+            or not data["MainPID"].isascii() or not data["MainPID"].isdecimal()):
+        raise TunnelSwitchError("UNEXPECTED_TUNNEL_STATUS")
+    return int(data["MainPID"]), data["ActiveState"], data["SubState"]
+
+
+def _owned_health_listener(proc_root, pid, port):
+    """Bind an IPv4 loopback LISTEN endpoint to this exact tunnel process."""
+    sockets = set()
+    try:
+        for path in (proc_root / str(pid) / "fd").iterdir():
+            try:
+                match = re.fullmatch(r"socket:\[([0-9]+)\]", os.readlink(path))
+                if match:
+                    sockets.add(match.group(1))
+            except OSError:
+                continue
+        with (proc_root / str(pid) / "net/tcp").open("r", encoding="ascii") as stream:
+            raw = stream.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            raise TunnelSwitchError("TUNNEL_HEALTH_OWNER_MISMATCH")
+        matches = []
+        for line in raw.splitlines()[1:]:
+            fields = line.split()
+            if (len(fields) >= 10 and fields[1] == f"0100007F:{port:04X}"
+                    and fields[3] == "0A" and fields[7] == str(os.getuid())
+                    and fields[9] in sockets):
+                matches.append(fields[9])
+    except (OSError, UnicodeError) as exc:
+        raise TunnelSwitchError("TUNNEL_HEALTH_OWNER_MISMATCH") from exc
+    if len(matches) != 1:
+        raise TunnelSwitchError("TUNNEL_HEALTH_OWNER_MISMATCH")
+    return matches[0]
+
+
+def wsl_runtime_status(layout, *, command_fn, proc_root=Path("/proc"),
+                       releases=RELEASE_ROOT, approved_interpreters=None,
+                       urlopen_fn=None):
+    """Read run-mode status from the pinned systemd process and its own socket.
+
+    The runtimes registry can retain a PID from an earlier WSL boot. It is
+    never used as process evidence for the dedicated simple service.
+    """
+    proc_root = Path(proc_root)
+    try:
+        validate_layout(layout)
+        if layout["name"] != "wsl-pc1":
+            raise LayoutError("UNRECOGNIZED_RUNTIME_LAYOUT")
+        profile = freeze_owned_file(layout["profile_path"], layout["home"],
+                                    exact_mode=0o600, limit=131072)
+    except LayoutError as exc:
+        raise TunnelSwitchError(exc.code) from exc
+    data = _parse_profile(profile["bytes"])
+    try:
+        control, health = data["control_plane"], data["health"]
+        tunnel_id = control["tunnel_id"]
+        if (control["api_key"] != "file:" + str(layout["key_file"])
+                or health["listen_addr"] != "127.0.0.1:0"
+                or health["url_file"] != str(layout["health_url_file"])
+                or not isinstance(tunnel_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.:-]{5,160}", tunnel_id)):
+            raise ValueError()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TunnelSwitchError("UNRECOGNIZED_TUNNEL_PROFILE") from exc
+    _owned_tunnel_client(layout["client"])
+    def read_unit():
+        return _run(command_fn, ["systemctl", "--user", "cat", layout["service"]])
+    unit_bytes = _read_unit(read_unit)
+    unit = _parse_unit(unit_bytes.decode("utf8", errors="strict"), layout["client"],
+                       layout["profile_path"], layout)
+    service_state = _wsl_service_state(layout, command_fn)
+    pid, active, substate = service_state
+    result = {"alias": layout["alias"], "tunnel_id": tunnel_id,
+              "process": {"pid": pid}, "process_running": False,
+              "healthy": False, "ready": False}
+    if pid == 0 and active in {"inactive", "failed"} and substate in {"dead", "failed"}:
+        if _wsl_service_state(layout, command_fn) != service_state:
+            raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED")
+        return result
+    if pid <= 1 or (active, substate) != ("active", "running"):
+        raise TunnelSwitchError("TUNNEL_RUNTIME_STATUS_FAILED")
+    try:
+        identity = _process_identity(proc_root, pid)
+        if _process_argv(proc_root, pid) != unit["argv"]:
+            raise TunnelSwitchError("UNEXPECTED_TUNNEL_PROCESS")
+        live = freeze_live_runtime(result, releases, proc_root, approved_interpreters)
+    except OSError as exc:
+        raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED") from exc
+    if live.get("isolated") is not True:
+        raise TunnelSwitchError("UNEXPECTED_TUNNEL_PROCESS")
+    url_path = layout["health_url_file"]
+
+    def recheck_process(url_snapshot=None):
+        try:
+            unchanged = (freeze_owned_file(layout["profile_path"], layout["home"],
+                                           exact_mode=0o600, limit=131072) == profile)
+            if url_snapshot is not None:
+                unchanged = unchanged and freeze_owned_file(
+                    url_path, layout["home"], exact_mode=0o600, limit=2048) == url_snapshot
+        except LayoutError as exc:
+            raise TunnelSwitchError("TUNNEL_CONFIGURATION_CHANGED") from exc
+        if not unchanged or _read_unit(read_unit) != unit_bytes:
+            raise TunnelSwitchError("TUNNEL_CONFIGURATION_CHANGED")
+        try:
+            current = freeze_live_runtime(result, releases, proc_root, approved_interpreters)
+            if (_wsl_service_state(layout, command_fn) != service_state
+                    or _process_identity(proc_root, pid) != identity
+                    or _process_argv(proc_root, pid) != unit["argv"]
+                    or not _same_live(current, live)):
+                raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED")
+        except OSError as exc:
+            raise TunnelSwitchError("PROCESS_IDENTITY_CHANGED") from exc
+        return current
+
+    def health_unavailable(code, url_snapshot=None):
+        current = recheck_process(url_snapshot)
+        raise _TunnelHealthUnavailable(
+            code, current, unit["argv"], lambda: recheck_process(url_snapshot))
+
+    if not url_path.exists() and not url_path.is_symlink():
+        health_unavailable("TUNNEL_HEALTH_URL_UNAVAILABLE")
+    try:
+        url_file = freeze_owned_file(url_path, layout["home"], exact_mode=0o600, limit=2048)
+        address = url_file["bytes"].decode("ascii", errors="strict").strip()
+        url = urlsplit(address)
+        port = url.port
+        if (url.scheme != "http" or url.hostname != "127.0.0.1"
+                or not port or url.username or url.password or url.query or url.fragment
+                or url.path not in {"", "/"}):
+            raise ValueError()
+    except (LayoutError, UnicodeError, ValueError) as exc:
+        raise TunnelSwitchError("UNSAFE_MCP_HEALTH_URL") from exc
+    try:
+        listener = _owned_health_listener(proc_root, pid, port)
+    except TunnelSwitchError as exc:
+        if exc.code != "TUNNEL_HEALTH_OWNER_MISMATCH":
+            raise
+        health_unavailable(exc.code, url_file)
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, msg, headers, newurl):
+            return None
+    getter = urlopen_fn or urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect()).open
+    responses = []
+    for route, expected in (("/healthz", b"live"), ("/readyz", b"ready")):
+        try:
+            with getter(address.rstrip("/") + route, timeout=3) as response:
+                body = response.read(129)
+                responses.append(response.status == 200 and body.strip() == expected)
+        except (OSError, ValueError):
+            responses.append(False)
+    recheck_process(url_file)
+    try:
+        if _owned_health_listener(proc_root, pid, port) != listener:
+            raise TunnelSwitchError("TUNNEL_HEALTH_OWNER_MISMATCH")
+    except TunnelSwitchError as exc:
+        if exc.code != "TUNNEL_HEALTH_OWNER_MISMATCH":
+            raise
+        health_unavailable(exc.code, url_file)
+    result.update(process_running=True, healthy=responses[0],
+                  ready=responses[0] and responses[1])
+    return result
 
 
 def _rollback_live(status_fn, old, observed_new, *,
@@ -734,11 +1056,13 @@ def _rollback_live(status_fn, old, observed_new, *,
                    deadline, clock_fn, sleep_fn):
     for _ in range(attempts):
         try:
-            status = status_fn()
+            status, current = _runtime_observation(
+                status_fn, releases, proc_root, approved_interpreters)
             if isinstance(status, dict) and status.get("process_running") is False:
                 return None
-            current = freeze_live_runtime(status, releases, proc_root,
-                                          approved_interpreters)
+            if current is None:
+                current = freeze_live_runtime(status, releases, proc_root,
+                                              approved_interpreters)
             if _same_live(current, old):
                 return current
             if observed_new is not None and _same_live(current, observed_new):
@@ -759,17 +1083,12 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
                   releases=RELEASE_ROOT, client=None, proc_root=Path("/proc"),
                   approved_interpreters=None, sleep_fn=time.sleep, attempts=40,
                   poll_timeout=10.0, clock_fn=time.monotonic, verify_fn=None,
-                  authority_dir=None, controller_dir=None) -> dict:
+                  authority_dir=None, controller_dir=None, layout=None) -> dict:
     """Activate a verified release or restore the actual prior live release."""
     releases = Path(releases).absolute()
     proc_root = Path(proc_root)
     interpreter = _approved_interpreter(Path(interpreter), approved_interpreters)
     target = _verify_runtime(new_runtime, releases)
-    target_admission = _verify_workspace_launch(target["runtime"], authority_dir)
-    target_command = _workspace_command(
-        target_admission, target["runtime"], interpreter, authority_dir,
-        controller_dir,
-    )
     if plan is None:
         live = freeze_live_runtime(status_fn(), releases, proc_root,
                                    approved_interpreters)
@@ -778,7 +1097,36 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
         plan = preflight_tunnel(
             live, unit_fn=unit_fn, profile_path=profile_path,
             override_path=override_path, releases=releases, client=client,
-            approved_interpreters=approved_interpreters)
+            approved_interpreters=approved_interpreters, layout=layout)
+    managed = plan.get("managed")
+    expected_launch = None
+    if managed is not None:
+        if ((authority_dir is not None and Path(authority_dir) != managed["authority_dir"])
+                or (controller_dir is not None and Path(controller_dir) != managed["controller_dir"])
+                or interpreter != managed["interpreter"]):
+            raise TunnelSwitchError("WORKSPACE_AUTHORITY_ENV_MISMATCH")
+        authority_dir, controller_dir = managed["authority_dir"], managed["controller_dir"]
+        try:
+            target_command = managed_command(target["runtime"], managed["environment"],
+                                             home=managed["home"])
+            decoded = parse_managed_command(target_command, home=managed["home"])
+        except LayoutError as exc:
+            raise TunnelSwitchError(exc.code) from exc
+        expected_launch = {"command_argv": decoded["command_argv"],
+                           "launch_environment": managed["environment"]}
+    target_admission = _verify_workspace_launch(target["runtime"], authority_dir)
+    if managed is None:
+        target_command = _workspace_command(
+            target_admission, target["runtime"], interpreter, authority_dir, controller_dir)
+    service = plan.get("service", SERVICE)
+    selected = plan.get("layout")
+    try:
+        if selected is not None:
+            validate_layout(selected)
+    except LayoutError as exc:
+        raise TunnelSwitchError(exc.code) from exc
+    if service != (selected["service"] if selected is not None else SERVICE):
+        raise TunnelSwitchError("UNRECOGNIZED_TUNNEL_UNIT")
     current = freeze_live_runtime(status_fn(), releases, proc_root,
                                   approved_interpreters)
     if not _same_live(current, plan["live"]):
@@ -789,6 +1137,14 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
     reload_attempted = False
     service_touched = False
     observed_new = None
+
+    def observe_startup(live):
+        nonlocal observed_new
+        if observed_new is None:
+            observed_new = dict(live)
+        elif not _same_live(observed_new, live):
+            raise TunnelSwitchError("LIVE_RUNTIME_CHANGED")
+
     try:
         new_argv = _write_target(plan, state, target_command)
         _assert_resources(plan, state)
@@ -797,7 +1153,7 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
         _assert_resources(plan, state)
         _assert_unit_argv(plan, new_argv)
         service_touched = True
-        _run(command_fn, ["systemctl", "--user", "stop", SERVICE])
+        _run(command_fn, ["systemctl", "--user", "stop", service])
         deadline = clock_fn() + poll_timeout
         _wait_stopped(old, proc_root, attempts, sleep_fn, deadline, clock_fn)
         _assert_resources(plan, state)
@@ -806,14 +1162,17 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
             _transition_workspace_launch(target["runtime"], authority_dir)
         else:
             _verify_workspace_launch(target["runtime"], authority_dir)
-        _run(command_fn, ["systemctl", "--user", "start", SERVICE])
+        _run(command_fn, ["systemctl", "--user", "start", service])
         deadline = clock_fn() + poll_timeout
         actual = _wait_runtime(status_fn, target["snapshot"], interpreter, releases,
                                proc_root, approved_interpreters, attempts, sleep_fn,
-                               deadline, clock_fn)
+                               deadline, clock_fn, expected_launch, observe_startup)
         observed_new = dict(actual)
+        _assert_resources(plan, state)
+        _assert_unit_argv(plan, new_argv)
         if verify_fn is not None:
             verify_fn(actual)
+        _assert_resources(plan, state)
         return {"status": "tunnel_ready", **actual}
     except BaseException as cause:
         reason = _error_code(cause) or "TUNNEL_SWITCH_FAILED"
@@ -840,23 +1199,36 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
                 releases=releases, proc_root=proc_root,
                 approved_interpreters=approved_interpreters, attempts=attempts,
                 deadline=deadline, clock_fn=clock_fn, sleep_fn=sleep_fn)
+            if current is None:
+                stopped_deadline = clock_fn() + poll_timeout
+                _wait_stopped(old, proc_root, attempts, sleep_fn,
+                              stopped_deadline, clock_fn)
+                if observed_new is not None:
+                    _wait_stopped(observed_new, proc_root, attempts, sleep_fn,
+                                  stopped_deadline, clock_fn)
             old_interpreter = _approved_interpreter(
                 Path(old["interpreter"]), approved_interpreters)
             old_runtime = _verify_runtime(Path(old["server"]).parent, releases)
             old_admission = _verify_workspace_launch(
                 old_runtime["runtime"], authority_dir,
             )
-            old_command = _workspace_command(
-                old_admission, old_runtime["runtime"], old_interpreter,
-                authority_dir, controller_dir,
-            )
+            if managed is not None:
+                try:
+                    old_command = managed_command(old_runtime["runtime"], managed["environment"],
+                                                  home=managed["home"])
+                except LayoutError as exc:
+                    raise TunnelSwitchError(exc.code) from exc
+            else:
+                old_command = _workspace_command(
+                    old_admission, old_runtime["runtime"], old_interpreter,
+                    authority_dir, controller_dir)
             old_argv = _write_target(plan, state, old_command)
             _assert_resources(plan, state)
             _run(command_fn, ["systemctl", "--user", "daemon-reload"])
             _assert_resources(plan, state)
             _assert_unit_argv(plan, old_argv)
             if current:
-                _run(command_fn, ["systemctl", "--user", "stop", SERVICE])
+                _run(command_fn, ["systemctl", "--user", "stop", service])
                 deadline = clock_fn() + poll_timeout
                 _wait_stopped(current, proc_root, attempts, sleep_fn,
                               deadline, clock_fn)
@@ -866,11 +1238,14 @@ def switch_tunnel(new_runtime, *, interpreter, status_fn, command_fn, plan=None,
                 _transition_workspace_launch(old_runtime["runtime"], authority_dir)
             else:
                 _verify_workspace_launch(old_runtime["runtime"], authority_dir)
-            _run(command_fn, ["systemctl", "--user", "start", SERVICE])
+            _run(command_fn, ["systemctl", "--user", "start", service])
             deadline = clock_fn() + poll_timeout
             _wait_runtime(status_fn, old_runtime["snapshot"], old_interpreter,
                           releases, proc_root, approved_interpreters, attempts,
-                          sleep_fn, deadline, clock_fn)
+                          sleep_fn, deadline, clock_fn,
+                          ({"command_argv": old["command_argv"],
+                            "launch_environment": managed["environment"]}
+                           if managed is not None else None))
         except BaseException as rollback_error:
             if _is_interrupt(rollback_error):
                 raise

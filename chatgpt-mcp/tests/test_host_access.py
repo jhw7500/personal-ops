@@ -243,6 +243,19 @@ class HostAccessTests(unittest.TestCase):
         self.assertEqual(
             datetime.fromisoformat(grant["expires_at"]), self.now + timedelta(days=30))
 
+    def test_legacy_grant_rejects_null_expiry_as_malformed_state(self):
+        self.approve(duration_seconds=60)
+        path = self.access._record_path("personal-ops")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["grant"]["expires_at"] = None
+        path.write_text(json.dumps(record), encoding="utf-8")
+        path.chmod(0o600)
+
+        self.assert_error(
+            "HOST_ACCESS_STATE_INVALID",
+            lambda: self.access.require("personal-ops"),
+        )
+
     def test_thirty_day_grant_survives_reconnect_and_expires_at_the_limit(self):
         grant = self.approve(duration_seconds=30 * 24 * 60 * 60)
         before = self.access._record_path("personal-ops").read_bytes()
@@ -299,10 +312,10 @@ class HostAccessTests(unittest.TestCase):
         self.assertEqual(status["expires_at"], grant["expires_at"])
 
     def test_opening_and_cancelling_card_preserves_existing_grant_options(self):
-        grant = self.approve(allow_codex=True, duration_seconds=28_800)
+        grant = self.approve(allow_codex=False, duration_seconds=28_800)
         approvals = HostAccessApprovals(self.access)
-        result = approvals.open("personal-ops", duration_seconds=60, allow_codex=False)
-        self.assertEqual(self.access.require("personal-ops", codex=True), grant)
+        result = approvals.open("personal-ops", duration_seconds=60, allow_codex=True)
+        self.assertEqual(self.access.require("personal-ops"), grant)
         card = result["structuredContent"]
         approvals.cancel(
             "personal-ops", card_id=card["card_id"],
@@ -312,12 +325,26 @@ class HostAccessTests(unittest.TestCase):
             {"personal-ops": self.project_root}, self.state_root,
             trusted_runtime=lambda: self.runtime_identity,
         )
-        self.assertEqual(reconnected.require("personal-ops", codex=True), grant)
+        self.assertEqual(reconnected.require("personal-ops"), grant)
+
+    def test_legacy_card_open_reuses_suitable_timed_grant(self):
+        grant = self.approve(allow_codex=True, duration_seconds=28_800)
+        approvals = HostAccessApprovals(self.access)
+
+        result = approvals.open(
+            "personal-ops", duration_seconds=60, allow_codex=False,
+        )
+
+        self.assertEqual(result["structuredContent"]["state"], "approved")
+        self.assertEqual(result["structuredContent"]["grant"], grant)
+        self.assertNotIn("_meta", result)
+        self.assertFalse(approvals._path("personal-ops").exists())
+        self.assertEqual(self.access.get("personal-ops")["requests"], [])
 
     def test_approval_receipt_require_expiry_and_revoke(self):
         grant = self.approve(duration_seconds=60)
         self.assertEqual(set(grant), {
-            "grant_id", "expires_at", "allow_codex", "project", "scope",
+            "grant_id", "expires_at", "allow_codex", "allow_git", "project", "scope",
         })
         self.assertEqual(grant["project"], "personal-ops")
         self.assertEqual(grant["scope"], "installation")

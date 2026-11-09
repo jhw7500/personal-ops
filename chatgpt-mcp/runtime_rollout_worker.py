@@ -26,6 +26,52 @@ from workspace_control import (  # noqa: E402
 )
 
 
+def _load_frozen_rollout(file: Path, operation_id: str):
+    """Load approved rollout helpers without replacing installed modules.
+
+    The installed manager and its genuine WebRolloutGrant must remain cached:
+    they own the claimed plan. Frozen v3 target/layout/authority helpers instead
+    live in a one-operation namespace rooted at the approved snapshot.
+    """
+    if (not isinstance(operation_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None):
+        raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
+    file = Path(file)
+    package_name = "_approved_runtime_rollout_" + operation_id
+    module_name = package_name + ".host_runtime"
+    if any(name == package_name or name.startswith(package_name + ".")
+           for name in sys.modules):
+        raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
+    package_spec = importlib.util.spec_from_loader(
+        package_name, loader=None, is_package=True)
+    if package_spec is None:
+        raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
+    package = importlib.util.module_from_spec(package_spec)
+    package.__path__ = [str(file.parent)]
+    spec = importlib.util.spec_from_file_location(module_name, file)
+    if spec is None or spec.loader is None:
+        raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[package_name] = package
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        target = getattr(module, "_rollout_target", None)
+        authority = getattr(module, "_rollout_authority", None)
+        if (getattr(target, "__name__", None) != package_name + ".rollout_target"
+                or getattr(authority, "__name__", None)
+                != package_name + ".rollout_authority"
+                or getattr(authority, "verify_web_rollout_grant", None)
+                is not getattr(target, "verify_web_rollout_grant", None)):
+            raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
+        return module
+    except BaseException:
+        for name in tuple(sys.modules):
+            if name == package_name or name.startswith(package_name + "."):
+                sys.modules.pop(name, None)
+        raise
+
+
 def _safe_failure_code(exc):
     candidates = (getattr(exc, "code", None), str(exc))
     for value in candidates:
@@ -63,12 +109,7 @@ def main(argv=None):
         file = frozen / "chatgpt-mcp" / "rollout-host-runtime.py"
         if not file.is_file() or file.is_symlink():
             raise HostRuntimeError("ROLLOUT_SNAPSHOT_MISSING")
-        sys.path.insert(0, str(file.parent))
-        spec = importlib.util.spec_from_file_location("approved_runtime_rollout", file)
-        if spec is None or spec.loader is None:
-            raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = _load_frozen_rollout(file, operation_id)
         receipt = module.RolloutReceipt(mode="apply")
         with rollout_lock():
             with receipt.phase("rollout"):

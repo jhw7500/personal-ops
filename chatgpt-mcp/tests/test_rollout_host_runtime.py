@@ -36,10 +36,34 @@ class RolloutTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn("tests/" + name, module.control_inventory())
 
+    def setUp(self):
+        from rollout_layout import known_layout
+        self.layout = known_layout("legacy")
+        target = patch.object(module._rollout_target, "resolve_rollout_target",
+                              return_value=self.layout)
+        target.start()
+        self.addCleanup(target.stop)
+        self.authority_preflight_data = {
+            "version": 1, "layout": "legacy", "live_snapshot": OLD_LIVE["snapshot"],
+            "authority_active": False,
+        }
+        authority = patch.object(module._rollout_authority,
+                                 "preflight_rollout_authority",
+                                 return_value=self.authority_preflight_data)
+        self.authority_preflight = authority.start()
+        self.addCleanup(authority.stop)
+        admission = patch.object(module._rollout_authority, "admit_rollout_release", return_value={
+            "status": "not_required", "authority_active": False,
+            "release_digest": "c" * 64, "release_abi": 3,
+        })
+        self.release_admission = admission.start()
+        self.addCleanup(admission.stop)
+
     def test_approval_browser_fixture_is_pinned_with_preflight_inputs(self):
         for path in ("tests/check_host_access_approval_ui.py",
                      "tests/check_schema014_approval_ui.py",
                      "tests/check_host_command_approval_ui.py",
+                     "tests/check_development_approval_ui.py",
                      "tests/test_runtime_rollout_ui.py",
                      "tests/test_workspace_approval_browser.py",
                      "tests/test_git_commit_access_browser.py",
@@ -53,6 +77,7 @@ class RolloutTest(unittest.TestCase):
         for stage, filename in (("checks_approval_ui", "check_host_access_approval_ui.py"),
                                 ("checks_schema014_ui", "check_schema014_approval_ui.py"),
                                 ("checks_host_command_ui", "check_host_command_approval_ui.py"),
+                                ("checks_development_approval_ui", "check_development_approval_ui.py"),
                                 ("checks_runtime_rollout_ui", "test_runtime_rollout_ui.py"),
                                 ("checks_workspace_approval_browser", "test_workspace_approval_browser.py"),
                                 ("checks_git_commit_access_browser", "test_git_commit_access_browser.py"),
@@ -185,7 +210,7 @@ class RolloutTest(unittest.TestCase):
                  patch("sys.stdout", new_callable=io.StringIO):
                 module.run_checks()
 
-            self.assertEqual(len(private_homes), 10)
+            self.assertEqual(len(private_homes), 11)
             self.assertTrue(all(not home.exists() for home in private_homes))
 
     def test_checks_fail_closed_when_pinned_node_is_unavailable(self):
@@ -443,6 +468,10 @@ class RolloutTest(unittest.TestCase):
             "confirm_and_execute_host_command",
             "cancel_host_command_approval",
             "get_project_resume", "compact_project_memory",
+            "open_git_operation_approval", "confirm_git_operation",
+            "confirm_and_execute_git_operation", "cancel_git_operation_approval",
+            "open_operation_approval", "confirm_operation_approval",
+            "confirm_and_execute_operation", "cancel_operation_approval",
         }
         self.assertEqual(module.TOOL_NAMES, expected)
         self.assertIn("tests.test_toss_console_ux019", module.TESTS)
@@ -497,6 +526,236 @@ class RolloutTest(unittest.TestCase):
                          "tunnel-123")
         self.assertIsNone(module._find_id({"runtime": {"tunnel_id": "../x"}}))
 
+
+    def test_wsl_status_uses_verified_service_observer_instead_of_registry(self):
+        from rollout_layout import known_layout
+        layout = known_layout("wsl-pc1")
+        expected = {"process_running": True, "healthy": True, "ready": True}
+        command = lambda *args, **kwargs: b""
+        with patch("rollout_tunnel.wsl_runtime_status", return_value=expected) as observer, \
+             patch.object(module, "run_command", side_effect=AssertionError("stale registry must not run")):
+            result = module.runtime_status("ignored-client", layout=layout, command_fn=command)
+        self.assertIs(result, expected)
+        observer.assert_called_once_with(layout, command_fn=command)
+
+    def test_service_commands_are_bound_to_the_selected_layout(self):
+        import subprocess
+        from rollout_layout import known_layout
+        layout = known_layout("wsl-pc1")
+        with patch.object(module, "run_command", return_value=subprocess.CompletedProcess([],0,b"")) as run:
+            module.service_command(["systemctl","--user","stop",layout["service"]],layout=layout)
+            self.assertEqual(run.call_args.kwargs["stage"],"tunnel_stop")
+            with self.assertRaisesRegex(RuntimeError,"UNEXPECTED_SERVICE_COMMAND"):
+                module.service_command(["systemctl","--user","stop","personal-ops-tunnel.service"],layout=layout)
+            for action in ("start", "stop", "restart"):
+                with self.subTest(action=action), self.assertRaisesRegex(RuntimeError,"UNEXPECTED_SERVICE_COMMAND"):
+                    service = "personal-ops-admin.service" if action == "restart" else layout["service"]
+                    module.service_command(["systemctl","--user",action,service,
+                                            "personal-ops-agent-foreign.service"],layout=layout)
+            self.assertEqual(run.call_count,1)
+
+    def test_wsl_rollout_uses_the_reviewed_service_profile_and_catalog(self):
+        from rollout_layout import known_layout
+        layout = known_layout("wsl-pc1")
+        commands = []
+        marker = {"reviewed_fixture": True}
+        def command(argv, **kwargs):
+            commands.append(argv)
+            return b"fixture unit"
+        def preflight(before, *, unit_fn, **kwargs):
+            self.assertEqual(kwargs["layout"],layout)
+            self.assertEqual(kwargs["profile_path"],layout["profile_path"])
+            self.assertEqual(kwargs["override_path"],layout["override_path"])
+            self.assertEqual(kwargs["client"],layout["client"])
+            self.assertEqual(unit_fn(),b"fixture unit")
+            return marker
+        observed={"tools_registered":True,"connector_schemas_verified":True,"catalog_status":"observed","tool_count":7}
+        with self.apply_fixture() as (switch,admin), \
+             patch.object(module._rollout_target, "resolve_rollout_target",
+                          return_value=layout), \
+             patch("rollout_tunnel.preflight_tunnel",side_effect=preflight), \
+             patch.object(module,"observe_tools",return_value=observed) as observe:
+            result=module.rollout(apply=True,status_fn=self.healthy_status,command_fn=command)
+        self.assertEqual(result["status"],"ready")
+        self.assertIn(["systemctl","--user","cat",layout["service"]],commands)
+        self.assertFalse(any("personal-ops-tunnel.service" in argv for argv in commands))
+        self.assertIs(switch.call_args.kwargs["plan"],marker)
+        self.assertEqual(switch.call_args.kwargs["client"],layout["client"])
+        observe.assert_called_once_with(module.TOOL_NAMES,url_file=layout["health_url_file"])
+
+    def test_web_legacy_instance_uses_complete_source_contract_verifier(self):
+        import hashlib
+        from runtime_rollout_web import WebRolloutGrant
+        digest=hashlib.sha256(json.dumps({"server.py":"b"*64},sort_keys=True).encode()).hexdigest()[:20]
+        grant=WebRolloutGrant("1"*32,"2"*64,digest,"3"*64,Path("/fixture/state"))
+        with self.apply_fixture(), \
+             patch.object(WebRolloutGrant,"verify",side_effect=AssertionError("old verifier alone is incomplete")), \
+             patch.object(module._rollout_target, "verify_web_rollout_grant",
+                          return_value=self.layout) as verify:
+            expected_inventory = module.inventory
+            expected_controls = module.control_inventory
+            result=module.rollout(apply=True,approved_web=grant,status_fn=self.healthy_status,
+                                  command_fn=lambda *args,**kwargs:b"")
+        self.assertEqual(result["status"],"ready")
+        self.assertIs(verify.call_args.args[0],grant)
+        self.assertEqual(verify.call_args.args[1],module.HERE.parent)
+        self.assertIs(verify.call_args.args[3],expected_inventory)
+        self.assertIs(verify.call_args.args[4],expected_controls)
+
+    def test_verified_web_layout_mismatch_blocks_install_and_switch(self):
+        import hashlib
+        from rollout_layout import known_layout
+        from runtime_rollout_web import WebRolloutGrant
+        digest=hashlib.sha256(json.dumps({"server.py":"b"*64},sort_keys=True).encode()).hexdigest()[:20]
+        grant=WebRolloutGrant("1"*32,"2"*64,digest,"3"*64,Path("/fixture/state"))
+        with self.apply_fixture() as (switch,admin), \
+             patch.object(module._rollout_target, "verify_web_rollout_grant",
+                          return_value=known_layout("wsl-pc1")):
+            installer=module._import_installer()
+            with patch.object(installer,"install",side_effect=AssertionError("unexpected install")) as install:
+                with self.assertRaisesRegex(RuntimeError,"ROLLOUT_TARGET_CHANGED"):
+                    module.rollout(apply=True,approved_web=grant,status_fn=self.healthy_status,
+                                   command_fn=lambda *args,**kwargs:b"")
+                install.assert_not_called()
+            switch.assert_not_called()
+            admin.assert_not_called()
+
+    def test_source_layout_change_blocks_install_before_any_switch(self):
+        from rollout_layout import known_layout
+        with self.apply_fixture() as (switch,admin), \
+             patch.object(module._rollout_target, "resolve_rollout_target",
+                          side_effect=[self.layout,known_layout("wsl-pc1")]):
+            installer=module._import_installer()
+            with patch.object(installer,"install",side_effect=AssertionError("unexpected install")) as install:
+                with self.assertRaisesRegex(RuntimeError,"ROLLOUT_TARGET_CHANGED"):
+                    module.rollout(apply=True,status_fn=self.healthy_status,
+                                   command_fn=lambda *args,**kwargs:b"")
+                install.assert_not_called()
+            switch.assert_not_called()
+            admin.assert_not_called()
+
+
+
+    def web_grant_fixture(self):
+        import hashlib
+        from runtime_rollout_web import WebRolloutGrant
+        digest = hashlib.sha256(json.dumps({"server.py": "b" * 64}, sort_keys=True).encode()).hexdigest()[:20]
+        return WebRolloutGrant("1" * 32, "2" * 64, digest, "3" * 64, Path("/fixture/state"))
+
+    def test_preflight_reads_authority_without_admission_or_install(self):
+        with self.apply_fixture() as (switch, admin):
+            installer = module._import_installer()
+            with patch.object(installer, "install", side_effect=AssertionError("unexpected install")) as install:
+                result = module.rollout(status_fn=self.healthy_status,
+                                        command_fn=lambda *args, **kwargs: b"")
+        self.assertEqual(result["status"], "preflight_ok")
+        self.authority_preflight.assert_called_once_with(
+            self.layout, OLD_LIVE["snapshot"], source_root=module.HERE.parent)
+        self.release_admission.assert_not_called()
+        install.assert_not_called()
+        switch.assert_not_called()
+        admin.assert_not_called()
+
+    def test_authority_preflight_failure_blocks_before_install(self):
+        self.authority_preflight.side_effect = RuntimeError("ROLLOUT_AUTHORITY_CHANGED")
+        with self.apply_fixture() as (switch, admin):
+            installer = module._import_installer()
+            with patch.object(installer, "install", side_effect=AssertionError("unexpected install")) as install:
+                with self.assertRaisesRegex(RuntimeError, "ROLLOUT_AUTHORITY_CHANGED"):
+                    module.rollout(apply=True, approved_web=self.web_grant_fixture(),
+                                   status_fn=self.healthy_status,
+                                   command_fn=lambda *args, **kwargs: b"")
+                install.assert_not_called()
+            switch.assert_not_called()
+            admin.assert_not_called()
+        self.release_admission.assert_not_called()
+
+    def test_web_admission_between_install_and_switch_uses_frozen_preflight(self):
+        effects = []
+        grant = self.web_grant_fixture()
+        admission = {"status": "admitted", "authority_active": True,
+                     "release_digest": "c" * 64, "release_abi": 3}
+        def admit(*args, **kwargs):
+            effects.append("admit")
+            self.assertIs(args[0], grant)
+            self.assertEqual(args[1], module.HERE.parent)
+            self.assertIs(kwargs["preflight"], self.authority_preflight_data)
+            return admission
+        self.release_admission.side_effect = admit
+        with self.apply_fixture() as (switch, admin), \
+             patch.object(module._rollout_target, "verify_web_rollout_grant",
+                          return_value=self.layout):
+            installer = module._import_installer()
+            actual_install = installer.install
+            activate = switch.side_effect
+            def install_source(*args):
+                effects.append("install")
+                return actual_install(*args)
+            def activate_source(*args, **kwargs):
+                effects.append("switch")
+                return activate(*args, **kwargs)
+            switch.side_effect = activate_source
+            admin.side_effect = lambda *args, **kwargs: effects.append("admin") or "admin_ready"
+            with patch.object(installer, "install", side_effect=install_source):
+                expected_inventory = module.inventory
+                expected_controls = module.control_inventory
+                result = module.rollout(apply=True, approved_web=grant,
+                                        status_fn=self.healthy_status,
+                                        command_fn=lambda *args, **kwargs: b"")
+        self.assertEqual(effects, ["install", "admit", "switch", "admin"])
+        self.assertIs(self.release_admission.call_args.args[2], installer)
+        self.assertIs(self.release_admission.call_args.args[3], expected_inventory)
+        self.assertIs(self.release_admission.call_args.args[4], expected_controls)
+        self.assertEqual(result["status"], "ready")
+
+    def test_failed_web_admission_keeps_services_unchanged(self):
+        self.release_admission.side_effect = RuntimeError("ROLLOUT_AUTHORITY_CHANGED")
+        with self.apply_fixture() as (switch, admin), \
+             patch.object(module._rollout_target, "verify_web_rollout_grant",
+                          return_value=self.layout):
+            with self.assertRaisesRegex(RuntimeError, "ROLLOUT_AUTHORITY_CHANGED"):
+                module.rollout(apply=True, approved_web=self.web_grant_fixture(),
+                               status_fn=self.healthy_status,
+                               command_fn=lambda *args, **kwargs: b"")
+            switch.assert_not_called()
+            admin.assert_not_called()
+
+    def test_tty_approval_does_not_issue_web_release_admission(self):
+        with self.apply_fixture():
+            result = module.rollout(apply=True, status_fn=self.healthy_status,
+                                    command_fn=lambda *args, **kwargs: b"")
+        self.assertEqual(result["status"], "ready")
+        self.authority_preflight.assert_called_once()
+        self.release_admission.assert_not_called()
+
+
+    def test_preflight_tty_and_web_results_finish_the_original_receipt_contract(self):
+        from rollout_diagnostics import RolloutReceipt
+        for mode in ("preflight", "tty", "web"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary, \
+                 self.apply_fixture(), \
+                 patch.object(module._rollout_target, "verify_web_rollout_grant",
+                              return_value=self.layout):
+                receipt = RolloutReceipt(temporary, mode="preflight" if mode == "preflight" else "apply")
+                result = module.rollout(
+                    apply=mode != "preflight",
+                    approved_web=self.web_grant_fixture() if mode == "web" else None,
+                    receipt=receipt, status_fn=self.healthy_status,
+                    command_fn=lambda *args, **kwargs: b"")
+                receipt.finish(result, 0)
+                saved = json.loads(receipt.path.read_text())
+                self.assertEqual(saved["exit_code"], 0)
+                self.assertEqual(saved["status"], "preflight_ok" if mode == "preflight" else "ready")
+                admitted = [event for event in saved["events"]
+                            if event["stage"] == "release_admission_result"]
+                if mode == "web":
+                    self.assertEqual(len(admitted), 1)
+                    self.assertEqual(admitted[0]["state"], "completed")
+                    self.assertEqual(admitted[0]["status"], "not_required")
+                    self.assertEqual(admitted[0]["snapshot"], result["snapshot"])
+                else:
+                    self.assertEqual(admitted, [])
+
     def test_preflight_requires_checks_and_never_installs(self):
         fake = types.SimpleNamespace()
         def must_not_install(*args):
@@ -542,7 +801,6 @@ class RolloutTest(unittest.TestCase):
                  patch.object(module, "_key_check"), \
                  patch.object(module, "runtime_interpreter", return_value="/fixture/python"), \
                  patch.object(module, "expected_tool_names", return_value=module.TOOL_NAMES), \
-                 patch.object(module, "_authorize_workspace_rollout") as authorize, \
                  patch.object(module, "CliSessionObserver",
                               partial(module.CliSessionObserver, proc_root=proc)), \
                  patch("server.load_projects", return_value={}), \
@@ -560,7 +818,6 @@ class RolloutTest(unittest.TestCase):
                     verify_fn(after)
                     return dict(after, status="tunnel_ready")
                 switch.side_effect = activate
-                switch.authorize = authorize
                 yield switch, admin
 
     def healthy_status(self, _):
@@ -568,19 +825,6 @@ class RolloutTest(unittest.TestCase):
                 "process_running": True, "healthy": True, "ready": True,
                 "target_value": "/fixture/new/server.py"}
 
-
-    def test_apply_authorizes_target_and_rollback_before_tunnel_switch(self):
-        with self.apply_fixture() as (switch, _admin):
-            result = module.rollout(
-                apply=True, status_fn=self.healthy_status,
-                command_fn=lambda *args, **kw: b"",
-            )
-        self.assertEqual(result["status"], "ready")
-        switch.authorize.assert_called_once()
-        projects, target_runtime, rollback_runtime = switch.authorize.call_args.args
-        self.assertEqual(projects, {})
-        self.assertEqual(Path(target_runtime).name, "c" * 20)
-        self.assertEqual(rollback_runtime, Path("/fixture/old"))
 
     def test_healthy_profile_target_cannot_hide_old_actual_mcp(self):
         with self.apply_fixture(live_after=OLD_LIVE) as (switch, admin):
@@ -626,7 +870,7 @@ class RolloutTest(unittest.TestCase):
             module.rollout(apply=True, status_fn=self.healthy_status,
                            command_fn=lambda *args, **kw: b"")
         expected.assert_called_once_with({})
-        observe.assert_called_once_with(policy_tools)
+        observe.assert_called_once_with(policy_tools, url_file=self.layout["health_url_file"])
 
     def test_success_receipt_contains_cli_observations_at_each_switch_boundary(self):
         from rollout_diagnostics import RolloutReceipt

@@ -26,6 +26,7 @@ class FakeAccess:
         self.allow_codex = True
         self.grant_id = "g" * 32
         self.expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        self.lifetime = "timed"
 
     def require(self, project, *, grant_id=None, codex=False):
         if self.revoked or grant_id not in (None, self.grant_id):
@@ -34,7 +35,8 @@ class FakeAccess:
             raise HostRuntimeError("HOST_ACCESS_CODEX_DENIED")
         return {"project": project, "grant_id": self.grant_id,
                 "expires_at": self.expires_at, "allow_codex": self.allow_codex,
-                "scope": "host-user"}
+                "scope": "host-user", "lifetime": self.lifetime,
+                "version": 2, "grant_state_revision": 2}
 
     @contextmanager
     def guard(self, project, grant_id, *, codex=False):
@@ -135,23 +137,49 @@ class HostExecutionTests(unittest.IsolatedAsyncioTestCase):
         workspace.authority.initialize(snapshot.digest, {"f" * 64: 1})
         return workspace
 
-    async def test_two_commands_one_grant_and_request_id_idempotency(self):
-        first = self.prepare()
-        duplicate = self.prepare()
-        self.assertEqual(duplicate["operation_id"], first["operation_id"])
+    async def test_ten_commands_reuse_one_grant_and_request_ids_remain_idempotent(self):
+        plans = [self.prepare(f"request-{index}", argv=[str(index)]) for index in range(10)]
+        duplicate = self.prepare("request-0", argv=["0"])
+        self.assertEqual(duplicate["operation_id"], plans[0]["operation_id"])
         with self.assertRaisesRegex(HostRuntimeError, "REQUEST_ID_CONFLICT"):
-            self.prepare(argv=["different"])
-        second = self.prepare("request-2", argv=["two"])
-        self.assertNotEqual(first["operation_id"], second["operation_id"])
-        self.assertEqual(first["authorization"]["grant_id"], self.access.grant_id)
+            self.prepare("request-0", argv=["different"])
+        self.assertEqual(len({plan["operation_id"] for plan in plans}), 10)
+        self.assertTrue(all(
+            plan["authorization"]["grant_id"] == self.access.grant_id for plan in plans
+        ))
 
-        await self.manager.execute("demo", first["operation_id"])
-        self.assertEqual((await self.wait_terminal(first["operation_id"]))["state"],
+        for plan in plans:
+            await self.manager.execute("demo", plan["operation_id"])
+            self.assertEqual((await self.wait_terminal(plan["operation_id"]))["state"],
+                             "succeeded")
+            await self.manager.execute("demo", plan["operation_id"])
+        self.assertEqual(len(self.runner.calls), 10)
+
+    async def test_until_revoked_grant_keeps_finite_job_timeout(self):
+        self.access.lifetime = "until_revoked"
+        self.access.expires_at = None
+
+        plan = self.prepare(timeout_seconds=1800)
+
+        self.assertEqual(plan["authorization"]["lifetime"], "until_revoked")
+        self.assertIsNone(plan["authorization"]["expires_at"])
+        await self.manager.execute("demo", plan["operation_id"])
+        self.assertEqual((await self.wait_terminal(plan["operation_id"]))["state"],
                          "succeeded")
-        await self.manager.execute("demo", second["operation_id"])
-        self.assertEqual((await self.wait_terminal(second["operation_id"]))["state"],
-                         "succeeded")
-        self.assertEqual(len(self.runner.calls), 2)
+        self.assertEqual(self.runner.calls[0][0]["timeout_seconds"], 1800)
+
+    def test_grant_lifetime_and_expiry_combinations_are_exact(self):
+        cases = (
+            ("timed", None),
+            ("until_revoked", self.access.expires_at),
+            ("forever", None),
+        )
+        for lifetime, expires_at in cases:
+            with self.subTest(lifetime=lifetime, expires_at=expires_at):
+                self.access.lifetime = lifetime
+                self.access.expires_at = expires_at
+                with self.assertRaisesRegex(HostRuntimeError, "INVALID_HOST_ACCESS_GRANT"):
+                    self.prepare(f"invalid-{lifetime}")
 
     def test_public_work_context_separates_reported_label_from_safe_command_hint(self):
         npm = self.base / "npm"

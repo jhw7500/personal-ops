@@ -17,6 +17,7 @@ import asyncio,sys
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
 import server,host_access
+from rollout_layout import known_layout
 from runtime_rollout_web import RuntimeRolloutWeb
 root=Path(sys.argv[2])
 host_access._installed_runtime_identity=lambda:'a'*64
@@ -24,7 +25,7 @@ def fake(argv):
  p=root/'executions';p.write_text(str(int(p.read_text())+1) if p.exists() else '1');return True
 manager=RuntimeRolloutWeb({'personal-ops':root/'repo'},state_dir=root/'operation-state',launcher=fake,
  runtime_reader=lambda:'a'*64,boot_reader=lambda:'11111111-2222-3333-4444-555555555555',
- uid_reader=lambda:1000,test_only=True)
+ uid_reader=lambda:1000,layout_reader=lambda:known_layout("wsl-pc1"),test_only=True)
 server.RuntimeRolloutWeb=lambda *a,**k:manager
 asyncio.run(server.serve_with_shutdown({'personal-ops':root/'repo'}))
 """

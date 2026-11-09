@@ -24,7 +24,7 @@ if __name__ == "__main__":
       plan_digest: '3'.repeat(64), source_digest: '4'.repeat(64), control_digest: '5'.repeat(64), source_files: 213,
       expires_at: '2099-01-01T00:00:00Z', executes_on_approval: false, receipt_verified: false,
       impact: {restart: ['personal-ops-tunnel.service','personal-ops-admin.service'], preserve: ['API','Worker','PostgreSQL','Toss TEST bundle']},
-      plan: {project: 'personal-ops', operation_id: '1'.repeat(32), plan_digest: '3'.repeat(64), source_digest: '4'.repeat(64), control_digest: '5'.repeat(64), target_snapshot: '6'.repeat(20), expires_at:'2099-01-01T00:00:00Z'}
+      plan: {target_layout: 'legacy', project: 'personal-ops', operation_id: '1'.repeat(32), plan_digest: '3'.repeat(64), source_digest: '4'.repeat(64), control_digest: '5'.repeat(64), target_snapshot: '6'.repeat(20), expires_at:'2099-01-01T00:00:00Z', impact: {restart: ['personal-ops-tunnel.service','personal-ops-admin.service'], preserve: ['API','Worker','PostgreSQL','Toss TEST bundle']}}
     };
     window.calls = []; window.contexts = []; window.states = []; window.sizes = [];
     window.failNext = false; window.mismatchNext = false; window.approvalWon = false;
@@ -159,6 +159,44 @@ if __name__ == "__main__":
                     self.assertEqual(self.page.evaluate("calls"), [])
                     self.assertNotIn("a" * 64, frame.locator("body").inner_text())
                     self.page.reload()
+
+        def _host_with_rollout_restart(self, *, target_layout):
+            service = "personal-ops-coding-wsl-pc1.service"
+            html = HOST.replace("personal-ops-tunnel.service", service)
+            html = html.replace(
+                "target_layout: 'legacy'",
+                "target_layout: '" + target_layout + "'",
+            )
+            self.context.unroute("https://approval.test/**")
+            self.context.route(
+                "https://approval.test/**",
+                lambda route: route.fulfill(
+                    content_type="text/html",
+                    body=HTML.read_text(encoding="utf-8")
+                    if route.request.url.endswith("/approval")
+                    else html,
+                ),
+            )
+
+        def test_wsl_layout_card_accepts_exact_wsl_restart(self):
+            self._host_with_rollout_restart(target_layout="wsl-pc1")
+            frame = self.open()
+            expect(frame.get_by_text(
+                "personal-ops-coding-wsl-pc1.service · personal-ops-admin.service",
+                exact=True,
+            )).to_be_visible()
+            expect(frame.get_by_role("button", name="이 계획 승인")).to_be_enabled()
+            self.assertEqual(self.page.evaluate("calls"), [])
+
+        def test_mismatched_layout_and_service_rejected(self):
+            self._host_with_rollout_restart(target_layout="legacy")
+            self.page.goto("https://approval.test/")
+            frame = self.page.frame_locator("iframe")
+            expect(frame.get_by_role("status")).to_contain_text(
+                "승인 카드 데이터를 확인할 수 없습니다"
+            )
+            expect(frame.get_by_role("button", name="이 계획 승인")).to_be_disabled()
+            self.assertEqual(self.page.evaluate("calls"), [])
 
         def test_confirm_issues_receipt_only_and_keeps_capability_out_of_context(self):
             frame = self.open()

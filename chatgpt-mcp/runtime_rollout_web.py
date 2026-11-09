@@ -25,6 +25,11 @@ from host_runtime_config import HostRuntimeError, TRUSTED_APPROVAL_ORIGIN, priva
 from host_runtime_operations import (_digest, _lock, _read_private_json,
                                      _save_private_json, _verified_installation,
                                      acquire_flock)
+from rollout_layout import known_layout
+from rollout_target import (CONTROL_CONTRACT_VERSION, CONTROL_V3,
+                            approved_control_digest, control_contract_version,
+                            expected_rollout_snapshots, resolve_rollout_target,
+                            verify_web_rollout_grant)
 from workspace_control import (DEFAULT_CONTROLLER_DIR, WorkspaceControlError,
                                activation_admission, transition_release,
                                verify_controller, verify_launch)
@@ -43,11 +48,7 @@ EXTENSIONS = frozenset({".py", ".js", ".html", ".css", ".json", ".yaml", ".yml",
                         ".c", ".mjs", ".txt"})
 OMIT_DIRS = frozenset({".git", ".venv", ".serena", ".pytest_cache",
                       "__pycache__", "node_modules", "dist", "build"})
-CONTROL = ("rollout-host-runtime.py", "rollout_test_runner.py", "rollout_tunnel.py",
-           "rollout_admin.py", "rollout_catalog.py", "rollout_diagnostics.py",
-           "install-runtime.py", "configure-host-runtime.py",
-           "tossapp_neutral_ab24_command.js")
-LEGACY_CONTROL_OMIT = "tossapp_neutral_ab24_command.js"
+CONTROL = CONTROL_V3
 RUNNER_NAME = "runtime_rollout_worker.py"
 TERMINAL = frozenset({"succeeded", "failed", "verification_required",
                        "outcome_unknown", "expired", "cancelled"})
@@ -256,114 +257,38 @@ def _static_tuple(root: Path, label: str) -> tuple[str, ...]:
     raise HostRuntimeError("ROLLOUT_SOURCE_INCOMPLETE")
 
 
-def _expected_snapshots(root: Path) -> tuple[str, str]:
-    """Compute digests using the official rollout's public stable formats."""
-    files = _static_tuple(root, "FILES")
-    dash = _static_tuple(root, "DASHBOARD_FILES")
-    if len(set(files)) != len(files) or len(set(dash)) != len(dash):
-        raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
-    manifest = {}
-    for filename in files:
-        if filename.startswith("/") or ".." in Path(filename).parts:
-            raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
-        data, _ = _source_bytes(root / "chatgpt-mcp" / filename, root)
-        manifest[filename] = hashlib.sha256(data).hexdigest()
-    for filename in dash:
-        if filename.startswith("/") or ".." in Path(filename).parts:
-            raise HostRuntimeError("ROLLOUT_SOURCE_UNSAFE")
-        data, _ = _source_bytes(root / "work-dashboard" / filename, root)
-        manifest["work-dashboard/" + filename] = hashlib.sha256(data).hexdigest()
-    target = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:20]
-    control = {}
-    for name in CONTROL:
-        data, _ = _source_bytes(root / "chatgpt-mcp" / name, root)
-        control[name] = hashlib.sha256(data).hexdigest()
-    for path in sorted((root / "chatgpt-mcp/tests").glob("test_*.py")):
-        data, _ = _source_bytes(path, root)
-        control["tests/" + path.name] = hashlib.sha256(data).hexdigest()
-    # Match the official rollout's standalone approval UI checks exactly.
-    for name in ("check_host_access_approval_ui.py", "check_schema014_approval_ui.py",
-                 "check_host_command_approval_ui.py"):
-        ui_check = root / "chatgpt-mcp/tests" / name
-        data, _ = _source_bytes(ui_check, root)
-        control["tests/" + ui_check.name] = hashlib.sha256(data).hexdigest()
-    tests_dir = root / "chatgpt-mcp/tests"
-    required_node_ui = tests_dir / "test_workspace_approval_ui.mjs"
-    if not required_node_ui.is_file() or required_node_ui.is_symlink():
-        raise HostRuntimeError("ROLLOUT_SOURCE_INCOMPLETE")
-    node_ui_inputs = [required_node_ui]
-    node_ui_inputs.extend(sorted(
-        path for path in tests_dir.glob("test_*.mjs") if path != required_node_ui
-    ))
-    for path in node_ui_inputs:
-        data, _ = _source_bytes(path, root)
-        control["tests/" + path.name] = hashlib.sha256(data).hexdigest()
-    control_digest = hashlib.sha256(json.dumps(control, sort_keys=True).encode()).hexdigest()
-    return target, control_digest
-
-
-def _approved_control_matches(approved: str, expected: str, observed: dict) -> bool:
-    """Accept the current digest or the immediately previous bootstrap format only."""
-    current = hashlib.sha256(json.dumps(observed, sort_keys=True).encode()).hexdigest()
-    if current != expected:
-        return False
-    if approved == current:
-        return True
-    if LEGACY_CONTROL_OMIT not in observed:
-        return False
-    legacy = dict(observed)
-    legacy.pop(LEGACY_CONTROL_OMIT)
-    legacy_digest = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
-    return approved == legacy_digest
+def _expected_snapshots(root: Path, *, contract_version=CONTROL_CONTRACT_VERSION) -> tuple[str, str]:
+    """Compute the explicitly versioned source and approval-control digests."""
+    return expected_rollout_snapshots(root, contract_version=contract_version)
 
 
 class WebRolloutGrant:
     """Process-local proof returned only by an atomic approved-plan claim."""
     def __init__(self, operation_id: str, source_digest: str, target_snapshot: str,
-                 control_digest: str, state_root: Path):
+                 control_digest: str, state_root: Path, *, source_mode="project",
+                 source_policy_digest="0" * 64, control_contract_version=1,
+                 target_layout=None, layout_reader=None):
         self.operation_id = operation_id
         self.source_digest = source_digest
         self.target_snapshot = target_snapshot
         self.control_digest = control_digest
         self.state_root = state_root
+        self.source_mode = source_mode
+        self.source_policy_digest = source_policy_digest
+        self.control_contract_version = control_contract_version
+        self.target_layout = target_layout
+        self.layout_reader = layout_reader
 
     def verify(self, root: Path, installer, inventory_fn, controls_fn) -> None:
-        """Require a *consumed* approval owned by THIS worker before any effect."""
-        if not isinstance(self.operation_id, str) or not HEX32.fullmatch(self.operation_id):
-            raise RuntimeError("WEB_ROLLOUT_GRANT_INVALID")
-        try:
-            plan = _read_private_json(
-                self.state_root / "plans" / (self.operation_id + ".json"))
-            fixed = plan["immutable"]
-            if (plan["state"] != "running" or plan.get("worker_pid") != os.getpid()
-                    or fixed.get("source_digest") != self.source_digest
-                    or fixed.get("target_snapshot") != self.target_snapshot
-                    or fixed.get("control_digest") != self.control_digest
-                    or plan.get("plan_digest") != _digest(fixed)):
-                raise RuntimeError("WEB_ROLLOUT_GRANT_INVALID")
-        except (OSError, HostRuntimeError, KeyError, TypeError):
-            raise RuntimeError("WEB_ROLLOUT_GRANT_INVALID") from None
-        actual_source = _catalog(root)
-        expected, control = _expected_snapshots(root)
-        official = inventory_fn(installer)
-        official_manifest = {name.removeprefix("chatgpt-mcp/"): digest
-                             for name, digest in official.items()}
-        observed_snapshot = hashlib.sha256(
-            json.dumps(official_manifest, sort_keys=True).encode()
-        ).hexdigest()[:20]
-        observed_control_map = controls_fn()
-        if (actual_source["digest"] != self.source_digest
-                or expected != self.target_snapshot
-                or observed_snapshot != self.target_snapshot
-                or not _approved_control_matches(
-                    self.control_digest, control, observed_control_map
-                )):
-            raise RuntimeError("WEB_ROLLOUT_SOURCE_CHANGED")
+        """Require a consumed approval and all current source/control gates."""
+        verify_web_rollout_grant(self, root, installer, inventory_fn, controls_fn,
+                                 layout_reader=self.layout_reader)
 
 
 class RuntimeRolloutWeb:
     def __init__(self, projects: dict, *, state_dir: Path, launcher=None, observer=None,
-                 boot_reader=None, runtime_reader=None, uid_reader=None, test_only=False):
+                 boot_reader=None, runtime_reader=None, uid_reader=None, layout_reader=None,
+                 test_only=False):
         if PROJECT not in projects:
             raise HostRuntimeError("ROLLOUT_SCOPE_UNAVAILABLE")
         self.root = Path(projects[PROJECT]).resolve(strict=True)
@@ -382,6 +307,7 @@ class RuntimeRolloutWeb:
         self.boot_reader = boot_reader or _boot_id
         self.runtime_reader = runtime_reader or host_access._installed_runtime_identity
         self.uid_reader = uid_reader or os.getuid
+        self.layout_reader = layout_reader
         self._trusted = _verified_installation() or bool(test_only and launcher is not None)
 
     def _trusted_only(self):
@@ -401,6 +327,7 @@ class RuntimeRolloutWeb:
                 or plan.get("plan_digest") != _digest(fixed)
                 or fixed.get("operation_id") != operation_id):
             raise HostRuntimeError("ROLLOUT_PLAN_INVALID")
+        control_contract_version(fixed)
         if "approval_context" in fixed:
             self._stored_approval_context(plan)
         return plan
@@ -487,12 +414,15 @@ class RuntimeRolloutWeb:
     @staticmethod
     def _public(plan):
         fixed = plan["immutable"]
+        version = control_contract_version(fixed)
+        target_layout = fixed.get("target_layout", "legacy")
         return {"project": PROJECT, "operation_id": plan["operation_id"],
                 "state": plan["state"], "phase": plan["phase"], "code": plan.get("code"),
                 "source_digest": fixed["source_digest"],
                 "plan_digest": plan["plan_digest"],
                 "target_snapshot": fixed["target_snapshot"],
                 "control_digest": fixed["control_digest"],
+                "control_contract_version": version, "target_layout": target_layout,
                 "source_files": fixed["source_files"],
                 "source_bytes": fixed["source_bytes"],
                 "created_at": plan["created_at"], "expires_at": fixed["expires_at"],
@@ -506,7 +436,7 @@ class RuntimeRolloutWeb:
                 "approval_card": {"tool": "open_runtime_rollout_approval", "arguments": {
                     "project": PROJECT, "operation_id": plan["operation_id"]}}
                     if plan["state"] in {"pending_host_approval", "approved"} else None,
-                "impact": {"restart": ["personal-ops-tunnel.service", "personal-ops-admin.service"],
+                "impact": {"restart": [known_layout(target_layout)["service"], "personal-ops-admin.service"],
                            "preserve": ["API", "Worker", "PostgreSQL", "Toss TEST bundle"]},
                 "approval_url": TRUSTED_APPROVAL_ORIGIN + "/runtime-rollouts?operation_id="
                 + plan["operation_id"]
@@ -568,16 +498,18 @@ class RuntimeRolloutWeb:
         self._save(plan)
         return plan
 
-    def _source_root(self):
+    def _source_root(self, contract_version=CONTROL_CONTRACT_VERSION):
         # No unregistered chat-provided source root. The owner-only
         # policy is revalidated on every prepare/approval/claim.
         return select_scoped_source(
             self.project_root, catalog=_catalog,
-            expected_snapshots=_expected_snapshots)
+            expected_snapshots=lambda root: _expected_snapshots(
+                root, contract_version=contract_version))
 
     def _check_source(self, plan):
         fixed = plan["immutable"]
-        source_root, source_mode, policy_digest = self._source_root()
+        version = control_contract_version(fixed)
+        source_root, source_mode, policy_digest = self._source_root(version)
         if (fixed.get("source_mode", "project") != source_mode
                 or fixed.get("source_policy_digest", "0" * 64) != policy_digest):
             raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
@@ -587,11 +519,21 @@ class RuntimeRolloutWeb:
         snapshots = [_catalog(source_root), _catalog(frozen)]
         if any(catalog["digest"] != fixed["source_digest"] for catalog in snapshots):
             raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
-        current_target, current_control = _expected_snapshots(source_root)
-        frozen_target, frozen_control = _expected_snapshots(frozen)
+        current_target, current_control = _expected_snapshots(
+            source_root, contract_version=version)
+        frozen_target, frozen_control = _expected_snapshots(frozen, contract_version=version)
+        try:
+            current_approved = approved_control_digest(source_root, fixed)
+            frozen_approved = approved_control_digest(frozen, fixed)
+        except RuntimeError:
+            raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED") from None
         if (current_target != fixed["target_snapshot"] or frozen_target != current_target
-                or current_control != fixed["control_digest"] or frozen_control != current_control):
+                or current_control != frozen_control
+                or current_approved != fixed["control_digest"]
+                or frozen_approved != current_approved):
             raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
+        resolve_rollout_target(frozen, pinned_layout=fixed.get("target_layout"),
+                               layout_reader=self.layout_reader)
         return frozen
 
     def _retire_source_stale_unstarted(self, plan):
@@ -622,7 +564,8 @@ class RuntimeRolloutWeb:
         self._trusted_only()
         if project != PROJECT or not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
-        source_root, source_mode, policy_digest = self._source_root()
+        source_root, source_mode, policy_digest = self._source_root(
+            CONTROL_CONTRACT_VERSION)
         from host_runtime_operations import _lock
         with _lock(self.lock):
             for path in self.plans_dir.glob("*.json"):
@@ -646,7 +589,9 @@ class RuntimeRolloutWeb:
                 staged = _catalog(frozen)
                 if base["digest"] != staged["digest"]:
                     raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
-                target, control = _expected_snapshots(frozen)
+                target, control = _expected_snapshots(
+                    frozen, contract_version=CONTROL_CONTRACT_VERSION)
+                layout = resolve_rollout_target(frozen, layout_reader=self.layout_reader)
                 if _catalog(source_root)["digest"] != base["digest"]:
                     raise HostRuntimeError("ROLLOUT_SOURCE_CHANGED")
                 fixed = {"project": PROJECT, "operation_id": operation_id,
@@ -654,6 +599,8 @@ class RuntimeRolloutWeb:
                          "source_mode": source_mode,
                          "source_policy_digest": policy_digest,
                          "target_snapshot": target, "control_digest": control,
+                         "control_contract_version": CONTROL_CONTRACT_VERSION,
+                         "target_layout": layout["name"],
                          "source_files": base["count"], "source_bytes": base["bytes"],
                          "approval_context": self._current_approval_context(),
                          "nonce": secrets.token_hex(32),
@@ -836,7 +783,12 @@ class RuntimeRolloutWeb:
             fixed = plan["immutable"]
             return self.snapshots_dir / operation_id, WebRolloutGrant(
                 operation_id, fixed["source_digest"], fixed["target_snapshot"],
-                fixed["control_digest"], self.state_root)
+                fixed["control_digest"], self.state_root,
+                source_mode=fixed.get("source_mode", "project"),
+                source_policy_digest=fixed.get("source_policy_digest", "0" * 64),
+                control_contract_version=control_contract_version(fixed),
+                target_layout=fixed.get("target_layout"),
+                layout_reader=self.layout_reader)
 
     def finish_from_worker(self, operation_id, result: dict):
         self._trusted_only()

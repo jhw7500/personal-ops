@@ -11,6 +11,7 @@ from unittest import mock
 from datetime import timedelta
 import host_access
 from host_runtime_config import HostRuntimeError
+from rollout_layout import known_layout
 from runtime_rollout_web import RuntimeRolloutWeb, PROJECT, _utc, PLAN_TTL
 
 
@@ -42,6 +43,7 @@ class RuntimeChatTest(unittest.TestCase):
             runtime_reader=lambda: self.identity,
             boot_reader=lambda: self.boot_id,
             uid_reader=lambda: 1000,
+            layout_reader=lambda: known_layout("wsl-pc1"),
             test_only=True,
         )
         self.cards = self.ui.RuntimeRolloutApprovals(
@@ -80,7 +82,7 @@ class RuntimeChatTest(unittest.TestCase):
         self.assertEqual(p["target_snapshot"], self.plan["target_snapshot"])
         self.assertEqual(
             p["impact"]["restart"],
-            ["personal-ops-tunnel.service", "personal-ops-admin.service"],
+            ["personal-ops-coding-wsl-pc1.service", "personal-ops-admin.service"],
         )
         self.assertIn("PostgreSQL", p["impact"]["preserve"])
         self.assertNotIn(token, json.dumps(p) + json.dumps(r["content"]))

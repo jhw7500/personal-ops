@@ -20,6 +20,7 @@ if __name__ == "__main__":
     REPOSITORY = MODULE_DIR.parent
     sys.path.insert(0, str(MODULE_DIR))
 
+    from rollout_layout import known_layout  # noqa: E402
     import runtime_rollout_web  # noqa: E402
     from admin_server import create_server  # noqa: E402
     from runtime_rollout_web import RuntimeRolloutWeb  # noqa: E402
@@ -64,6 +65,7 @@ if __name__ == "__main__":
                 runtime_reader=lambda: "a" * 64,
                 boot_reader=lambda: "11111111-2222-3333-4444-555555555555",
                 uid_reader=lambda: 1000,
+                layout_reader=lambda: known_layout("wsl-pc1"),
                 test_only=True,
             )
             token_path = self.base / "private" / "admin-token"

@@ -55,7 +55,11 @@ TOOLS = (PROJECT_TOOLS | {"list_projects", "open_project_picker", "select_projec
          | SETTINGS_TOOLS | EXECUTION_TOOLS | GIT_TOOLS | MEMORY_TOOLS | PROGRESS_TOOLS | RESUME_TOOLS
          | {"report_work_events"} | REGISTERED_HOST_TOOLS | AGENT_TOOLS | HOST_COMMAND_TOOLS
          | HOST_EXECUTION_TOOLS | HOST_ACCESS_APPROVAL_TOOLS | HOST_COMMAND_APPROVAL_TOOLS
-         | GIT_CHAT_APPROVAL_TOOLS | GIT_COMMIT_ACCESS_TOOLS | REGISTERED_CHAT_APPROVAL_TOOLS)
+         | GIT_CHAT_APPROVAL_TOOLS | GIT_COMMIT_ACCESS_TOOLS | REGISTERED_CHAT_APPROVAL_TOOLS
+         | {"open_git_operation_approval", "confirm_git_operation",
+            "confirm_and_execute_git_operation", "cancel_git_operation_approval",
+            "open_operation_approval", "confirm_operation_approval",
+            "confirm_and_execute_operation", "cancel_operation_approval"})
 TOOL_PROPERTIES = {
     "read_file": {"relative_path", "start_line", "end_line", "max_answer_chars"},
     "list_dir": {"relative_path", "recursive", "skip_ignored_files", "max_answer_chars"},
@@ -225,7 +229,11 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
                                     descriptor = tools_by_name[name]
                                     self.assertEqual(descriptor.meta["ui"]["visibility"], ["model"])
                                     self.assertFalse(descriptor.meta["openai/widgetAccessible"])
-                                    self.assertNotIn("openai/outputTemplate", descriptor.meta)
+                                    if name == "prepare_git_operation":
+                                        self.assertEqual(descriptor.meta["openai/outputTemplate"],
+                                                         "ui://git-operations/approval-v2.html")
+                                    else:
+                                        self.assertNotIn("openai/outputTemplate", descriptor.meta)
                                     self.assertEqual(descriptor.inputSchema["properties"]["project"]["enum"],
                                                      ["alpha", "beta"])
                                     self.assertIn("project", descriptor.inputSchema["required"])
@@ -519,11 +527,13 @@ class MultiProjectRouterTest(unittest.IsolatedAsyncioTestCase):
 
                                 resources = await client.list_resources()
                                 self.assertEqual({str(item.uri) for item in resources.resources}, {
-                                    UI_URI, "ui://host-access/approval-v2.html",
+                                    UI_URI, "ui://host-access/approval-v3.html",
                                     "ui://host-commands/approval-v1.html",
                                     "ui://git-operations/approval-v1.html",
+                                    "ui://git-operations/approval-v2.html",
                                     "ui://git-commit-access/approval-v1.html",
-                                    "ui://host-operations/registered-approval-v1.html"})
+                                    "ui://host-operations/registered-approval-v1.html",
+                                    "ui://operations/approval-v1.html"})
                                 resource = next(item for item in resources.resources
                                                 if str(item.uri) == UI_URI)
                                 self.assertEqual(str(resource.uri), UI_URI)

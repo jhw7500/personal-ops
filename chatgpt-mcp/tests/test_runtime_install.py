@@ -28,9 +28,13 @@ HOST_COMMAND_MODULES = ("host_command_profiles.py", "host_command_entry.py",
                         "host_command_runner.py", "host_command_supervisor.py",
                         "host_command_operations.py", "host_command_tools.py",
                         "host-command-admin.js", "host_command_ui.py", "host-command-approval.html")
-HOST_ACCESS_MODULES = ("host_access.py", "host_execution.py", "host_execution_tools.py",
+HOST_ACCESS_MODULES = ("host_access.py", "host_access_installation.py",
+                       "host_execution.py", "host_execution_tools.py",
                        "host_agent.py", "host-access-admin.js", "host_access_ui.py",
                        "host-access-approval.html")
+CHAT_APPROVAL_FILES = ("git_operation_ui.py", "git-operation-approval.html",
+                       "operation_approval_ui.py", "operation-approval.html",
+                       "rollout_layout.py", "rollout_target.py", "rollout_authority.py")
 WORKROOM_AUTHORITY_FILES = ("workroom-frame.html", "workroom-frame.js", "workroom-bridge.js")
 PROBE = '''
 import sys
@@ -189,6 +193,11 @@ class VerifiedInstallationTest(unittest.TestCase):
                          "admin_server.py", "admin.html", "admin.js", "admin.css"} <= verified)
         self.assertTrue({'work-dashboard/' + name for name in installer.DASHBOARD_FILES} <= verified)
 
+    def test_chat_approval_assets_are_packaged_and_verified(self):
+        import host_runtime_operations
+        self.assertTrue(set(CHAT_APPROVAL_FILES) <= set(installer.FILES))
+        self.assertTrue(set(CHAT_APPROVAL_FILES) <= set(host_runtime_operations.VERIFIED_RUNTIME_FILES))
+
     def test_one_changed_byte_in_any_verified_runtime_file_makes_it_untrusted(self):
         import host_runtime_operations
         with tempfile.TemporaryDirectory(prefix="verified-install-") as folder:
@@ -212,6 +221,7 @@ class VerifiedInstallationTest(unittest.TestCase):
 
             self.assertEqual(probe(), ["True", "True"])
             for name in (*REGISTERED_MODULES, *AGENT_MODULES, *HOST_COMMAND_MODULES,
+                         *HOST_ACCESS_MODULES, *CHAT_APPROVAL_FILES,
                          "work-dashboard/visualizer.js", "admin.js"):
                 with self.subTest(name=name):
                     self.assertIn(name, host_runtime_operations.VERIFIED_RUNTIME_FILES)

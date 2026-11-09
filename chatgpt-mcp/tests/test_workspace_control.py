@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from workspace_authority import WorkspaceAuthority  # noqa: E402
-from workspace_control import (MANDATORY_RELEASE_FILES, WorkspaceControlError,  # noqa: E402
+from workspace_control import (ABI3_MANDATORY_RELEASE_FILES, MANDATORY_RELEASE_FILES,  # noqa: E402
+                               WorkspaceControlError,
                                install_controller, main, transition_release,
                                verify_launch)
 
@@ -27,6 +29,8 @@ POLICY_B = "b" * 64
 def load_launcher():
     path = ROOT / "workspace-launcher.py"
     spec = importlib.util.spec_from_file_location("workspace_launcher_test", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -54,12 +58,28 @@ class WorkspaceControlTest(unittest.TestCase):
         self.assertTrue({"workspace_files.py", "workspace_host.py"}
                         <= MANDATORY_RELEASE_FILES)
 
-    def make_release(self, marker, *, omit=()):
+    def make_release(self, marker, *, omit=(), enforcement_abi=None,
+                     capability_generation=None, overrides=None):
         manifest = {}
-        for name in MANDATORY_RELEASE_FILES:
+        contents = {}
+        overrides = overrides or {}
+        files = set(MANDATORY_RELEASE_FILES)
+        if enforcement_abi is not None and enforcement_abi >= 3:
+            files.update(ABI3_MANDATORY_RELEASE_FILES)
+        for name in files:
             if name in omit:
                 continue
-            content = f"{marker}:{name}\n".encode()
+            content = overrides.get(name)
+            if content is None:
+                content = ((f"# {marker}:{name}\n" if name == "workspace_control.py"
+                            and enforcement_abi is not None else
+                            f"{marker}:{name}\n").encode())
+            if name == "workspace_control.py" and enforcement_abi is not None:
+                content += f"ENFORCEMENT_ABI = {enforcement_abi}\n".encode()
+                if capability_generation is not None:
+                    content += ("HOST_ACCESS_CAPABILITY_GENERATION = "
+                                f"{capability_generation}\n").encode()
+            contents[name] = content
             manifest[name] = hashlib.sha256(content).hexdigest()
         digest = hashlib.sha256(
             json.dumps(manifest, sort_keys=True).encode()
@@ -69,7 +89,7 @@ class WorkspaceControlTest(unittest.TestCase):
         for name in manifest:
             path = release / name
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            path.write_bytes(f"{marker}:{name}\n".encode())
+            path.write_bytes(contents[name])
             path.chmod(0o600)
         (release / "manifest.json").write_text(
             json.dumps(manifest, sort_keys=True), encoding="utf-8",
@@ -93,7 +113,9 @@ class WorkspaceControlTest(unittest.TestCase):
         self.assertFalse(self.authority_dir.exists())
 
     def test_active_authority_accepts_only_reviewed_full_manifest_digest_and_abi(self):
-        release, digest = self.make_release("compatible")
+        release, digest = self.make_release(
+            "compatible", enforcement_abi=3, capability_generation=1,
+        )
         binding = self.authority({digest: 3}).binding(POLICY_A)
 
         result = verify_launch(release, self.authority_dir)
@@ -103,6 +125,72 @@ class WorkspaceControlTest(unittest.TestCase):
         self.assertEqual(result["release_abi"], 3)
         self.assertEqual(result["binding"], binding)
         self.assertEqual(result["authority_dir"], str(self.authority_dir.absolute()))
+
+    def test_floor_two_still_validates_declared_release_abi(self):
+        release, digest = self.make_release("floor-two", enforcement_abi=1)
+        authority = WorkspaceAuthority(
+            {"demo": self.project}, state_dir=self.authority_dir,
+        )
+        authority.initialize(POLICY_A, {digest: 2}, minimum_abi=2)
+
+        self.assert_code(
+            "WORKSPACE_RELEASE_ABI_MISMATCH",
+            lambda: verify_launch(release, self.authority_dir),
+        )
+
+    def test_historical_abi_two_release_does_not_require_v3_host_access_helper(self):
+        release, digest = self.make_release(
+            "historical-two", enforcement_abi=2,
+            omit={"host_access.py", "host_access_installation.py"},
+        )
+        authority = WorkspaceAuthority(
+            {"demo": self.project}, state_dir=self.authority_dir,
+        )
+        authority.initialize(POLICY_A, {digest: 2}, minimum_abi=2)
+
+        admitted = verify_launch(release, self.authority_dir)
+
+        self.assertEqual(admitted["release_abi"], 2)
+        self.assertIsNone(admitted["host_access_capability_generation"])
+
+    def test_abi_three_release_requires_v3_host_access_helper(self):
+        release, digest = self.make_release(
+            "abi-three-missing-helper", enforcement_abi=3,
+            capability_generation=1,
+            omit={"host_access_installation.py"},
+        )
+        authority = WorkspaceAuthority(
+            {"demo": self.project}, state_dir=self.authority_dir,
+        )
+        authority.initialize(POLICY_A, {digest: 3}, minimum_abi=3)
+
+        self.assert_code(
+            "WORKSPACE_RELEASE_INCOMPATIBLE",
+            lambda: verify_launch(release, self.authority_dir),
+        )
+
+    def test_unknown_future_release_abi_is_rejected(self):
+        release, digest = self.make_release("future", enforcement_abi=4)
+        self.authority({digest: 4})
+
+        self.assert_code(
+            "WORKSPACE_RELEASE_INCOMPATIBLE",
+            lambda: verify_launch(release, self.authority_dir),
+        )
+
+    def test_abi_three_admission_exposes_declared_host_access_generation(self):
+        release, digest = self.make_release(
+            "abi-three", enforcement_abi=3, capability_generation=7,
+        )
+        authority = WorkspaceAuthority(
+            {"demo": self.project}, state_dir=self.authority_dir,
+        )
+        authority.initialize(POLICY_A, {digest: 3}, minimum_abi=3)
+
+        result = verify_launch(release, self.authority_dir)
+
+        self.assertEqual(result["enforcement_abi"], 3)
+        self.assertEqual(result["host_access_capability_generation"], 7)
 
     def test_enforcement_latch_blocks_legacy_after_authority_root_deletion(self):
         release, digest = self.make_release("compatible")
@@ -199,9 +287,54 @@ class WorkspaceControlTest(unittest.TestCase):
             release.absolute(), canonical.absolute(), enforcement_required=True,
         )
         execute.assert_called_once_with("/usr/bin/python3", [
-            "/usr/bin/python3", "-I",
+            "/usr/bin/python3", "-I", "-c", mock.ANY,
+            str(release.absolute()),
             str(release.absolute() / "runtime_rollout_worker.py"), "job-1",
         ])
+
+    def test_isolated_launcher_uses_only_admitted_release_for_sibling_imports(self):
+        server = b"""\
+import json
+import os
+import sys
+from jobs import SIBLING_VALUE
+print(json.dumps({
+    "argv": sys.argv,
+    "prefix": sys.prefix,
+    "sibling": SIBLING_VALUE,
+    "sys_path": sys.path,
+    "xdg_state_home": os.environ.get("XDG_STATE_HOME"),
+}, sort_keys=True))
+"""
+        release, digest = self.make_release(
+            "isolated", overrides={"server.py": server,
+                                   "jobs.py": b'SIBLING_VALUE = "verified"\n'},
+        )
+        xdg_state = self.root / "isolated-state"
+        authority_dir = xdg_state / "chatgpt-coding-mcp" / "workspace-authority"
+        WorkspaceAuthority(
+            {"demo": self.project}, state_dir=authority_dir,
+        ).initialize(POLICY_A, {digest: 1})
+        rogue = self.root / "rogue-pythonpath"
+        rogue.mkdir()
+        environment = dict(os.environ, XDG_STATE_HOME=str(xdg_state),
+                           PYTHONPATH=str(rogue))
+
+        completed = subprocess.run(
+            [sys.executable, "-B", str(ROOT / "workspace-launcher.py"),
+             "--authority-dir", str(authority_dir), "--release", str(release),
+             "--interpreter", sys.executable, "--isolated", "--", "one", "two"],
+            cwd=self.root, env=environment, text=True, capture_output=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["sibling"], "verified")
+        self.assertEqual(result["argv"], [str(release / "server.py"), "one", "two"])
+        self.assertEqual(Path(result["prefix"]), Path(sys.prefix))
+        self.assertEqual(result["sys_path"][0], str(release))
+        self.assertNotIn(str(rogue), result["sys_path"])
+        self.assertEqual(result["xdg_state_home"], str(xdg_state))
 
     def test_unlisted_tampered_incomplete_or_replaced_release_is_denied(self):
         compatible, compatible_digest = self.make_release("compatible")

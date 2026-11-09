@@ -10,6 +10,7 @@ import threading
 import unittest
 
 from admin_server import create_server, APPROVAL_BODIES
+from rollout_layout import known_layout
 from runtime_rollout_web import RuntimeRolloutWeb
 
 
@@ -30,6 +31,7 @@ class RuntimeRolloutHTTPTest(unittest.TestCase):
             runtime_reader=lambda: "a" * 64,
             boot_reader=lambda: "11111111-2222-3333-4444-555555555555",
             uid_reader=lambda: 1000,
+            layout_reader=lambda: known_layout("wsl-pc1"),
             test_only=True)
         self.plan = self.manager.prepare("personal-ops", "web-approval-test")
         private = self.base / "private"

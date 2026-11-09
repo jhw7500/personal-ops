@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager, nullcontext
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -26,12 +27,57 @@ from rollout_catalog import observe_tools
 from rollout_diagnostics import (RECEIPT_ROOT, CliSessionObserver, RolloutReceipt,
                                  is_interruption, run_command, safe_error)
 from rollout_test_runner import EXCLUDED_TEST_METHODS
-from workspace_authority import WorkspaceAuthority
-from workspace_control import (DEFAULT_AUTHORITY_DIR, WorkspaceControlError,
-                               release_enforcement_abi, verify_launch,
-                               verify_release_manifest)
 
 HERE = Path(__file__).resolve().parent
+
+
+def _frozen_helpers():
+    """Route rollout-only helpers to this exact approved source directory."""
+    if __package__ and __package__.startswith("_approved_runtime_rollout_"):
+        package_name = __package__
+    else:
+        identity = hashlib.sha256(os.fsencode(str(HERE))).hexdigest()[:32]
+        package_name = "_approved_runtime_rollout_" + identity
+    package = sys.modules.get(package_name)
+    created = package is None
+    if created:
+        package_spec = importlib.util.spec_from_loader(
+            package_name, loader=None, is_package=True)
+        if package_spec is None:
+            raise RuntimeError("ROLLOUT_SOURCE_UNSAFE")
+        package = importlib.util.module_from_spec(package_spec)
+        package.__path__ = [str(HERE)]
+        sys.modules[package_name] = package
+    elif getattr(package, "__path__", None) != [str(HERE)]:
+        raise RuntimeError("ROLLOUT_SOURCE_UNSAFE")
+    try:
+        target = importlib.import_module(package_name + ".rollout_target")
+        authority = importlib.import_module(package_name + ".rollout_authority")
+        expected = {
+            target: HERE / "rollout_target.py",
+            authority: HERE / "rollout_authority.py",
+        }
+        for module, path in expected.items():
+            module_file = getattr(module, "__file__", None)
+            if (not isinstance(module_file, str)
+                    or Path(module_file).is_symlink()
+                    or Path(module_file).resolve(strict=True) != path.resolve(strict=True)):
+                raise RuntimeError("ROLLOUT_SOURCE_UNSAFE")
+        if (getattr(target, "CONTROL_CONTRACT_VERSION", None) != 3
+                or getattr(authority, "verify_web_rollout_grant", None)
+                is not getattr(target, "verify_web_rollout_grant", None)):
+            raise RuntimeError("ROLLOUT_SOURCE_UNSAFE")
+        return target, authority
+    except BaseException:
+        if created:
+            for name in tuple(sys.modules):
+                if name == package_name or name.startswith(package_name + "."):
+                    sys.modules.pop(name, None)
+        raise
+
+
+_rollout_target, _rollout_authority = _frozen_helpers()
+
 ALIAS = "personal-ops-coding"
 KEY_FILE = Path.home() / ".config/chatgpt-coding-mcp/runtime-key"
 RELEASE_ROOT = Path.home() / ".local/lib/chatgpt-coding-mcp/releases"
@@ -86,6 +132,12 @@ TESTS = (
     "tests.test_admin_host_command_approval",
     "tests.test_host_access", "tests.test_host_execution", "tests.test_host_execution_tools",
     "tests.test_chat_host_access_approval", "tests.test_chat_host_access_router",
+    "tests.test_host_access_installation", "tests.test_development_approval_router",
+    "tests.test_git_workflows", "tests.test_git_chat_approval",
+    "tests.test_operation_chat_approval", "tests.test_rollout_dependencies",
+    "tests.test_operation_approval_cancellation", "tests.test_git_grant_acceptance",
+    "tests.test_rollout_layout", "tests.test_runtime_rollout_contract",
+    "tests.test_rollout_authority",
     "tests.test_host_agent", "tests.test_host_agent_entry", "tests.test_admin_host_access",
     "tests.test_execution",
     "tests.test_workspace_policy", "tests.test_workspace_authority",
@@ -136,6 +188,10 @@ TOOL_NAMES = {
     "open_host_command_approval", "confirm_host_command_approval", "cancel_host_command_approval",
     "confirm_and_execute_host_command",
     "get_project_resume", "compact_project_memory",
+    "open_git_operation_approval", "confirm_git_operation",
+    "confirm_and_execute_git_operation", "cancel_git_operation_approval",
+    "open_operation_approval", "confirm_operation_approval",
+    "confirm_and_execute_operation", "cancel_operation_approval",
 }
 # This surface is configured only when personal-ops is available. Keep the
 # expected names independent from catalog_refresh.tool_specs() so registration
@@ -156,6 +212,8 @@ WORKSPACE_OUTPUT_TOOL_NAMES = frozenset({
 def _import_installer():
     script = HERE / "install-runtime.py"
     spec = importlib.util.spec_from_file_location("host_runtime_installer", script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("ROLLOUT_SOURCE_UNSAFE")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -176,15 +234,12 @@ def inventory(installer):
 
 def control_inventory():
     """Pin the rollout helpers and regression inputs as well as runtime files."""
-    names = ("rollout-host-runtime.py", "rollout_test_runner.py",
-             "rollout_tunnel.py", "rollout_admin.py", "rollout_catalog.py",
-             "rollout_diagnostics.py", "install-runtime.py", "configure-host-runtime.py",
-             "tossapp_neutral_ab24_command.js")
-    paths = [HERE / name for name in names]
+    paths = [HERE / name for name in _rollout_target.CONTROL_V3]
     paths.extend(sorted((HERE / "tests").glob("test_*.py")))
     paths.append(HERE / "tests/check_host_access_approval_ui.py")
     paths.append(HERE / "tests/check_schema014_approval_ui.py")
     paths.append(HERE / "tests/check_host_command_approval_ui.py")
+    paths.append(HERE / "tests/check_development_approval_ui.py")
     paths.extend(node_ui_test_inputs())
     result = {}
     for path in paths:
@@ -204,10 +259,22 @@ def runtime_interpreter(interpreter=sys.executable):
 
 
 def runtime_node():
-    verified_node = Path.home() / ".nvm/versions/node/v24.12.0/bin/node"
-    if verified_node.is_file() and os.access(verified_node, os.X_OK):
-        return str(verified_node)
+    home = Path.home()
+    for verified_node in (
+        home / ".nvm/versions/node/v24.12.0/bin/node",
+        home / "mcp-comparison/tools/node-v24.12.0-linux-x64/bin/node",
+    ):
+        if verified_node.is_file() and os.access(verified_node, os.X_OK):
+            return str(verified_node)
     raise RuntimeError("ROLLOUT_NODE_UNAVAILABLE")
+
+
+def browser_test_interpreter():
+    # Keep browser dependencies isolated from the installed MCP interpreter.
+    approved = Path.home() / ".local/share/uv/tools/playwright/bin/python"
+    if approved.is_file() and os.access(approved, os.X_OK):
+        return str(approved)
+    return "/usr/bin/python3"
 
 
 def expected_tool_names(projects, *, config_path=None, authority_dir=None):
@@ -254,6 +321,7 @@ def run_checks(interpreter=sys.executable, *, receipt=None):
     # switching a privileged installed runtime. Failure blocks activation.
     interpreter = runtime_interpreter(interpreter)
     node = runtime_node()
+    browser_python = browser_test_interpreter()
     owner_home = Path.home()
     owner_userbase = site.getuserbase()
     approved_venv = owner_home / ".local/share/uv/tools/serena-agent"
@@ -291,17 +359,19 @@ def run_checks(interpreter=sys.executable, *, receipt=None):
         test_runner = str(HERE / "rollout_test_runner.py")
         node_tests = [str(path) for path in node_ui_test_inputs()]
         for stage, argv, timeout in (
-            ("checks_approval_ui", [*environment, "/usr/bin/python3", "-B",
+            ("checks_approval_ui", [*environment, browser_python, "-B",
                                     str(HERE / "tests/check_host_access_approval_ui.py")], 120),
-            ("checks_schema014_ui", [*environment, "/usr/bin/python3", "-B",
+            ("checks_schema014_ui", [*environment, browser_python, "-B",
                                      str(HERE / "tests/check_schema014_approval_ui.py")], 120),
-            ("checks_host_command_ui", [*environment, "/usr/bin/python3", "-B",
+            ("checks_host_command_ui", [*environment, browser_python, "-B",
                                         str(HERE / "tests/check_host_command_approval_ui.py")], 120),
-            ("checks_runtime_rollout_chat_ui", [*environment, "/usr/bin/python3", "-B",
+            ("checks_development_approval_ui", [*environment, browser_python, "-B",
+                                                str(HERE / "tests/check_development_approval_ui.py")], 180),
+            ("checks_runtime_rollout_chat_ui", [*environment, browser_python, "-B",
                                                 str(HERE / "tests/test_runtime_rollout_chat_ui.py")], 120),
-            ("checks_runtime_rollout_ui", [*environment, "/usr/bin/python3", "-B",
+            ("checks_runtime_rollout_ui", [*environment, browser_python, "-B",
                                            str(HERE / "tests/test_runtime_rollout_ui.py")], 120),
-            ("checks_workspace_approval_browser", [*environment, "/usr/bin/python3", "-B",
+            ("checks_workspace_approval_browser", [*environment, browser_python, "-B",
                                                     str(HERE / "tests/test_workspace_approval_browser.py")], 180),
             ("checks_git_commit_access_browser", [*environment, "/usr/bin/python3", "-B",
                                                   str(HERE / "tests/test_git_commit_access_browser.py")], 120),
@@ -345,8 +415,24 @@ def _find_id(value):
     return None
 
 
-def runtime_status(executable, *, receipt=None):
-    result = run_command([executable, "runtimes", "status", ALIAS, "--json"],
+def _selected_layout(layout=None):
+    from rollout_layout import known_layout
+    if layout is None:
+        return known_layout("legacy")
+    if (not isinstance(layout, dict) or layout.get("name") not in {"legacy", "wsl-pc1"}
+            or layout != known_layout(layout["name"])):
+        raise RuntimeError("ROLLOUT_TARGET_INVALID")
+    return layout
+
+
+def runtime_status(executable, *, receipt=None, layout=None, command_fn=None):
+    layout = _selected_layout(layout)
+    if layout["name"] == "wsl-pc1":
+        from rollout_tunnel import wsl_runtime_status
+        commands = command_fn or (lambda argv, **kw:
+            service_command(argv, layout=layout, receipt=receipt, **kw))
+        return wsl_runtime_status(layout, command_fn=commands)
+    result = run_command([executable, "runtimes", "status", layout["alias"], "--json"],
                          stage="tunnel_status", capture=True, max_output=64 * 1024,
                          timeout=20, receipt=receipt)
     if result.returncode:
@@ -368,15 +454,17 @@ def _key_check(path=KEY_FILE):
         raise RuntimeError("UNSAFE_TUNNEL_KEY")
 
 
-def service_command(argv, *, stdout=subprocess.DEVNULL, receipt=None):
-    """Only the existing two user services are controlled by rollout helpers."""
-    services = {"personal-ops-tunnel.service": "tunnel", "personal-ops-admin.service": "admin"}
+def service_command(argv, *, stdout=subprocess.DEVNULL, receipt=None, layout=None):
+    """Control only the reviewed tunnel service and its existing admin service."""
+    layout = _selected_layout(layout)
+    services = {layout["service"]: "tunnel", "personal-ops-admin.service": "admin"}
     if argv == ["systemctl", "--user", "daemon-reload"]:
         stage = "systemd_reload"
     elif (len(argv) >= 4 and argv[:2] == ["systemctl", "--user"]
           and argv[3] in services and argv[2] in {"cat", "show", "start", "stop", "restart"}):
         action = argv[2]
-        if (action in {"start", "stop"} and services[argv[3]] != "tunnel"
+        if (action in {"start", "stop", "restart"} and len(argv) != 4
+                or action in {"start", "stop"} and services[argv[3]] != "tunnel"
                 or action == "restart" and services[argv[3]] != "admin"):
             raise RuntimeError("UNEXPECTED_SERVICE_COMMAND")
         stage = services[argv[3]] + "_" + action
@@ -407,101 +495,27 @@ def _live_fields(live):
                                       "codex_pid", "codex_start_ticks") if key in live}
 
 
-def _verify_approved_web(approved_web, installer, *, catalog_fn=None):
-    """Verify a web grant, with one exact legacy-control bootstrap fallback."""
-    try:
-        approved_web.verify(HERE.parent, installer, inventory, control_inventory)
-        return
-    except RuntimeError as exc:
-        if safe_error(exc) != "WEB_ROLLOUT_SOURCE_CHANGED":
-            raise
-        original = exc
-    if catalog_fn is None:
-        from runtime_rollout_web import _catalog as catalog_fn
-    actual_source = catalog_fn(HERE.parent)
-    official = inventory(installer)
-    manifest = {name.removeprefix("chatgpt-mcp/"): digest
-                for name, digest in official.items()}
-    target = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:20]
-    controls = control_inventory()
-    legacy_key = "tossapp_neutral_ab24_command.js"
-    if legacy_key not in controls:
-        raise original
-    current_digest = hashlib.sha256(
-        json.dumps(controls, sort_keys=True).encode()
-    ).hexdigest()
-    legacy_controls = dict(controls)
-    legacy_controls.pop(legacy_key)
-    legacy_digest = hashlib.sha256(
-        json.dumps(legacy_controls, sort_keys=True).encode()
-    ).hexdigest()
-    if (actual_source.get("digest") != approved_web.source_digest
-            or target != approved_web.target_snapshot
-            or approved_web.control_digest == current_digest
-            or approved_web.control_digest != legacy_digest):
-        raise original
-
-
-def _authorize_workspace_rollout(projects, target_runtime, rollback_runtime,
-                                 authority_dir=None):
-    """Authorize exactly target + rollback releases before a managed switch."""
-    authority_path = Path(
-        authority_dir if authority_dir is not None else DEFAULT_AUTHORITY_DIR
-    ).absolute()
-    target_path = Path(target_runtime).absolute()
-    rollback_path = Path(rollback_runtime).absolute()
-    try:
-        rollback = verify_launch(
-            rollback_path, authority_path, enforcement_required=True
-        )
-        target_release = verify_release_manifest(target_path)
-        target_abi = release_enforcement_abi(target_path)
-        minimum_abi = rollback["minimum_abi"]
-        if target_abi < minimum_abi:
-            raise WorkspaceControlError("WORKSPACE_RELEASE_INCOMPATIBLE")
-        allowed = {target_release["release_digest"]: target_abi}
-        old_digest = rollback["release_digest"]
-        old_abi = rollback["release_abi"]
-        if old_digest in allowed and allowed[old_digest] != old_abi:
-            raise WorkspaceControlError("WORKSPACE_RELEASE_ABI_MISMATCH")
-        allowed[old_digest] = old_abi
-        authority = WorkspaceAuthority(projects, state_dir=authority_path)
-        binding = authority.advance(rollback["binding"]["policy_digest"], allowed)
-        target = verify_launch(
-            target_path, authority_path, enforcement_required=True
-        )
-        restored = verify_launch(
-            rollback_path, authority_path, enforcement_required=True
-        )
-        if target["binding"] != binding or restored["binding"] != binding:
-            raise WorkspaceControlError("WORKSPACE_AUTHORITY_CHANGED")
-        return {
-            "target_digest": target["release_digest"],
-            "target_abi": target["release_abi"],
-            "rollback_digest": restored["release_digest"],
-            "rollback_abi": restored["release_abi"],
-            "authority_epoch": binding["authority_epoch"],
-        }
-    except WorkspaceControlError as exc:
-        raise RuntimeError(exc.code) from exc
-
-
 def rollout(*, apply=False, tunnel_id=None, interpreter=sys.executable,
             status_fn=None, command_fn=None, receipt=None, approved_web=None):
     installer = _import_installer()
     from server import CONFIG, load_projects
     from rollout_admin import AdminSwitchError, preflight_admin, switch_admin
     from rollout_tunnel import TunnelSwitchError, freeze_live_runtime, preflight_tunnel, switch_tunnel
-
+    layout = _rollout_target.resolve_rollout_target(HERE.parent)
     projects = load_projects(CONFIG)
     source_before = inventory(installer)
     controls_before = control_inventory()
     run_checks(interpreter, receipt=receipt)
     if inventory(installer) != source_before or control_inventory() != controls_before:
         raise RuntimeError("SOURCE_CHANGED_DURING_CHECK")
-    client = tunnel_client()
-    read_status = status_fn or (lambda executable: runtime_status(executable, receipt=receipt))
-    call_service = command_fn or (lambda argv, **kw: service_command(argv, receipt=receipt, **kw))
+    if _rollout_target.resolve_rollout_target(
+            HERE.parent, pinned_layout=layout["name"]) != layout:
+        raise RuntimeError("ROLLOUT_TARGET_CHANGED")
+    client = layout["client"] if layout["name"] == "wsl-pc1" else tunnel_client()
+    call_service = command_fn or (lambda argv, **kw:
+        service_command(argv, receipt=receipt, layout=layout, **kw))
+    read_status = status_fn or (lambda executable:
+        runtime_status(executable, receipt=receipt, layout=layout, command_fn=call_service))
     status = read_status(client)
     discovered_id = _find_id(status)
     actual_id = tunnel_id or discovered_id
@@ -509,13 +523,16 @@ def rollout(*, apply=False, tunnel_id=None, interpreter=sys.executable,
         raise RuntimeError("TUNNEL_ID_UNAVAILABLE")
     if tunnel_id and discovered_id and tunnel_id != discovered_id:
         raise RuntimeError("TUNNEL_ID_MISMATCH")
-    _key_check()
+    _key_check(layout["key_file"])
     with receipt.phase("live_runtime_preflight") if receipt else nullcontext():
         before = freeze_live_runtime(status)
         plan = preflight_tunnel(before, unit_fn=lambda: call_service(
-            ["systemctl", "--user", "cat", "personal-ops-tunnel.service"], stdout=subprocess.PIPE),
-            client=client)
+            ["systemctl", "--user", "cat", layout["service"]], stdout=subprocess.PIPE),
+            profile_path=layout["profile_path"], override_path=layout["override_path"],
+            client=client, layout=layout)
         preflight_admin(command_fn=call_service)
+        authority_preflight = _rollout_authority.preflight_rollout_authority(
+            layout, before["snapshot"], source_root=HERE.parent)
     target_manifest = {name.removeprefix("chatgpt-mcp/"): value for name, value in source_before.items()}
     target_digest = hashlib.sha256(json.dumps(target_manifest, sort_keys=True).encode()).hexdigest()[:20]
     alignment = {key: plan[key] for key in ("profile_aligned", "service_aligned") if key in plan}
@@ -535,7 +552,7 @@ def rollout(*, apply=False, tunnel_id=None, interpreter=sys.executable,
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise RuntimeError("HOST_TTY_REQUIRED")
         print("Install reviewed runtime; align only existing tunnel unit/profile MCP command.", flush=True)
-        print("Stop/start the tunnel, including its Codex app-server; restart the recognized admin service.", flush=True)
+        print("Stop/start " + layout["service"] + "; restart personal-ops-admin.service.", flush=True)
         print("Preserve credentials, network settings and old snapshots. No Docker/DB changes or Schema 013 application.", flush=True)
         print("Type ROLLOUT to continue:", flush=True)
         if sys.stdin.readline().strip() != "ROLLOUT":
@@ -544,10 +561,16 @@ def rollout(*, apply=False, tunnel_id=None, interpreter=sys.executable,
         from runtime_rollout_web import WebRolloutGrant
         if type(approved_web) is not WebRolloutGrant:
             raise RuntimeError("WEB_ROLLOUT_GRANT_INVALID")
-        _verify_approved_web(approved_web, installer)
+        verified_layout = _rollout_target.verify_web_rollout_grant(
+            approved_web, HERE.parent, installer, inventory, control_inventory)
+        if verified_layout != layout:
+            raise RuntimeError("ROLLOUT_TARGET_CHANGED")
         if approved_web.target_snapshot != target_digest:
             raise RuntimeError("WEB_ROLLOUT_SOURCE_CHANGED")
-    # Revalidate the source after operator approval, before snapshot creation.
+    # Revalidate the reviewed target and source after approval, before any effect.
+    if _rollout_target.resolve_rollout_target(
+            HERE.parent, pinned_layout=layout["name"]) != layout:
+        raise RuntimeError("ROLLOUT_TARGET_CHANGED")
     if inventory(installer) != source_before or control_inventory() != controls_before:
         raise RuntimeError("SOURCE_CHANGED_DURING_APPROVAL")
     with receipt.phase("snapshot_install") if receipt else nullcontext():
@@ -563,20 +586,25 @@ def rollout(*, apply=False, tunnel_id=None, interpreter=sys.executable,
     if receipt:
         receipt.event("snapshot_installed", "completed", snapshot=installed["snapshot"],
                       previous_snapshot=before["snapshot"], source_files=len(source_before))
+    if approved_web is not None:
+        with receipt.phase("release_admission") if receipt else nullcontext():
+            admission = _rollout_authority.admit_rollout_release(
+                approved_web, HERE.parent, installer, inventory, control_inventory,
+                preflight=authority_preflight)
+            if receipt:
+                receipt.event("release_admission_result", "completed",
+                              status=admission["status"], snapshot=installed["snapshot"])
     catalog = {}
     def verify_live(actual):
         if (actual["snapshot"] != installed["snapshot"]
                 or actual["interpreter"] != runtime_interpreter(interpreter)):
             raise TunnelSwitchError("LIVE_RUNTIME_MISMATCH")
-        catalog.update(observe_tools(expected_tool_names(projects)))
+        catalog.update(observe_tools(expected_tool_names(projects), url_file=layout["health_url_file"]))
         if receipt:
             receipt.event("mcp_discovery", "completed", **catalog)
     excluded = tuple(before[key] for key in ("tunnel_pid", "mcp_pid", "codex_pid") if key in before)
     with CliSessionObserver(receipt, excluded_pids=excluded) as cli:
         with receipt.phase("tunnel_switch") if receipt else nullcontext():
-            _authorize_workspace_rollout(
-                projects, installed["runtime_dir"], Path(before["server"]).parent
-            )
             actual = switch_tunnel(installed["runtime_dir"], interpreter=runtime_interpreter(interpreter),
                                    status_fn=lambda: read_status(client), command_fn=call_service,
                                    plan=plan, client=client, verify_fn=verify_live)
@@ -643,9 +671,11 @@ def main(argv=None):
     try:
         with receipt.phase("rollout"):
             # Interactive and web-approved updates share one owner-only transition lock.
+            transition_lock = nullcontext()
             if args.apply:
-                from runtime_rollout_web import rollout_lock
-            with (rollout_lock() if args.apply else nullcontext()):
+                from runtime_rollout_web import rollout_lock as owner_rollout_lock
+                transition_lock = owner_rollout_lock()
+            with transition_lock:
                 result = rollout(apply=args.apply, tunnel_id=args.tunnel_id, receipt=receipt)
         exit_code = 0 if result["status"] in ("ready", "preflight_ok") else 2
         receipt.finish(result, exit_code)

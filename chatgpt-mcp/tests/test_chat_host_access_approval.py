@@ -59,6 +59,21 @@ class ChatHostAccessApprovalTests(unittest.TestCase):
             function()
         self.assertEqual(caught.exception.code, code)
 
+    def rewrite_card_as_exact_v1(self, result):
+        path = self.cards._path("alpha")
+        card = json.loads(path.read_text())
+        card["version"] = 1
+        card.pop("lifetime")
+        card.pop("grant_state_revision")
+        card.pop("allow_git", None)
+        host_access._save_private_json(path, card)
+        self.assertEqual(set(self.cards._load("alpha")), {
+            "version", "project", "card_id", "request_id", "created_at", "expires_at",
+            "duration_seconds", "allow_codex", "revision", "token_digest", "state",
+            "boot_id", "runtime_identity", "uid", "project_root",
+        })
+        return result
+
     def test_open_is_request_only_and_secret_is_only_in_meta(self):
         result = self.open()
         public = result["structuredContent"]
@@ -129,6 +144,28 @@ class ChatHostAccessApprovalTests(unittest.TestCase):
         self.assertFalse(self.access.get("alpha")["active"])
         self.cards.confirm("alpha", **self.args(updated))
         self.assertTrue(self.access.require("alpha")["allow_codex"])
+
+    def test_exact_v1_card_update_stays_loadable_and_confirmable(self):
+        opened = self.rewrite_card_as_exact_v1(self.open())
+        updated = self.cards.update(
+            "alpha", **self.args(opened), duration_seconds=600, allow_codex=True)
+        from host_access_ui import HostAccessApprovals
+        recreated = HostAccessApprovals(self.access)
+        loaded = recreated._load("alpha")
+        self.assertEqual(loaded["version"], 2)
+        self.assertIsNone(loaded["grant_state_revision"])
+        recreated.confirm("alpha", **self.args(updated))
+        self.assertTrue(self.access.require("alpha")["allow_codex"])
+
+    def test_exact_v1_card_update_stays_loadable_and_cancellable(self):
+        opened = self.rewrite_card_as_exact_v1(self.open())
+        updated = self.cards.update(
+            "alpha", **self.args(opened), duration_seconds=600, allow_codex=False)
+        from host_access_ui import HostAccessApprovals
+        recreated = HostAccessApprovals(self.access)
+        self.assertEqual(recreated._load("alpha")["version"], 2)
+        result = recreated.cancel("alpha", **self.args(updated))
+        self.assertEqual(result["structuredContent"]["state"], "cancelled")
 
     def test_cancel_consumes_card_without_revoking_existing_grant(self):
         self.cards.confirm("alpha", **self.args(self.open()))
@@ -231,14 +268,13 @@ class ChatHostAccessApprovalTests(unittest.TestCase):
         self.assertEqual(self.access.require("alpha"), grant)
 
     def test_cancel_storage_failure_keeps_pending_card_retryable(self):
-        import host_access_ui
         opened = self.open()
-        save = host_access_ui._save_private_json
+        save = host_access._save_private_json
         def fail_request_save(path, value):
             if path == self.access._record_path("alpha"):
                 raise OSError("temporary fixture storage failure")
             return save(path, value)
-        with mock.patch.object(host_access_ui, "_save_private_json", side_effect=fail_request_save):
+        with mock.patch.object(host_access, "_save_private_json", side_effect=fail_request_save):
             with self.assertRaises(OSError):
                 self.cards.cancel("alpha", **self.args(opened))
         result = self.cards.cancel("alpha", **self.args(opened))
@@ -246,7 +282,89 @@ class ChatHostAccessApprovalTests(unittest.TestCase):
         self.assertEqual(self.access.get("alpha")["requests"], [])
 
 
+    def test_git_callback_uses_private_token_and_preserves_default_denial(self):
+        import asyncio
+        from host_access_ui import HostAccessApprovalTools, tool_specs
+        tools = HostAccessApprovalTools(self.access.projects, lambda: self.access)
+        specs = {spec["name"]: spec for spec in tool_specs(self.access.projects)}
+        self.assertEqual(specs["confirm_host_access_approval"]["_meta"]["ui"]["visibility"], ["app"])
+        opened = asyncio.run(tools.call("open_host_access_approval", {
+            "project": "alpha", "duration_seconds": 60, "allow_git": True,
+        }))
+        token = opened["_meta"]["host_access_confirmation"]
+        public = opened["structuredContent"]
+        self.assertIs(public["allow_git"], True)
+        self.assertNotIn(token, json.dumps(public))
+        self.assertNotIn(token, json.dumps(opened["content"]))
+        self.assertFalse(self.access.get("alpha")["active"])
+        with self.assertRaisesRegex(ValueError, "HOST_ACCESS_CARD_DENIED"):
+            asyncio.run(tools.call("confirm_host_access_approval", {
+                "project": "alpha", "card_id": public["card_id"],
+                "confirmation_token": "0" * 64,
+            }))
+        result = asyncio.run(tools.call("confirm_host_access_approval", {
+            "project": "alpha", "card_id": public["card_id"],
+            "confirmation_token": token,
+        }))
+        self.assertIs(result["structuredContent"]["grant"]["allow_git"], True)
+        self.assertIs(self.access.require_git("alpha", "push")["allow_git"], True)
+        self.boot = "99999999-8888-7777-6666-555555555555"
+        self.error("HOST_ACCESS_BOOT_CHANGED", lambda: self.access.require_git("alpha", "push"))
+
+    def test_legacy_card_confirmation_does_not_add_git_permission(self):
+        opened = self.open()
+        path = self.cards._path("alpha")
+        card = json.loads(path.read_text())
+        card.pop("allow_git", None)
+        host_access._save_private_json(path, card)
+        self.cards.confirm("alpha", **self.args(opened))
+        self.assertIs(self.access.require("alpha")["allow_git"], False)
+        self.error("HOST_ACCESS_GIT_DENIED", lambda: self.access.require_git("alpha", "commit"))
+
+    def test_git_callback_rejects_non_boolean_and_tampered_card_without_issuing(self):
+        import asyncio
+        from host_access_ui import HostAccessApprovalTools
+        tools = HostAccessApprovalTools(self.access.projects, lambda: self.access)
+        for value in (1, "true", None):
+            with self.assertRaisesRegex(ValueError, "INVALID_HOST_ACCESS_REQUEST"):
+                asyncio.run(tools.call("open_host_access_approval", {
+                    "project": "alpha", "duration_seconds": 60, "allow_git": value,
+                }))
+        opened = self.open()
+        path = self.cards._path("alpha")
+        card = json.loads(path.read_text())
+        card["allow_git"] = 1
+        host_access._save_private_json(path, card)
+        self.error("HOST_ACCESS_CARD_STATE_INVALID",
+                   lambda: self.cards.confirm("alpha", **self.args(opened)))
+        self.assertFalse(self.access.get("alpha")["active"])
+
+
 class ChatApprovalDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_schema_and_callback_accept_exact_html_lifetime_payloads(self):
+        from host_access_ui import HostAccessApprovalTools, tool_specs
+        update_spec = next(
+            spec for spec in tool_specs({"alpha": Path("/fixture")})
+            if spec["name"] == "update_host_access_approval")
+        self.assertIn("lifetime", update_spec["inputSchema"]["properties"])
+
+        manager = mock.Mock()
+        manager.update.return_value = {"structuredContent": {"state": "pending"}}
+        tools = HostAccessApprovalTools({"alpha": Path("/fixture")}, lambda: None)
+        tools._manager = manager
+        shared = {"project": "alpha", "card_id": "1" * 32,
+                  "confirmation_token": "2" * 64, "allow_codex": False}
+        timed = {**shared, "lifetime": "timed", "duration_seconds": 900}
+        durable = {**shared, "lifetime": "until_revoked", "duration_seconds": None}
+        await tools.call("update_host_access_approval", timed)
+        await tools.call("update_host_access_approval", durable)
+        self.assertEqual(manager.update.call_args_list, [
+            mock.call("alpha", card_id="1" * 32, confirmation_token="2" * 64,
+                      allow_codex=False, lifetime="timed", duration_seconds=900),
+            mock.call("alpha", card_id="1" * 32, confirmation_token="2" * 64,
+                      allow_codex=False, lifetime="until_revoked", duration_seconds=None),
+        ])
+
     async def test_unexpected_error_has_private_safe_correlation_diagnostics(self):
         from host_access_ui import HostAccessApprovalTools
         manager = mock.Mock()

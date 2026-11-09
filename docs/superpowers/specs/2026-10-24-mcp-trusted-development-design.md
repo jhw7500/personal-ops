@@ -1,6 +1,12 @@
 # MCP 개발 작업의 승인·등록 단순화 설계
 
-작성일: 2026-10-24. 상태: 구현 전 검토안. 이 문서는 권한 발급·정책 적용·서비스 전환의 증거가 아니다.
+작성일: 2026-10-24. 상태: 소스 구현 및 격리 검증 완료, 실제 WSL/ChatGPT 적용 전. 이 문서는 운영 권한 발급·서비스 전환의 증거가 아니다.
+
+현재 feature branch에는 설치 단위 v2 권한, ABI 3 admission, policy v2 text 산출물,
+clone-first bootstrap이 구현되어 있다. bootstrap의 기본 동작은 read-only 계획이며
+`--apply`만 새 owner-local 설정·runtime·controller·authority를 만들고 설치 범위를
+활성화한다. 실제 Windows/WSL PC, native driver, live tunnel/ChatGPT, PIM/보드 QA는
+아직 실행하지 않았다. 아래의 “확인된 구현과 원인 후보”는 설계 당시 역사적 관찰로 보존한다.
 
 ## 목적과 현재 합의
 

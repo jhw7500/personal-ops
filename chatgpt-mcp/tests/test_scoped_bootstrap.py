@@ -93,7 +93,8 @@ class BootstrapPreparationTests(unittest.TestCase):
         names = set(CONTROL) | {"server.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py"}
         names.update("fixture_%02d.py" % i for i in range(45))
         names.update(("tests/check_host_access_approval_ui.py", "tests/check_schema014_approval_ui.py",
-                      "tests/check_host_command_approval_ui.py", "tests/test_workspace_approval_ui.mjs"))
+                      "tests/check_host_command_approval_ui.py",
+                      "tests/check_development_approval_ui.py", "tests/test_workspace_approval_ui.mjs"))
         names.update(DENIED)
         for name in names:
             (mcp / name).write_text("# fixture\n")

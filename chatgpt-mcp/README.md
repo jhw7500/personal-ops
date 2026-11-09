@@ -32,6 +32,12 @@ Browser <-> SSH local forwarding <-> admin HTTP (127.0.0.1:8765)
                                      +-> host grant / revoke / task stop
 ```
 
+새 WSL 설치는 임시 아카이브를 옮기지 않고 Git clone에서 시작한다. Python 3.11,
+고정 Serena commit, MCP 1.23.0의 검증된 제약과 read-only 계획 → 명시적 적용 절차는
+[WSL clone-first setup](./WSL-SETUP.md)을 따른다. 초기 적용은 새 로컬 identity와
+ABI 3 authority 및 설치 범위만 준비하며 host grant, 외부 credential, 서비스와
+tunnel을 만들거나 시작하지 않는다.
+
 ## 로컬 MCP
 
 ```bash
@@ -88,35 +94,66 @@ python3 chatgpt-mcp/server.py --project /absolute/project/path
 
 이전 고정 번들 프로필은 `tossapp-upload-test`로 보존했다. 이 프로필은 이미 만들어진 특정 `.ait`만 업로드하며 빌드·발송을 수행하지 않는다. 전체 실행 프로필은 사용자 실행 승인 후 실제 터널 MCP로 빌드·TEST 업로드·본인 초대장 발송까지 완료했다. 새 버전 `20261015-23`의 콘솔 컴파일 성공(`CREATED`)과 `isTested=true`, 종료 코드 0·프로세스 종료 확인을 검증했다. 상세 결과는 [전체 TEST 배포 결과](../docs/handoffs/2026-10-15-tossapp-full-test-deployment.md), [프로필 정정 인계](../docs/handoffs/2026-10-15-tossapp-deploy-profile-correction.md)와 [Host Command Runner 인계](../docs/handoffs/2026-10-14-host-command-runner.md)를 참조한다.
 
-## 기간제 호스트 권한과 기존 Codex 호출
+## 한 번 승인해 재사용하는 호스트 개발 권한
 
-2026-10-21 기간 연장 변경은 소스에만 적용했다. 카드·작업 계획은 생성부터 7일,
-호스트·workspace 권한은 승인 시점부터 기본·최대 30일이다. 기존 저장 기록의
-만료는 자동 연장하지 않는다. 철회, 재부팅·런타임·정책·입력 변경에 따른 무효화는
-계속 적용한다. 운영 반영과 실제 ChatGPT 연결 확인은 별도 단계다.
+런타임 설치와 사용자 권한 부여는 별도다. 실제 허용 상태는 `get_host_access`로 확인한다.
+설치 범위 HostAccess v2는 `lifetime=timed`(기본·최대 30일)와
+`lifetime=until_revoked`(소유자가 철회할 때까지)를 지원한다. 기존 기록을 자동으로
+연장하거나 새 권한을 추가하지 않는다. 구형 v1 권한은 기존 기간제 계약을 유지한다.
+`until_revoked`도 아래의 재부팅·권한 경계 변경에 따른 무효화 조건을 따른다.
 
-호스트 명령 기능은 운영 런타임에 반영했다. 런타임 설치와 사용자 권한 부여는 별도이며,
-실제 허용 상태는 `get_host_access`로 확인한다.
+사용자가 반복 승인 없는 개발 작업을 요청했다면 채팅에서 한 번
+`open_host_access_approval(project, lifetime="until_revoked", allow_git=True)`를 열어
+정확한 범위를 확인하게 한다. 이 권한은 일반 파일·명령 작업과 지정한 Git commit·push에
+재사용할 수 있다. `allow_codex`는 별도 선택 사항이며 기존 Codex 계정의 모델 사용량을
+소비할 수 있다. `allow_git`과 `allow_codex`는 모두 기본 꺼짐이다. 이미 필요한 권한이
+유효하면 새 승인 요청을 만들지 않고 현재 권한을 재사용한다.
 
-`request_host_access(project)`는 권한 요청만 만든다. 기존 관리 화면에서 호스트·사용자·UID·그룹,
-파일·네트워크·그룹 접근 범위, 유효 기간과 Codex 사용 동의를 확인하고 소유자가 승인한다.
-새 소스의 기본·최대 기간은 30일이며 자동 갱신하지 않는다. 관리 화면의 승인은 loopback 또는
-등록된 Tailscale HTTPS 주소에서 새 관리 토큰으로 인증한다. LAN HTTP 화면은 조회에 사용한다.
-`get_host_access`에서 실제 활성 상태를 확인한다.
+카드는 호스트·사용자·시작 프로젝트·설치 전체 접근 범위·유지 방식과 선택한 권한을
+보여준다. 소유자가 카드의 **승인** 버튼을 눌러야 발급된다. 카드를 열거나 채팅에
+“승인”이라고 쓰는 것만으로는 권한이 발급되지 않는다. 옵션 변경은 확인값을 교체하며
+새 옵션에 대한 명시적 확인을 요구한다. 기존 관리 웹의 새 토큰 인증과 CLI 경로는
+호환용으로 유지한다. 관리 웹은 loopback 또는 등록된 Tailscale HTTPS 주소에서
+새 관리 토큰으로 인증하고, LAN HTTP 화면은 조회에 사용한다.
 
-호스트 권한용 채팅 승인 카드는 운영 반영했으며 실제 ChatGPT에서 표시·승인을 확인했다.
-`open_host_access_approval(project, duration_seconds?, allow_codex?)`가 카드를 열면
-호스트·사용자·작업 시작 위치·접근 범위·기간·Codex 동의를 확인하고 **승인**을 누른다.
-카드를 여는 요청이나 프롬프트의 “승인” 문장만으로 권한이 발급되지는 않는다.
-새 소스의 기본·최대 기간은 30일이고 더 짧은 기간도 선택할 수 있다. Codex 동의는 기본 꺼짐이며 카드에서 변경할 수 있다.
-카드에는 관리 토큰을 넣지 않는다. 기존 관리 웹은 복구 경로로 유지한다.
+Git 권한은 사용자가 요청한 커밋·푸시를 새 일회용 승인 없이 준비·실행하게 한다.
+실제 파일·메시지·HEAD·원격·보호 브랜치 검사는 유지한다. 새 계획에는 권한 ID와 revision을 고정하고
+실행 전에 다시 확인한다. 철회·교체·만료된 권한으로는 실행하지 않는다.
+배포·DB·런타임 전환과 PR/merge를 이 옵션으로 승인하지 않는다.
 
-확인값은 결과 `_meta`로 신뢰한 MCP 호스트/컴포넌트에만 전달하며 모델용 응답·위젯 상태·
-로그에는 저장하지 않는다. 앱 전용 확인 도구는 이 일회용 값과 프로젝트·런타임·재부팅·
-사용자·작업 경로가 일치해야 동작한다. 새 소스의 카드 유효 기간은 7일이며 옵션 변경은 확인값을
-교체하지만 유효 기간을 늘리지 않는다. 같은 프로젝트의 새 카드를 열면 이전 카드가
-무효화된다. 취소는 해당 요청을 없애며 이미 활성화된 권한을 철회하지 않는다.
-응답이 유실되면 자동 재승인하지 말고 `get_host_access`로 결과를 확인한다.
+확인값은 결과 `_meta`로 신뢰한 MCP 호스트/컴포넌트에만 전달하고 모델용 응답·
+위젯 상태·로그에는 넣지 않는다. 앱 전용 콜백은 카드의 설치/사용자와 현재 권한 상태,
+런타임·재부팅 맥락, 일회용 확인값 및 만료를 검증한다. 카드 유효 기간은 7일이며,
+옵션 변경으로 늘어나지 않는다. 같은 프로젝트에서 새 카드를 열면 이전 카드는
+무효화된다. 카드 취소는 요청을 없애며 이미 활성화된 권한을 철회하지 않는다.
+응답이 유실되면 다시 승인하지 말고 `get_host_access`로 현재 결과를 확인한다.
+
+### 승인 장소와 권한 재사용
+
+다음은 새 소스의 채팅 승인 경로다. 설치된 불변 런타임을 전환하고 연결의 도구 정의를
+새로고침해야 사용할 수 있으며, 소스 편집만으로 기존 설치본이나 권한이 바뀌지 않는다.
+
+| 대상 | 채팅 승인 경로 | 반복 승인 |
+|---|---|---|
+| 일반 호스트 개발 작업 | `open_host_access_approval` | 유효한 권한 재사용 |
+| Git commit·push | 준비 결과 또는 `open_git_operation_approval` | 명시적 `allow_git` 권한 또는 기존 작업 영수증 재사용 |
+| 등록 명령·TEST 업로드 | 준비 결과 또는 `open_host_command_approval` | 정확한 계획별 승인 |
+| 등록 호스트 대상 작업 | 준비 결과 또는 `open_operation_approval(family="registered")` | 정확한 계획별 승인 |
+| 기존 TEST 배포·DB·선행 migration 계획 | 준비 결과 또는 `open_operation_approval(family="runtime")` | 유효한 고정 대상 권한은 재사용 |
+| 격리된 Codex 작업 | 준비 결과 또는 `open_operation_approval(family="agent")` | 정확한 계획별 승인 |
+| 호스트 모드 Codex 작업 | 호스트 권한 카드의 `allow_codex` | 유효한 Codex 권한 재사용 |
+| Schema 014 | 준비 결과 또는 `open_schema014_approval` | 정확한 계획별 승인 |
+| MCP 런타임 전환 | `open_runtime_rollout_approval` | 정확한 소스와 서비스 영향 승인 |
+| 별도 workspace 경로 | `open_workspace_access_approval` | 승인한 경로·동작·기간 재사용 |
+
+새 Git·일반 작업 카드는 `승인만`, `승인하고 실행`, `취소`를 제공한다. `승인만`은
+영수증을 발급하며 실행하지 않는다. `승인하고 실행`은 표시한 계획만 기존 실행 경로에
+제출한다. 기존 카드의 동작은 각 절을 따른다. `execution_requested=true`를 받으면
+`next_action`으로 상태를 확인하고 중복 실행 요청을 보내지 않는다.
+이미 검증된 영수증이나 대상 권한이 있는 계획에는 새 확인값을 발급하지 않는다.
+카드가 지원되지 않는 경우에만 사용자가 요청한 관리 웹/터미널 복구 경로를 사용한다.
+PR/merge의 네이티브 검토·승인 경로와 ChatGPT 플랫폼 자체의 확인 정책은 유지한다.
+이 기능이 모든 플랫폼 확인창을 없애는 것은 아니다.
 
 앱 전용 도구 표시 설정 자체는 인증이 아니다. 이 흐름은 인증된 터널의 MCP 호스트와
 카드 컴포넌트를 신뢰하며, 이를 제어하는 호출자는 같은 신뢰 경계 안에 있다.
@@ -129,7 +166,7 @@ python3 chatgpt-mcp/server.py --project /absolute/project/path
 sudo 그룹 가입이 비밀번호 없는 sudo를 보장하지 않는다. 같은 UID에 대한 공격 방어,
 DB/Docker 제외, 외부 효과의 취소·롤백을 보장하지 않는다.
 
-기간 안에서는 `start_host_execution`에 실행 파일 절대 경로·`argv`·상대 `cwd`·`request_id`를
+권한이 유효한 동안에는 `start_host_execution`에 실행 파일 절대 경로·`argv`·상대 `cwd`·`request_id`를
 전달해 명령마다 프로필을 등록하거나 승인을 다시 받지 않고 실행한다. 상태는
 `get_host_execution`, 일반 명령의 제한된 마스킹 로그는 `read_host_execution_log`,
 취소는 `cancel_host_execution`으로 확인한다. 마스킹은 알려진 관리 토큰·키와 일부 토큰
@@ -352,6 +389,12 @@ MCP 래퍼와 작업 메타데이터에서 출력하거나 저장하지 않고 �
 
 ## 허용할 저장소
 
+WSL 새 설치의 기본 목록은 `personal-ops`, `pim-check`, `tossApp`이다.
+`bootstrap.py --project NAME=ABSOLUTE_PATH`를 반복하면 원하는 프로젝트 목록 전체를
+선택할 수 있으며, 특정 프로젝트 이름은 필수가 아니다. 설치 후에는 기존 목록을 보존해
+항목을 추가한다. [WSL 프로젝트 추가 절차](./WSL-SETUP.md#7-add-projects-after-installation)와
+[tossApp 환경 준비](./WSL-SETUP.md#6-prepare-tossapp-dependencies-on-the-wsl-pc)를 참고한다.
+
 기본 설정은 `~/.config/chatgpt-coding-mcp/projects.json`이다.
 사용자가 허용한 레포만 명시적으로 등록한다. 폴더 안의 레포를 자동 추가하지 않는다.
 
@@ -396,11 +439,22 @@ HTTPS 인증은 고정된 호스트 GitHub CLI helper와 기존 로그인을 사
 push 미리보기는 비교 커밋, 전체 변경 경로, 파일 모드와 변경 전후의 전체 blob ID를
 표시한다. 전송할 커밋에 내용을 고정하고 경로별 권한과 송신 이력을 모두 검사한다.
 
-계획의 `approval_command`를 **호스트의 실제 터미널**에서 실행하면 대상, diff,
-commit 메시지를 보고 작업 ID를 직접 입력해 한 번 승인할 수 있다. 이후 ChatGPT에서
-`execute_git_operation`을 호출한다. 영수증은 허용 레포 밖에 `0600`으로 저장하고 사용하면
-소모한다. 변경 내용이나 HEAD가 달라지면 다시 준비해야 한다. 모델이 작성한 승인 플래그나
-도구 표시는 이 승인을 대신하지 않는다.
+커밋 계획을 만들기 전에 실제 Git 환경의 작성자·커미터 정보를 검사한다.
+설정 누락으로 승인 영수증만 소모하는 일을 줄이기 위한 사전 검사다.
+
+유효한 호스트 권한에 명시적인 `allow_git=true`가 있으면 새 계획은 그 권한의
+ID/revision에 결합된다. `approval_required=false`이면 사용자의 실행 요청에 따라
+`next_action`을 호출하고 다시 승인을 요구하지 않는다. 이미 만들어진 대기·실패 계획을
+새 권한으로 자동 승격하지 않는다.
+
+권한이 없으면 `prepare_git_operation`이 정확한 변경 범위의 채팅 카드를 반환한다.
+기존 계획은 `open_git_operation_approval(project, operation_id)`로 연다.
+카드에서 대상, 변경 파일, diff 지문과 메시지를 확인하고 **승인만** 또는
+**승인하고 실행**을 선택한다. 기존 CLI `approval_command`는 복구용으로 유지한다.
+작업별 영수증은 허용 레포 밖에 `0600`으로 저장하고 실행 시 한 번 소모한다.
+조회·재열기는 이미 유효한 영수증을 인식하며 새 승인을 요구하지 않는다.
+실패한 실행의 영수증을 복원하지 않는다. 변경 내용이나 HEAD가 달라지면 다시 준비한다.
+모델이 작성한 승인 플래그나 도구 표시 자체는 권한을 부여하지 않는다.
 
 PR은 제목·본문·base를, merge는 정확한 PR URL을 받아 비공개 핸드오프 자료를 만든다.
 결과는 `waiting_native_workflow` / `NATIVE_WORKFLOW_REQUIRED`이며 완료가 아니다.
@@ -985,23 +1039,31 @@ tests.test_admin_host_approval` 및 전체 MCP 회귀, 코드 보안 리뷰,
 python3 chatgpt-mcp/rollout-host-runtime.py --apply
 ```
 
-프로그램은 `personal-ops-coding` alias의 `tunnel-client runtimes status --json`에서
-기존 터널 ID를 읽고, `~/.config/chatgpt-coding-mcp/runtime-key`의 존재·권한만
-확인한다. 키 본문·터널 ID를 출력하지 않는다. 소스 파일 digest를 검증하고
-관련/전체 unittest가 모두 통과해야 불변 릴리스를 설치한다.
-호스트에서 `ROLLOUT` 확인 후 현재 터널 alias를 새 `server.py`로 전환한다.
-아무런 Docker 재시작, DB 적용 또는 배포 승인은 수행하지 않는다.
+전환 대상은 소스에 고정한다. `rollout-target.json`의
+`{"version":1,"layout":"wsl-pc1"}`는 검증된 WSL 구성인
+`personal-ops-coding-wsl-pc1.service`와 해당 profile을 선택한다. 임의 서비스명은
+받지 않으며 실제 unit·profile·wrapper가 알려진 구성과 일치해야 한다. 대상 파일이
+없으면 기존 `personal-ops-coding` alias / `personal-ops-tunnel.service` 경로만 허용한다.
+WSL 상태는 선택한 unit의 MainPID, 정확한 실행 인자·UID·부모/자식 프로세스와
+그 터널이 소유한 loopback health socket으로 확인한다. 오래된 runtimes registry PID를
+대신 사용하지 않는다. 기존 alias 방식의 상태 조회·전환 경로도 유지한다.
+
+`~/.config/chatgpt-coding-mcp/runtime-key`의 존재·권한만 확인하며 키 본문·터널 ID를
+출력하지 않는다. 고정한 전체 소스와 검사 파일의 digest를 검증하고 관련/전체 검사에
+통과해야 불변 릴리스를 설치한다. 호스트에서 `ROLLOUT` 확인 후 검증한 대상을 전환한다.
+Docker 재시작, DB 적용 또는 배포 승인은 이 절차에 포함하지 않는다.
 
 `--apply`가 없으면 진단·테스트만 한다. 안전 검사 실패 시 설치/연결을
-진행하지 않는다. 구 CLI가 ID를 출력하지 않는 경우에는 자동 전환을
+진행하지 않는다. 기존 alias 경로에서 구 CLI가 ID를 출력하지 않는 경우에는 자동 전환을
 중단한다. 필요할 때만 `--tunnel-id`로 기존 ID를 전달할 수 있으며
 `status`에서 발견한 ID와 다르면 거부한다. 전환 뒤 `status`가
 `ready`가 아니면 성공으로 보고하지 않는다.
 
 **관리 대시보드는 별도 HTTP 프로세스다.** 원스텝 rollout은 이미 설치된
-`personal-ops-admin.service`의 `ExecStart`가 인지된 Python
-`admin_server.py` 명령인 경우에만 원래 port/config/origin/LAN 인자를
-보존하는 systemd 사용자 drop-in을 적용한다. `daemon-reload`→restart→
+`personal-ops-admin.service`의 `ExecStart`가 인지된 Python `admin_server.py` 명령이나
+정확히 검증된 WSL managed wrapper인 경우에만 systemd 사용자 drop-in을 적용한다.
+기존 port/config/origin/LAN 인자와 WSL wrapper의 고정 환경을 보존하고 wrapper를
+직접 다시 쓰지 않는다. `daemon-reload`→restart→
 `is-active`→루프백 HTML의 신규 승인 UI 확인까지 성공해야
 `admin_ready`로 보고한다. 재시작·검증 실패 시 기존 drop-in을 복원하고
 이전 서비스를 재시작하며, 식별 불가능한 서비스는 변경하지 않는다.
@@ -1010,19 +1072,38 @@ python3 chatgpt-mcp/rollout-host-runtime.py --apply
 교체됐다는 뜻이 아니다. 새로운 MCP 도구 목록도 플러그인 새로고침 후
 재조회해야 한다.
 
-### 관리 웹에서 승인하는 런타임 업데이트
+### 채팅에서 승인하는 런타임 업데이트
 
 `prepare_runtime_rollout(project="personal-ops", request_id=...)`로 소스·검사 파일과
-대상 런타임을 고정한다. 반환된 HTTPS 승인 링크를 열고 관리 웹에 로그인하면
-해당 계획을 조회한다. 계획 ID와 관리 토큰을 다시 입력해 승인한 뒤,
-채팅에서 `execute_runtime_rollout(project="personal-ops", operation_id=...)`을
-호출한다. 승인을 누르는 것만으로 설치나 재시작이 시작되지는 않는다.
-진행과 결과는 `get_runtime_rollout`으로 확인한다.
+대상 런타임을 고정한다. 채팅 카드 또는 기존 계획의 `open_runtime_rollout_approval`에서
+정확한 변경 범위와 서비스 영향을 확인하고 소유자가 승인한다. 인증된 카드의 앱 전용
+콜백이 발급·검증한 승인만 사용하며, 채팅의 “승인” 문장으로 대체할 수 없다.
+이 카드는 승인만 한다. 실제 실행 요청은
+`execute_runtime_rollout(project="personal-ops", operation_id=...)`으로 접수하고
+진행과 결과는 `get_runtime_rollout`으로 확인한다. 관리 웹의 새 토큰 인증과
+SSH/TTY 확인 경로는 호환·복구용으로 유지한다.
 
 승인은 계획 생성부터 7일 안에 한 번만 사용할 수 있다. 소스가 달라지면 기존 승인은 사용할 수 없다.
 실행기는 별도 사용자 systemd unit에서 동작하며, 터널과 관리 웹만 전환한다.
 DB·Docker·API·Worker·Toss 업로드는 이 승인의 대상이 아니다.
 중단 후 결과를 확정할 수 없는 작업은 `outcome_unknown`으로 남고 자동 재실행하지 않는다.
+
+새 v2 계획은 선택한 layout과 실제 재시작 서비스를 함께 고정한다. 첫 업데이트에서
+기존 v1/버전 없는 계획을 사용할 때도 승인 당시 전체 소스 digest와 v1 control digest가
+그대로 일치해야 하며, 새 공식 v2 control inventory 전체를 추가 검증한다. 이 호환
+경로는 기존 승인 기록을 다시 발급하거나 바꾸지 않는다. 구형 카드의 재시작 표시가
+legacy 서비스로 고정돼 있으면, 승인 전에 채팅에서 소스에 고정한 실제 WSL 대상과
+영향을 명시해야 한다. 새 소스가 실행되기 전에는 구형 카드 표시가 자동 갱신되지 않는다.
+
+이미 활성화된 workspace authority에는 같은 소유자 런타임 전환 승인으로 검토한
+새 릴리스 하나를 등록할 수 있다. 실행기는 실제로 소비된 승인과 현재 worker PID의
+증명, 설치한 전체 manifest와 검토한 inventory의 일치, ABI·capability 세대·최저치,
+사전 검사 때의 설치 identity·정책·epoch를 다시 검증한다. 기존 activation gate와
+authority lock 안에서 해당 digest만 허용 목록에 추가하며 기존 릴리스·정책·epoch·
+요청·grant를 보존한다. 이 등록 자체는 workspace 경로나 일반 호스트 권한을 부여하지
+않고, authority 초기화나 ABI 업그레이드를 대신하지 않는다. 실제 target start와
+rollback의 epoch 증가·기존 승인 무효화는 아래 실행·복구 절의 별도 전환 규칙을 따른다.
+TTY 확인만으로 이 웹 승인용 릴리스 등록 경로를 사용할 수는 없다.
 
 새 웹 도구가 없는 설치본은 기존 SSH/TTY `ROLLOUT` 절차로 먼저 설치해야 한다.
 2026-10-16 별도 승인 후 통합 보완본 `5c725c7a6d4ef86b9759`/80파일을 활성화했고,
@@ -1031,7 +1112,7 @@ DB·Docker·API·Worker·Toss 업로드는 이 승인의 대상이 아니다.
 승인 링크·로그인·중단 복구 보완본의 검증과 적용 기록은
 [통합 배포 인계](../docs/handoffs/2026-10-16-runtime-rollout-integration.md)를 따른다.
 보완본은 승인 화면의 실제 HTTP/Chromium 검사도 공식 배포 사전검사에 포함한다.
-`tests/test_runtime_rollout_ui.py`는 브라우저가 설치된 `/usr/bin/python3`로 직접 실행하며,
+`tests/test_runtime_rollout_ui.py`는 브라우저와 Playwright가 준비된 별도 Python으로 실행하며,
 MCP Python의 테스트 탐색에서는 Playwright를 불러오지 않는다.
 
 ### 등록 대상 호스트 작업 (version 3) — MCP 도구와 관리 웹 승인
@@ -1330,6 +1411,28 @@ gate가 포함된 release를 배포하고 기존 실행을 별도로 배출해�
 worker·lease가 모두 없는 경우에만 새 boot의 관측값을 journal에 고정해 재개한다.
 실제 MCP 연결의 정책 동작과 기존 산출물 조회(T14)는 서비스 시작 뒤 별도 smoke로
 확인하며, 프로세스 실행만으로 이 검증까지 완료됐다고 보고하지 않는다.
+
+ABI 2로 이미 활성화된 설치는 먼저 일반 rollout으로 같은 설치에 admission된 ABI 3
+release를 floor 2에서 실행·검증한 뒤, 그 설치된 release의 `workspace_upgrade.py`를
+사용한다. 이 명령은 서비스를 중지하거나 시작하거나 unit wiring을 바꾸지 않는다.
+
+```bash
+python -B workspace_upgrade.py prepare \
+  --transaction-id <32자 hex> --target-release <현재 설치 release 절대 경로>
+# 별도 owner 절차로 personal-ops-tunnel/admin 두 서비스를 중지한다.
+python -B workspace_upgrade.py apply --transaction-id <같은 ID>
+# 중단됐다면 같은 release, ID, 설정에서만 재개한다.
+python -B workspace_upgrade.py resume --transaction-id <같은 ID>
+python -B workspace_upgrade.py status --transaction-id <같은 ID>
+```
+
+`apply`/`resume`은 rollout lock과 activation maintenance를 유지한 채 두 서비스와
+실제 tunnel/MCP/admin 프로세스, 여섯 worker 종류, lease가 모두 비었는지 새로
+확인한다. 기존 installation ID와 policy digest를 보존하고 epoch를 정확히 한 번
+증가시키며, 허용 release를 해당 ABI 3 하나로 제한한 뒤 ABI floor를 3으로 올린다.
+HostAccess v2는 revision 1, 요청 없음, grant 없음으로 시작한다. 웹 승인 전에는 host
+권한이 발급되지 않는다. Journal은
+`$XDG_STATE_HOME/chatgpt-coding-mcp/workspace-upgrade`에 별도로 보관한다.
 
 ## 검증
 

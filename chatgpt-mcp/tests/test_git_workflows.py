@@ -160,6 +160,30 @@ class GitWorkflowTest(unittest.TestCase):
         message_path.write_text(self.message(), encoding="utf-8")
         _default_message_validator(message_path)
 
+    def test_vendored_commit_validator_is_original_checkout_independent(self):
+        message_path = self.base / "portable-message.md"
+        message_path.write_text(self.message(), encoding="utf-8")
+
+        self.assertEqual(
+            git_workflows.CHANGE_EVIDENCE_VALIDATOR,
+            MODULE_DIR / "validate_change_evidence.py",
+        )
+        _default_message_validator(message_path)
+
+    def test_missing_or_tampered_vendored_validator_is_refused(self):
+        message_path = self.base / "message.md"
+        message_path.write_text(self.message(), encoding="utf-8")
+        missing = self.base / "missing-validator.py"
+        with mock.patch.object(git_workflows, "CHANGE_EVIDENCE_VALIDATOR", missing):
+            with self.assertRaisesRegex(ValueError, "unavailable or unsafe"):
+                _default_message_validator(message_path)
+
+        tampered = self.base / "tampered-validator.py"
+        tampered.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        with mock.patch.object(git_workflows, "CHANGE_EVIDENCE_VALIDATOR", tampered):
+            with self.assertRaisesRegex(ValueError, "changed"):
+                _default_message_validator(message_path)
+
     def test_subprocess_capture_and_runtime_are_bounded(self):
         with self.assertRaisesRegex(ValueError, "512 KiB"):
             _run([sys.executable, "-c", "import sys; sys.stdout.write('x' * 600000)"])
@@ -476,6 +500,67 @@ class GitWorkflowTest(unittest.TestCase):
         self.assertEqual(run_git(remote, "rev-parse", "refs/heads/feature/test").stdout.strip(), head)
         with self.assertRaisesRegex(ValueError, "not executable"):
             self.workflows.execute({"project": "repo", "operation_id": prepared["operation_id"]})
+    def test_large_push_uses_compact_diff_without_global_limit_bypass(self):
+        remote = self.base / "remote.git"
+        subprocess.run(
+            ["/usr/bin/git", "init", "--bare", str(remote)], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        run_git(self.repo, "remote", "add", "origin", str(remote))
+        run_git(self.repo, "push", "-u", "origin", "feature/test")
+        previous = run_git(remote, "rev-parse", "refs/heads/feature/test").stdout.strip()
+        large = "".join(f"revision-{index:06d} {'y' * 70}\n" for index in range(10000))
+        self.assertGreater(len(large.encode()), git_workflows.MAX_CAPTURE)
+        (self.repo / "large-source.txt").write_text(large)
+        run_git(self.repo, "add", "large-source.txt")
+        run_git(self.repo, "commit", "-m", "large fixture source")
+        (self.repo / "other.txt").write_text("owner work must remain\n")
+
+        prepared = self.workflows.prepare({
+            "project": "repo", "action": "push", "branch": "feature/test",
+            "new_branch": False,
+        })
+        preview = self.workflows._load_plan("repo", prepared["operation_id"])["immutable"]["preview"]
+        self.assertIn("OUTGOING_DIFF_SUMMARY_ONLY", preview)
+        self.assertIn(previous, preview)
+        self.assertIn("large-source.txt", preview)
+        self.assertNotIn("revision-000001", preview)
+        self.assertLess(len(preview.encode()), git_workflows.MAX_TEXT_BYTES)
+        self.approve(prepared)
+        self.assertEqual(
+            self.workflows.execute({
+                "project": "repo", "operation_id": prepared["operation_id"],
+            })["status"], "completed",
+        )
+        self.assertEqual(
+            run_git(remote, "rev-parse", "refs/heads/feature/test").stdout.strip(),
+            run_git(self.repo, "rev-parse", "HEAD").stdout.strip(),
+        )
+        self.assertEqual((self.repo / "other.txt").read_text(), "owner work must remain\n")
+
+    def test_large_push_compact_preview_uses_explicit_large_path_limit(self):
+        remote = self.base / "large-compact-remote.git"
+        run_git(self.base, "init", "--bare", str(remote))
+        run_git(self.repo, "remote", "add", "origin", str(remote))
+        run_git(self.repo, "push", "origin", "HEAD:refs/heads/feature/test")
+        large = "".join(f"revision-{index:06d} {'z' * 70}\n" for index in range(10000))
+        self.assertGreater(len(large.encode()), git_workflows.MAX_CAPTURE)
+        for index in range(git_workflows.MAX_PUSH_PATHS + 1):
+            content = large if index == 0 else f"{index}\n"
+            self.repo.joinpath(f"compact-{index:03d}.txt").write_text(content)
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-m", "large compact path fixture")
+
+        prepared = self.workflows.prepare({
+            "project": "repo", "action": "push", "branch": "feature/test",
+            "new_branch": False, "large_push": True,
+        })
+
+        stored = self.workflows._load_plan("repo", prepared["operation_id"])["immutable"]
+        self.assertEqual(stored["outgoing_path_count"], git_workflows.MAX_PUSH_PATHS + 1)
+        self.assertIn("OUTGOING_DIFF_SUMMARY_ONLY", stored["preview"])
+        self.assertIn("compact-128.txt", stored["preview"])
+        self.assertLess(len(stored["preview"].encode()), git_workflows.MAX_TEXT_BYTES)
 
     def test_pr_and_merge_are_native_workflow_handoffs(self):
         pr = self.workflows.prepare({
@@ -497,6 +582,22 @@ class GitWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(merge["status"], "waiting_native_workflow")
         self.assertIn("https://github.com/jhw7500/personal-ops/pull/2", self.checked_references)
+
+    def test_native_handoff_reports_missing_current_user_workflow_skills(self):
+        missing_home = self.base / "fresh-home"
+        missing_home.mkdir()
+        with mock.patch.object(Path, "home", return_value=missing_home):
+            pr = self.workflows.prepare({
+                "project": "repo", "action": "pr", "title": "Test PR",
+                "body": "PR body\n", "base": "main",
+            })
+
+        self.assertEqual(pr["code"], "NATIVE_WORKFLOW_REQUIRED")
+        self.assertEqual(
+            pr["handoff"]["missing_prerequisites"],
+            ["jhw-pr", "pre-pr-tribunal"],
+        )
+        self.assertIn(str(missing_home), pr["handoff"]["jhw_pr_skill"])
 
     def test_state_is_outside_projects_and_owner_only(self):
         with self.assertRaisesRegex(ValueError, "outside"):

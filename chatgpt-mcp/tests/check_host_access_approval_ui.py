@@ -21,14 +21,14 @@ const future = '2099-01-01T00:00:00Z';
 const cards = window.cards = {
   one: {project: 'personal-ops', scope: 'installation', card_id: '11111111111111111111111111111111',
     revision: 1, state: 'pending', expires_at: future, project_root: '/srv/personal-ops',
-    duration_seconds: 2592000, allow_codex: true,
+    lifetime: 'timed', duration_seconds: 2592000, allow_codex: true,
     host_identity: {hostname: 'cantopsbuildserver', user: 'jhw', uid: 1000,
       groups: ['jhw', 'docker'], filesystem_isolated: false,
       effective_access: 'host_user_filesystem_network_groups'},
     secret: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'},
   two: {project: 'tossApp', scope: 'installation', card_id: '22222222222222222222222222222222',
     revision: 1, state: 'pending', expires_at: future, project_root: '/srv/tossApp',
-    duration_seconds: 3600, allow_codex: false,
+    lifetime: 'timed', duration_seconds: 3600, allow_codex: false,
     host_identity: {hostname: 'cantopsbuildserver', user: 'jhw', uid: 1000,
       groups: ['jhw'], filesystem_isolated: false,
       effective_access: 'host_user_filesystem_network_groups'},
@@ -63,14 +63,18 @@ function invoke(frameId, name, args) {
   }
   if (name === 'update_host_access_approval') {
     card.revision += 1;
+    card.lifetime = args.lifetime;
     card.duration_seconds = args.duration_seconds;
     card.allow_codex = args.allow_codex;
+    card.allow_git = args.allow_git;
     card.secret = frameId === 'one' ? 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' :
       'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
   } else if (name === 'confirm_host_access_approval') {
     card.state = 'approved';
-    card.grant = {grant_id: '33333333333333333333333333333333', expires_at: future,
-      allow_codex: card.allow_codex, project: card.project, scope: 'installation'};
+    card.grant = {grant_id: '33333333333333333333333333333333', expires_at: card.lifetime === "until_revoked" ? null : future,
+      lifetime: card.lifetime, allow_codex: card.allow_codex,
+      allow_git: card.allow_git ?? false,
+      project: card.project, scope: 'installation'};
   } else if (name === 'cancel_host_access_approval') {
     card.state = 'cancelled';
   }
@@ -268,6 +272,7 @@ class HostAccessApprovalBrowserTest(unittest.TestCase):
         expect(frame.get_by_text("jhw, docker", exact=True)).to_be_visible()
         expect(frame.get_by_text("/srv/personal-ops")).to_be_visible()
         expect(frame.locator("#duration")).to_have_text("30일")
+        expect(frame.locator("#lifetime")).to_have_text("시간 제한")
         expect(frame.get_by_text("설치 전체 · 호스트 사용자 파일·네트워크·그룹 권한")).to_be_visible()
         expect(frame.get_by_text(
             "이 MCP 설치의 선택 프로젝트 호출자와 대화가 권한을 공유합니다.", exact=True
@@ -304,6 +309,7 @@ class HostAccessApprovalBrowserTest(unittest.TestCase):
         calls = self.tool_calls()
         self.assertEqual(calls[0]["params"]["name"], "update_host_access_approval")
         self.assertEqual(calls[0]["params"]["arguments"]["confirmation_token"], "a" * 64)
+        self.assertEqual(calls[0]["params"]["arguments"]["lifetime"], "timed")
 
         frame.get_by_role("button", name="승인").click()
         expect(frame.get_by_role("status")).to_contain_text("승인되었습니다")
@@ -311,6 +317,56 @@ class HostAccessApprovalBrowserTest(unittest.TestCase):
         self.assertEqual(calls[1]["params"]["name"], "confirm_host_access_approval")
         self.assertEqual(calls[1]["params"]["arguments"]["confirmation_token"], "c" * 64)
         self.assertFalse(self.page.evaluate("cards.one.grant.allow_codex"))
+
+
+    def test_git_option_is_reviewed_before_confirmation_and_preserved_in_receipt(self):
+        frame = self.open()
+        expect(frame.locator("#git")).to_have_text("별도 승인")
+        self.assertEqual(self.tool_calls(), [])
+        frame.get_by_role("button", name="옵션 변경").click()
+        expect(frame.get_by_label("Git commit·push 반복 승인 허용")).not_to_be_checked()
+        frame.get_by_label("Git commit·push 반복 승인 허용").check()
+        frame.get_by_label("Codex 에이전트 호출 허용").uncheck()
+        frame.get_by_label("권한 유지 방식").select_option("until_revoked")
+        frame.get_by_role("button", name="변경 적용").click()
+        expect(frame.locator("#git")).to_have_text("commit·push 반복 승인")
+        self.assertEqual(self.page.evaluate("cards.one.state"), "pending")
+        arguments = self.tool_calls()[0]["params"]["arguments"]
+        self.assertIs(arguments["allow_git"], True)
+        self.assertIs(arguments["allow_codex"], False)
+        self.assertIsNone(arguments["duration_seconds"])
+        frame.get_by_role("button", name="승인", exact=True).click()
+        expect(frame.get_by_role("status")).to_contain_text("승인되었습니다")
+        self.assertIs(self.page.evaluate("contexts.one.structuredContent.hostAccess.allow_git"), True)
+        self.assertNotIn("c" * 64, str(self.page.evaluate("contexts")))
+        self.assertNotIn("c" * 64, frame.locator("body").inner_text())
+
+    def test_non_boolean_git_response_locks_card(self):
+        frame = self.open()
+        malformed = self.page.evaluate("""() => {
+          const result = resultFor(cards.one);
+          result.structuredContent.allow_git = 1;
+          return result;
+        }""")
+        self.page.evaluate("""value => document.querySelector('#one').contentWindow.postMessage({
+          jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: value
+        }, '*')""", malformed)
+        expect(frame.get_by_role("button", name="승인")).to_be_disabled()
+        self.assertEqual(self.tool_calls(), [])
+
+
+    def test_until_revoked_hides_duration_and_sends_no_duration(self):
+        frame = self.open()
+        frame.get_by_role("button", name="옵션 변경").click()
+        frame.get_by_label("권한 유지 방식").select_option("until_revoked")
+        expect(frame.get_by_label("권한 유지 시간")).to_be_disabled()
+        frame.get_by_role("button", name="변경 적용").click()
+
+        expect(frame.locator("#lifetime")).to_have_text("취소할 때까지")
+        expect(frame.locator("#duration")).to_have_text("해당 없음")
+        arguments = self.tool_calls()[0]["params"]["arguments"]
+        self.assertEqual(arguments["lifetime"], "until_revoked")
+        self.assertIsNone(arguments["duration_seconds"])
 
     def test_eight_hour_option_updates_card(self):
         frame = self.open()
@@ -393,7 +449,8 @@ class HostAccessApprovalBrowserTest(unittest.TestCase):
         pending = self.page.evaluate("""() => ({content: [], structuredContent: {
           project: 'personal-ops', scope: 'installation', card_id: '11111111111111111111111111111111',
           revision: 3, state: 'pending', expires_at: '2099-01-01T00:00:00Z',
-          project_root: '/srv/personal-ops', duration_seconds: 3600, allow_codex: true,
+          project_root: '/srv/personal-ops', lifetime: 'timed',
+          duration_seconds: 3600, allow_codex: true,
           host_identity: cards.one.host_identity},
           _meta: {host_access_confirmation: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'}})""")
         self.page.evaluate("""value => document.querySelector('#one').contentWindow.postMessage({

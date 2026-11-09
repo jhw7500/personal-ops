@@ -97,22 +97,35 @@
 
   function localAccessStatus() {
     const hasGrant = access?.active === true && ID.test(access.grant_id || '');
-    const expiry = Date.parse(access?.expires_at || '');
-    const validExpiry = Number.isFinite(expiry);
-    return {hasGrant, expiry, validExpiry,
-      active: hasGrant && validExpiry && expiry > Date.now(),
-      expired: hasGrant && validExpiry && expiry <= Date.now()};
+    const lifetime = access?.lifetime || 'timed';
+    const expiry = lifetime === 'timed' ? Date.parse(access?.expires_at || '') : Infinity;
+    const validExpiry = lifetime === 'until_revoked'
+      ? access?.version === 2 && access?.expires_at === null
+      : lifetime === 'timed' && Number.isFinite(expiry);
+    return {hasGrant, lifetime, expiry, validExpiry,
+      active: hasGrant && validExpiry && (lifetime === 'until_revoked' || expiry > Date.now()),
+      expired: hasGrant && lifetime === 'timed' && validExpiry && expiry <= Date.now()};
   }
 
   function renderButtons() {
     const fresh = hasFreshApproval();
+    const pending = selectedRequestData();
+    const lifetime = pending?.lifetime || 'timed';
+    const validDuration = lifetime === 'until_revoked' || validMinutes();
     $('host-access-approve').disabled = !(fresh && validHostIdentity(access?.host_identity)
-      && selectedRequestData() && validMinutes());
+      && pending && validDuration);
     $('host-access-revoke').disabled = !(fresh && localAccessStatus().active);
     const selected = executionDetail?.operation_id === selectedExecution
       ? executionDetail : selectedExecutionData();
     $('host-execution-cancel').disabled = !(fresh && selected && ID.test(selectedExecution)
       && !TERMINAL.has(selected.state));
+  }
+
+  function renderRequestOptions() {
+    const pending = selectedRequestData();
+    const requestedLifetime = pending?.lifetime || 'timed';
+    $('host-access-lifetime').value = requestedLifetime;
+    $('host-access-duration').disabled = requestedLifetime === 'until_revoked';
   }
 
   function renderAccess() {
@@ -147,6 +160,7 @@
       select.append(option);
     }
     select.value = selectedRequest;
+    renderRequestOptions();
     if (focusHandled && focusedRequest && project === focusedRequest.project
         && access?.project === project && !focusScrolled) {
       focusScrolled = true;
@@ -178,8 +192,11 @@
       $('host-access-state').textContent = '프로젝트를 선택하세요.';
       $('host-access-guidance').textContent = '';
     } else if (localAccessStatus().active) {
-      $('host-access-state').textContent = '활성 · 만료 ' + String(access.expires_at || '')
-        + ' · Codex ' + (access.allow_codex === true ? '허용' : '허용 안 함');
+      const lifetimeText = access.lifetime === 'until_revoked'
+        ? '소유자가 취소할 때까지' : '만료 ' + String(access.expires_at || '');
+      $('host-access-state').textContent = '활성 · ' + lifetimeText
+        + ' · Codex ' + (access.allow_codex === true ? '허용' : '허용 안 함')
+        + ' · Git commit·push ' + (access.allow_git === true ? '반복 승인' : '별도 승인');
       $('host-access-guidance').textContent = rows.length
         ? '새 요청을 승인하면 현재 액세스 시간이 새 승인으로 교체됩니다.'
         : '승인만으로 명령이나 Codex가 시작되지는 않습니다.';
@@ -218,7 +235,8 @@
     const local = localAccessStatus();
     const left = local.expiry - Date.now();
     if (local.active) {
-      const remaining = left >= 86400000
+      const remaining = local.lifetime === 'until_revoked' ? '소유자가 취소할 때까지'
+        : left >= 86400000
         ? `${Math.floor(left / 86400000)}일 ${Math.floor((left % 86400000) / 3600000)}시간 남음`
         : left >= 3600000
           ? `${Math.floor(left / 3600000)}시간 ${Math.floor((left % 3600000) / 60000)}분 남음`
@@ -464,6 +482,7 @@
     focusedRequestMissing = false;
     selectedRequest = $('host-access-request').value;
     clearFreshApproval();
+    renderRequestOptions();
     renderButtons();
   });
   $('host-execution').addEventListener('change', () => {
@@ -482,6 +501,7 @@
     $(id).addEventListener('input', renderButtons);
   }
   $('host-access-codex').addEventListener('change', renderButtons);
+  $('host-access-git').addEventListener('change', renderButtons);
   $('host-access-refresh').addEventListener('click', () => { void refresh(); });
   $('project').addEventListener('change', () => { void refresh(); });
   window.addEventListener('personal-ops:select-host-execution', event => {
@@ -499,14 +519,18 @@
 
   $('host-access-approve').addEventListener('click', () => {
     const pending = selectedRequestData();
-    const minutes = validMinutes();
+    const lifetime = pending?.lifetime || 'timed';
+    const minutes = lifetime === 'timed' ? validMinutes() : null;
     const expectedProject = project;
-    if (!pending || !minutes || !validHostIdentity(access?.host_identity)) return;
+    if (!pending || lifetime === 'timed' && !minutes
+        || !validHostIdentity(access?.host_identity)) return;
     const requestId = pending.request_id;
     void mutate('/api/host-access-approve', {
       request_id: requestId,
-      duration_seconds: minutes * 60,
+      lifetime,
+      duration_seconds: minutes === null ? null : minutes * 60,
       allow_codex: $('host-access-codex').checked === true,
+      allow_git: $('host-access-git').checked === true,
       confirmation: expectedProject,
       admin_token: $('host-access-token').value,
     }, '호스트 액세스를 승인했습니다. 실행은 ChatGPT의 별도 요청으로만 시작됩니다.',

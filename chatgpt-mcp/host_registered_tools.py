@@ -81,13 +81,13 @@ HOST_REGISTERED_TOOL_SPECS = [
           readonly=True),
     _tool("prepare_host_operation", "호스트 작업 승인 계획",
           "Freeze inputs and target identity into a plan that expires in 7 days and "
-          "return a frozen plan; open_registered_host_approval shows its in-chat card. Runs no Docker or SQL. The same request_id "
+          "return its inline chat approval card. Runs no Docker or SQL. The same request_id "
           "with the same input returns the same plan.",
           {"target": _TARGET, "action": {"type": "string", "enum": list(ACTIONS)},
            "parameters": _PARAMETERS, "request_id": _REQUEST},
           readonly=False),
     _tool("execute_host_operation", "승인된 호스트 작업 실행",
-          "Start a plan only after a human approved it in the admin web; the one-use receipt "
+          "Start a plan only after its owner approved the chat card or authenticated admin fallback; the one-use receipt "
           "is consumed. Repeated calls report the existing state and never run it again.",
           {"target": _TARGET, "operation_id": _ID}, readonly=False),
     _tool("read_host_operation_events", "호스트 작업 이벤트 조회",

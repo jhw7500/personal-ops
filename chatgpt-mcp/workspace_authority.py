@@ -7,6 +7,7 @@ never creates state or grants authority.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import copy
 import ctypes
 from datetime import datetime, timezone
 import errno
@@ -41,6 +42,7 @@ _MAX_STATE_BYTES = 2 * 1024 * 1024
 _REQUEST_TTL_SECONDS = 7 * 24 * 60 * 60
 _DEFAULT_DURATION_SECONDS = 30 * 24 * 60 * 60
 _MAX_DURATION_SECONDS = 30 * 24 * 60 * 60
+_MAXIMUM_ENFORCEMENT_ABI = 3
 
 
 def _fail(code: str, cause: BaseException | None = None):
@@ -339,10 +341,13 @@ class WorkspaceAuthority:
         return value["minimum_abi"]
 
     def _ensure_minimum_abi(self, parent_fd: int, releases: dict[str, int],
-                            *, create: bool) -> int:
+                            *, create: bool, requested: int = 1) -> int:
+        if (type(requested) is not int or requested < 1
+                or requested > _MAXIMUM_ENFORCEMENT_ABI):
+            _fail("INVALID_MINIMUM_ABI")
         minimum_abi = self._read_minimum_abi(parent_fd, required=not create)
         if minimum_abi is None:
-            minimum_abi = 1
+            minimum_abi = requested
             _create_private_file(
                 parent_fd, self.minimum_abi_path.name,
                 self._minimum_abi_payload(minimum_abi),
@@ -995,9 +1000,12 @@ class WorkspaceAuthority:
         finally:
             os.close(parent_fd)
 
-    def initialize(self, policy_digest, allowed_releases):
+    def initialize(self, policy_digest, allowed_releases, *, minimum_abi=1):
         policy_digest = _validate_digest(policy_digest)
         releases = _validate_releases(allowed_releases)
+        if (type(minimum_abi) is not int or minimum_abi < 1
+                or minimum_abi > _MAXIMUM_ENFORCEMENT_ABI):
+            _fail("INVALID_MINIMUM_ABI")
         self._check_state_location()
         if self._enforcement_exists():
             _fail("AUTHORITY_ALREADY_INITIALIZED")
@@ -1005,7 +1013,9 @@ class WorkspaceAuthority:
         try:
             parent_fd = _private_directory(self.state_dir.parent, create=False)
             try:
-                self._ensure_minimum_abi(parent_fd, releases, create=True)
+                self._ensure_minimum_abi(
+                    parent_fd, releases, create=True, requested=minimum_abi,
+                )
                 _create_private_file(
                     parent_fd, self.enforcement_path.name,
                     self._enforcement_payload(),
@@ -1399,6 +1409,136 @@ class WorkspaceAuthority:
             state["updated_at"] = now
             self._save(root_fd, state)
             return self._binding(state)
+
+    @staticmethod
+    def _state_fingerprint(state):
+        return hashlib.sha256(json.dumps(
+            state, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _owner_upgrade_candidate(state, target_release_digest, transitioned_at):
+        candidate = copy.deepcopy(state)
+        candidate["authority_epoch"] += 1
+        candidate["allowed_releases"] = {target_release_digest: 3}
+        for request in candidate["requests"].values():
+            if isinstance(request, dict) and request.get("status") == "pending":
+                request["status"] = "tombstoned"
+                request["tombstoned_at"] = transitioned_at
+                request.pop("confirmation_digest", None)
+        for grant in candidate["grants"].values():
+            if isinstance(grant, dict) and grant.get("status") == "active":
+                grant["status"] = "tombstoned"
+                grant["tombstoned_at"] = transitioned_at
+        candidate["updated_at"] = transitioned_at
+        return candidate
+
+    def _owner_upgrade_preview(self, target_release_digest, transitioned_at):
+        """Seal exact pre/post fingerprints without modifying authority state."""
+        target_release_digest = _validate_digest(target_release_digest)
+        if (not isinstance(transitioned_at, (int, float))
+                or isinstance(transitioned_at, bool)
+                or not math.isfinite(transitioned_at)):
+            _fail("INVALID_AUTHORITY_TRANSACTION")
+        with self._locked_state(shared=True) as (_, state):
+            candidate = self._owner_upgrade_candidate(
+                state, target_release_digest, transitioned_at)
+            return {
+                "binding": self._binding(state),
+                "original_fingerprint": self._state_fingerprint(state),
+                "final_binding": self._binding(candidate),
+                "final_fingerprint": self._state_fingerprint(candidate),
+            }
+
+    @staticmethod
+    def _owner_maintenance(maintenance, expected_binding):
+        from workspace_control import ActivationMaintenance
+        if not isinstance(maintenance, ActivationMaintenance):
+            _fail("INVALID_AUTHORITY_TRANSACTION")
+        return maintenance._verify_binding(expected_binding)
+
+    def _owner_upgrade_state(self, maintenance, original_binding,
+                             target_release_digest, original_fingerprint,
+                             final_fingerprint, transitioned_at):
+        """Publish the one ABI 3 release for a sealed stopped-owner upgrade.
+
+        The original and completed bindings are both accepted so a crash after
+        the authority write can resume without advancing the epoch twice.
+        """
+        if (not isinstance(original_binding, dict)
+                or set(original_binding) != {
+                    "installation_id", "authority_epoch", "policy_digest"}
+                or type(original_binding.get("authority_epoch")) is not int):
+            _fail("INVALID_AUTHORITY_TRANSACTION")
+        target_release_digest = _validate_digest(target_release_digest)
+        if (not isinstance(original_fingerprint, str)
+                or _DIGEST.fullmatch(original_fingerprint) is None
+                or not isinstance(final_fingerprint, str)
+                or _DIGEST.fullmatch(final_fingerprint) is None
+                or not isinstance(transitioned_at, (int, float))
+                or isinstance(transitioned_at, bool)
+                or not math.isfinite(transitioned_at)):
+            _fail("INVALID_AUTHORITY_TRANSACTION")
+        completed = {
+            **original_binding,
+            "authority_epoch": original_binding["authority_epoch"] + 1,
+        }
+        try:
+            self._owner_maintenance(maintenance, original_binding)
+        except Exception as exc:
+            if getattr(exc, "code", None) != "WORKSPACE_AUTHORITY_CHANGED":
+                raise
+            self._owner_maintenance(maintenance, completed)
+        with self._locked_state() as (root_fd, state):
+            current = self._binding(state)
+            fingerprint = self._state_fingerprint(state)
+            if current == completed and fingerprint == final_fingerprint:
+                return current
+            if current != original_binding or fingerprint != original_fingerprint:
+                _fail("AUTHORITY_BINDING_STALE")
+            candidate = self._owner_upgrade_candidate(
+                state, target_release_digest, transitioned_at)
+            if self._state_fingerprint(candidate) != final_fingerprint:
+                _fail("AUTHORITY_BINDING_STALE")
+            self._save(root_fd, candidate)
+            return self._binding(candidate)
+
+    def _owner_upgrade_minimum_abi(self, maintenance, expected_binding,
+                                   expected_fingerprint):
+        """Raise the ABI floor from 2 to 3 under the authority write lock."""
+        self._owner_maintenance(maintenance, expected_binding)
+        with self._locked_state() as (_, state):
+            if (self._binding(state) != expected_binding
+                    or self._state_fingerprint(state) != expected_fingerprint):
+                _fail("AUTHORITY_BINDING_STALE")
+            if set(state["allowed_releases"].values()) != {3}:
+                _fail("INVALID_ALLOWED_RELEASES")
+            parent_fd = _private_directory(self.state_dir.parent, create=False)
+            try:
+                current = self._read_minimum_abi(parent_fd, required=True)
+                if current == 3:
+                    return 3
+                if current != 2:
+                    _fail("INVALID_MINIMUM_ABI")
+                temporary = ".minimum-abi-" + secrets.token_hex(16) + ".tmp"
+                _create_private_file(
+                    parent_fd, temporary, self._minimum_abi_payload(3))
+                try:
+                    os.replace(
+                        temporary, self.minimum_abi_path.name,
+                        src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                    )
+                    _fsync_directory(parent_fd)
+                except OSError as exc:
+                    _fail("AUTHORITY_STATE_UNAVAILABLE", exc)
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+                return 3
+            finally:
+                os.close(parent_fd)
 
     def cursor_key(self, policy_digest):
         with self._locked_state(shared=True) as (root_fd, state):

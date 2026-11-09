@@ -1,8 +1,9 @@
 """Bounded, optional switch of the existing personal-ops-admin systemd user unit.
 
 Never installs a new service, changes listening interfaces or reads tokens.
-Only an existing Python admin_server.py ExecStart can be replaced; original
-flags are preserved exactly. Failure attempts rollback of the single override.
+Recognizes a validated Python command or the pinned WSL launcher wrapper.
+Flags and wrapper exports are preserved. Failure attempts bounded rollback
+of the single override without rewriting an existing wrapper.
 """
 from __future__ import annotations
 
@@ -18,6 +19,10 @@ import urllib.request
 
 from workspace_control import (DEFAULT_CONTROLLER_DIR, WorkspaceControlError,
                                transition_release, verify_controller, verify_launch)
+from rollout_layout import (LayoutError, assert_wrapper, isolated_argv,
+                            managed_command, parse_managed_command,
+                            process_environment, validate_environment,
+                            validate_wsl_unit, verify_managed_interpreter)
 
 SERVICE = "personal-ops-admin.service"
 ALLOWED_ARGS = {"--port", "--config", "--public-origin", "--lan-host"}
@@ -133,7 +138,7 @@ def _safe_script(path, root, releases):
                  or resolved.is_relative_to(releases.resolve())))
 
 
-def parse_execstart(unit_text, root, releases):
+def _parse_admin_unit(unit_text, root, releases):
     from admin_server import validate_lan_host, validate_public_origin
     section = ""
     commands = []
@@ -156,6 +161,15 @@ def parse_execstart(unit_text, root, releases):
         argv = shlex.split(commands[0])
     except ValueError as exc:
         raise AdminSwitchError("UNRECOGNIZED_ADMIN_UNIT") from exc
+    managed = None
+    if argv == [str(Path.home() / ".local/bin/personal-ops-admin")] or argv[:1] == ["/usr/bin/env"]:
+        try:
+            validate_wsl_unit(unit_text, admin=True)
+            managed = parse_managed_command(argv, "admin_server.py")
+        except LayoutError as exc:
+            raise AdminSwitchError(exc.code) from exc
+        argv = [str(managed["interpreter"]), str(managed["runtime"] / "admin_server.py"),
+                *managed["application_args"]]
     if len(argv) < 2 or not _safe_interpreter(Path(argv[0])):
         raise AdminSwitchError("UNRECOGNIZED_ADMIN_UNIT")
     if Path(argv[1]).name == "workspace-launcher.py":
@@ -202,7 +216,36 @@ def parse_execstart(unit_text, root, releases):
                                       or not Path(value).resolve().is_relative_to(
                                           Path.home() / ".config/chatgpt-coding-mcp")):
             raise AdminSwitchError("UNRECOGNIZED_ADMIN_FLAGS")
+    return (managed["command_argv"] if managed is not None else argv), port, managed
+
+
+def parse_execstart(unit_text, root, releases):
+    argv, port, _ = _parse_admin_unit(unit_text, root, releases)
     return argv, port
+
+
+def _assert_managed(managed):
+    if managed is not None:
+        try:
+            assert_wrapper(managed["wrapper"])
+            verify_managed_interpreter(managed["home"])
+            if verify_controller(managed["controller_dir"])["manifest"] != managed["controller_manifest"]:
+                raise LayoutError("WORKSPACE_CONTROLLER_CHANGED")
+        except (LayoutError, WorkspaceControlError) as exc:
+            raise AdminSwitchError(exc.code) from exc
+
+
+def _bind_environment(managed, pid, process_environment_fn):
+    if managed is None:
+        return
+    try:
+        environment = validate_environment(process_environment_fn(pid), managed["home"])
+        if managed["environment"] is not None and managed["environment"] != environment:
+            raise LayoutError("LIVE_RUNTIME_ENVIRONMENT_MISMATCH")
+        managed["environment"] = environment
+        _assert_managed(managed)
+    except LayoutError as exc:
+        raise AdminSwitchError(exc.code) from exc
 
 
 def _read_override(path):
@@ -469,13 +512,15 @@ def _poll_ui(getter, url, marker, *, attempts=12, sleep_fn=time.sleep):
 def _rollback_admin(*, override, previous, deployed_stamp, old_unit, deployed_unit,
                     old_argv, port, command_fn, unit_fn, process_argv_fn,
                     process_start_fn, getter, sleep_fn, allowed_processes,
-                    authority_dir, controller_dir):
-    old_runtime = Path(old_argv[1]).parent
+                    authority_dir, controller_dir, managed=None,
+                    process_environment_fn=process_environment):
+    _assert_managed(managed)
+    old_runtime = managed["runtime"] if managed is not None else Path(old_argv[1]).parent
     old_admission = _verify_workspace_launch(old_runtime, authority_dir)
-    old_launch_argv = _workspace_admin_command(
-        old_admission, old_runtime, Path(old_argv[0]), authority_dir,
-        old_argv[2:], controller_dir,
-    )
+    old_launch_argv = (managed["launcher_argv"] if managed is not None else
+                       _workspace_admin_command(
+                           old_admission, old_runtime, Path(old_argv[0]), authority_dir,
+                           old_argv[2:], controller_dir))
     _assert_override(override, deployed_stamp)
     _assert_effective_unit(unit_fn, command_fn, deployed_unit)
     inactive_recovery = False
@@ -550,26 +595,34 @@ def _rollback_admin(*, override, previous, deployed_stamp, old_unit, deployed_un
         command_fn, process_argv_fn, process_start_fn)
     if final_identity != restored_identity or final_argv != old_argv:
         raise AdminSwitchError("ADMIN_ROLLBACK_MAINPID_MISMATCH")
+    if managed is not None:
+        _bind_environment(managed, restored_identity[0], process_environment_fn)
 
 
 def preflight_admin(*, unit_fn=None, command_fn=_run, root=None, releases=None,
-                    process_argv_fn=_process_argv, process_start_fn=_process_start):
+                    process_argv_fn=_process_argv, process_start_fn=_process_start,
+                    process_environment_fn=process_environment):
     """Validate the existing unit without writing an override or restarting it."""
     root = Path(root) if root is not None else Path(__file__).resolve().parent
     releases = (Path(releases) if releases is not None else
                 Path.home() / ".local/lib/chatgpt-coding-mcp/releases")
     _validate_override_shape(_override_path())
     unit = _read_unit(unit_fn, command_fn)
-    argv, port = parse_execstart(unit, root, releases)
-    _, live_argv = _process_snapshot(command_fn, process_argv_fn, process_start_fn)
+    argv, port, managed = _parse_admin_unit(unit, root, releases)
+    identity, live_argv = _process_snapshot(command_fn, process_argv_fn, process_start_fn)
     if live_argv != argv:
         raise AdminSwitchError("ADMIN_MAINPID_MISMATCH")
+    if managed is not None:
+        _bind_environment(managed, identity[0], process_environment_fn)
+        _assert_effective_unit(unit_fn, command_fn, unit)
+        _assert_process(command_fn, process_argv_fn, process_start_fn, {identity: argv})
     return argv, port
 
 
 def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
                  process_argv_fn=_process_argv, process_start_fn=_process_start,
-                 sleep_fn=time.sleep, authority_dir=None, controller_dir=None):
+                 sleep_fn=time.sleep, authority_dir=None, controller_dir=None,
+                 process_environment_fn=process_environment):
     """Switch only a recognizable existing user unit to the new immutable release."""
     root = Path(__file__).resolve().parent
     releases = Path.home() / ".local/lib/chatgpt-coding-mcp/releases"
@@ -592,19 +645,42 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
     target_admission = _verify_workspace_launch(runtime_path, authority_dir)
     previous, previous_stamp = _validate_override_shape(_override_path())
     old_unit = _read_unit(unit_fn, command_fn)
-    old_argv, port = parse_execstart(old_unit, root, releases)
+    old_argv, port, managed = _parse_admin_unit(old_unit, root, releases)
     _assert_override(_override_path(), previous_stamp)
     old_identity, actual_old_argv = _process_snapshot(
         command_fn, process_argv_fn, process_start_fn)
     if actual_old_argv != old_argv:
         raise AdminSwitchError("ADMIN_MAINPID_MISMATCH")
+    if managed is not None:
+        if ((authority_dir is not None and Path(authority_dir) != managed["authority_dir"])
+                or (controller_dir is not None and Path(controller_dir) != managed["controller_dir"])):
+            raise AdminSwitchError("WORKSPACE_AUTHORITY_ENV_MISMATCH")
+        authority_dir, controller_dir = managed["authority_dir"], managed["controller_dir"]
+        _bind_environment(managed, old_identity[0], process_environment_fn)
+        target_admission = _verify_workspace_launch(runtime_path, authority_dir)
+        owner_command = command_fn
+        def guarded_command(command, **kwargs):
+            _assert_managed(managed)
+            value = owner_command(command, **kwargs)
+            _assert_managed(managed)
+            return value
+        command_fn = guarded_command
     _assert_effective_unit(unit_fn, command_fn, old_unit)
-    argv = list(old_argv)
-    argv[1] = str(script)
-    launch_argv = _workspace_admin_command(
-        target_admission, runtime_path, Path(argv[0]), authority_dir, argv[2:],
-        controller_dir,
-    )
+    if managed is not None:
+        try:
+            argv = isolated_argv(runtime_path, "admin_server.py", managed["home"])
+            launch_argv = managed_command(runtime_path, managed["environment"],
+                                          "admin_server.py", managed["home"])
+        except LayoutError as exc:
+            raise AdminSwitchError(exc.code) from exc
+        pending_argv = launch_argv[4:]
+    else:
+        argv = list(old_argv)
+        argv[1] = str(script)
+        launch_argv = _workspace_admin_command(
+            target_admission, runtime_path, Path(argv[0]), authority_dir, argv[2:],
+            controller_dir)
+        pending_argv = launch_argv
     override = _override_path()
     override.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent = override.parent
@@ -613,6 +689,7 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
     except AdminSwitchError:
         raise AdminSwitchError("UNSAFE_ADMIN_OVERRIDE")
     _assert_override(override, previous_stamp)
+    _assert_managed(managed)
     value = ("[Service]\nExecStart=\nExecStart=" + shlex.join(launch_argv) + "\n").encode()
     deployed_stamp = _atomic_override(override, value, previous_stamp)
     getter = urlopen_fn or urllib.request.urlopen
@@ -642,9 +719,15 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
         _assert_process(command_fn, process_argv_fn, process_start_fn,
                         {old_identity: old_argv})
         current_admission = _verify_workspace_launch(runtime_path, authority_dir)
-        if (_workspace_admin_command(
-                current_admission, runtime_path, Path(argv[0]), authority_dir,
-                argv[2:], controller_dir) != launch_argv):
+        try:
+            current_command = (managed_command(runtime_path, managed["environment"],
+                                                "admin_server.py", managed["home"])
+                               if managed is not None else _workspace_admin_command(
+                                   current_admission, runtime_path, Path(argv[0]), authority_dir,
+                                   argv[2:], controller_dir))
+        except LayoutError as exc:
+            raise AdminSwitchError(exc.code) from exc
+        if current_command != launch_argv:
             raise AdminSwitchError("WORKSPACE_AUTHORITY_CHANGED")
         if current_admission["authority_active"]:
             _transition_workspace_launch(runtime_path, authority_dir)
@@ -654,9 +737,9 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
         identity, current_argv = _process_snapshot(
             command_fn, process_argv_fn, process_start_fn)
         launch_identity = None
-        if current_argv == argv:
+        if current_argv == argv and (managed is None or identity != old_identity):
             new_identity = identity
-        elif current_argv == launch_argv and current_argv != argv:
+        elif current_argv == pending_argv and current_argv != argv:
             launch_identity = identity
         elif identity != old_identity or current_argv != old_argv:
             raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
@@ -670,7 +753,7 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
             try:
                 identity, current_argv = _process_snapshot(
                     command_fn, process_argv_fn, process_start_fn)
-                if current_argv == launch_argv and current_argv != argv:
+                if current_argv == pending_argv and current_argv != argv:
                     if new_identity is not None:
                         raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
                     if launch_identity is None:
@@ -682,6 +765,8 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
                     if (launch_identity is not None or identity != old_identity
                             or current_argv != old_argv):
                         raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
+                    raise AdminSwitchError("ADMIN_MAINPID_MISMATCH")
+                if managed is not None and identity == old_identity:
                     raise AdminSwitchError("ADMIN_MAINPID_MISMATCH")
                 if launch_identity is not None and identity != launch_identity:
                     raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
@@ -699,6 +784,8 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
                     command_fn, process_argv_fn, process_start_fn)
                 if verified_identity != new_identity or verified_argv != argv:
                     raise AdminSwitchError("ADMIN_SERVICE_CHANGED")
+                if managed is not None:
+                    _bind_environment(managed, new_identity[0], process_environment_fn)
                 return "admin_ready"
             except AdminSwitchError as exc:
                 if exc.code in ("ADMIN_OVERRIDE_CHANGED", "ADMIN_UNIT_CHANGED",
@@ -723,7 +810,8 @@ def switch_admin(new_runtime, *, unit_fn=None, command_fn=_run, urlopen_fn=None,
                 port=port, command_fn=command_fn, unit_fn=unit_fn,
                 process_argv_fn=process_argv_fn, process_start_fn=process_start_fn,
                 getter=getter, sleep_fn=sleep_fn, allowed_processes=allowed,
-                authority_dir=authority_dir, controller_dir=controller_dir)
+                authority_dir=authority_dir, controller_dir=controller_dir,
+                managed=managed, process_environment_fn=process_environment_fn)
         except BaseException as rollback_error:
             if _is_interruption(cause):
                 cause.rollback_status = "failed"

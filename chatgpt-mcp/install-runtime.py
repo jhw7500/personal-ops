@@ -13,7 +13,7 @@ from jobs import private_directory, private_file
 from server import CONFIG, load_projects
 
 
-FILES = ("server.py", "catalog_refresh.py", "runtime_verification.py", "verify-runtime-rollout.py", "project_resume.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
+FILES = ("server.py", "bootstrap.py", "catalog_refresh.py", "runtime_verification.py", "verify-runtime-rollout.py", "project_resume.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
          "host_runtime_config.py", "host_runtime.py", "host_runtime_operations.py",
          "host_runtime_tools.py", "host_runtime_web.py", "host_db_migration.py", "host_schema014.py",
          "host_schema015016.py",
@@ -22,6 +22,9 @@ FILES = ("server.py", "catalog_refresh.py", "runtime_verification.py", "verify-r
          "runtime_rollout_web.py", "runtime_rollout_scoped_source.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py", "runtime_rollout_ui.py", "runtime-rollout-approval.html",
          "approve-host-operation.py",
          "postgres_job.py", "git_workflows.py", "approve-git-operation.py", "context.yml",
+         "git_operation_ui.py", "git-operation-approval.html",
+         "operation_approval_ui.py", "operation-approval.html",
+         "validate_change_evidence.py",
          "project-picker.html", "project_state.py", "admin_server.py",
          "admin.html", "admin.js", "admin.css", "agent-admin.js",
          "runtime-rollout-admin.js", "workspace_view.py",
@@ -38,7 +41,8 @@ FILES = ("server.py", "catalog_refresh.py", "runtime_verification.py", "verify-r
          "host_command_profiles.py", "host_command_entry.py",
          "host_command_runner.py", "host_command_supervisor.py",
          "host_command_operations.py", "host_command_tools.py", "host-command-admin.js",
-         "host_access.py", "host_execution.py", "host_execution_tools.py", "host_agent.py",
+         "host_access.py", "host_access_installation.py",
+         "host_execution.py", "host_execution_tools.py", "host_agent.py",
          "host-access-admin.js", "host_access_ui.py", "host-access-approval.html",
          "host_operation_ui.py", "host-operation-approval.html",
          "host_test_approval_ui.py", "host-test-plan-approval.html",
@@ -49,7 +53,9 @@ FILES = ("server.py", "catalog_refresh.py", "runtime_verification.py", "verify-r
          "workspace_paths.py", "workspace_policy.py", "workspace_authority.py",
          "workspace_activation.py", "workspace_activation_cli.py",
          "workspace_activation_host.py", "workspace_activation_legacy.py",
+         "workspace_upgrade.py",
          "rollout_admin.py", "rollout_tunnel.py", "rollout_diagnostics.py",
+         "rollout_layout.py", "rollout_target.py", "rollout_authority.py",
          "workspace_files.py", "workspace_jobs.py", "workspace_tools.py", "workspace_host.py",
          "workspace_control.py", "workspace-launcher.py", "workspace-access-approval.html")
 DASHBOARD_FILES = ('model.js', 'motion.js', 'pixels.js', 'visualizer.js', 'visualizer.css')

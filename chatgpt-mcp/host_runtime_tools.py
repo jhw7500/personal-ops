@@ -47,7 +47,7 @@ HOST_RUNTIME_TOOL_SPECS = [
     _tool("prepare_test_deploy", "테스트 API 배포 계획",
           "Create a source-pinned, time-limited API-or-Worker deployment plan. "
           "An active fixed-target authorization permits a later explicit execute call without "
-           "per-plan approval; otherwise a separate one-use in-chat TEST approval card is opened. "
+          "per-plan approval; otherwise its exact inline chat approval card is required. "
           "The ready_to_execute response includes approval_required=false and the next execute "
           "call. Planning does not build, restart services, or alter the database. Registered "
           "reviewed_snapshot targets accept uncommitted inputs; no Git commit is required.",
@@ -61,7 +61,7 @@ HOST_RUNTIME_TOOL_SPECS = [
           "baseline, missing 006-012 and 013 are pinned into one 006-013 plan; otherwise the "
           "existing separate 013/per-operation approval policy remains. Planning never writes SQL. "
           "A ready_to_execute response with approval_required=false needs only the user's "
-          "explicit execution request; call its next_action without another web approval. "
+          "explicit execution request; call its next_action without another approval. "
           "Changing any fixed 001-013 SQL bytes invalidates the target grant until reauthorized. "
           "No arbitrary SQL or restoration.",
           {"request_id": _REQUEST}, ("request_id",), readonly=False),
@@ -84,7 +84,7 @@ HOST_RUNTIME_TOOL_SPECS = [
           "permits a later explicit execute call; otherwise a new separate host approval is required. "
           "Changing any fixed 001-013 SQL bytes requires target reauthorization. "
           "Registered reviewed_snapshot targets need no extra scope-enable step or Git commit; "
-          "Without a target grant, review and approve the frozen source in the management web. "
+          "Without a target grant, review and approve the frozen source in its chat card. "
           "Does not execute SQL writes, backup, Docker deploy or service restart.",
           {"request_id": _REQUEST}, ("request_id",), readonly=False),
     _tool("execute_predecessor_migration", "승인된 DB 006~012 적용",
@@ -114,11 +114,11 @@ HOST_RUNTIME_TOOL_SPECS = [
     _tool("get_host_operation", "호스트 배포 작업 상태",
           "Read deployment operation state and safe metadata. A ready_to_execute plan with "
           "approval_required=false is already target-authorized: use its next_action only if "
-          "the user requested execution; do not request another web approval. Expired plans "
+          "the user requested execution; do not request another approval. Expired plans "
           "need a new request_id, not approval. For a pending Schema 014 plan, open its exact "
-          "inline card with open_schema014_approval; use the admin page only as fallback. "
-          "For a pending schema015016 plan, use open_test_plan_approval with its exact "
-          "operation_id; the authenticated admin page is an explicitly requested fallback. "
+          "inline card with open_schema014_approval. Pending schema015016 plans use "
+          "open_test_plan_approval with their exact operation_id; other pending legacy plans "
+          "use open_operation_approval with family=runtime. Use the admin page only as fallback. "
           "Queued, running or unknown "
           "outcomes are never reported as success.",
           {"operation_id": _ID}, ("operation_id",)),

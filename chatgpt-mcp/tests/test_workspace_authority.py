@@ -131,6 +131,24 @@ class WorkspaceAuthorityTest(unittest.TestCase):
             "minimum_abi": 1,
         })
 
+    def test_initialize_can_explicitly_create_abi_three_floor(self):
+        self.authority.initialize(
+            POLICY_A, {RELEASE_A: 3}, minimum_abi=3,
+        )
+
+        self.assertEqual(json.loads(
+            self.minimum_abi_path().read_text(encoding="utf-8"),
+        )["minimum_abi"], 3)
+
+    def test_initialize_rejects_unknown_future_minimum_abi(self):
+        self.assert_code(
+            "INVALID_MINIMUM_ABI",
+            lambda: self.authority.initialize(
+                POLICY_A, {RELEASE_A: 4}, minimum_abi=4,
+            ),
+        )
+        self.assertFalse(self.authority.enforcement_path.exists())
+
     def test_initialize_preserves_existing_floor_and_rejects_lower_release_abi(self):
         pin = self.write_minimum_abi(2)
         original = pin.read_bytes()

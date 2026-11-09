@@ -40,6 +40,7 @@ class FakeRuntime:
 
 class FakeOperations:
     def __init__(self, projects, state_dir=None, **kwargs):
+        self.projects = projects
         self.state_dir = private_dir(Path(state_dir))
         self.operations_dir = private_dir(self.state_dir / "operations")
         self.lock_path = self.state_dir / "operations.lock"
@@ -47,6 +48,7 @@ class FakeOperations:
         self.states = {}
     def _require_trusted_runtime(self): pass
     def _verify(self, immutable): return Path(sys.argv[2])
+    def _verify_pending_or_retire(self, state): pass
     def _load(self, project, target, operation_id): return self.states[operation_id]
     async def execute(self, project, target, operation_id, *, expected_component):
         if expected_component != {"schema015016"}:
@@ -80,6 +82,7 @@ class FakeOperations:
         }
         state = {
             "project": project, "target": target, "operation_id": operation_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "immutable": immutable, "state": "pending_host_approval",
             "plan_digest": hashlib.sha256(b"fixed-plan").hexdigest(),
         }
@@ -118,7 +121,11 @@ class TestPlanChatRouterTests(unittest.IsolatedAsyncioTestCase):
                             tools = {x.name: x for x in (await client.list_tools()).tools}
                             self.assertEqual(
                                 tools["prepare_test_deploy"].meta["ui"],
-                                {"resourceUri": UI_URI, "visibility": ["model"]})
+                                {"resourceUri": "ui://operations/approval-v1.html",
+                                 "visibility": ["model"]})
+                            self.assertEqual(
+                                tools["prepare_schema015016_migration"].meta["ui"]["resourceUri"],
+                                UI_URI)
                             for name in ("confirm_test_plan_approval", "cancel_test_plan_approval"):
                                 self.assertEqual(tools[name].meta["ui"]["visibility"], ["app"])
                                 self.assertTrue(tools[name].meta["openai/widgetAccessible"])
@@ -142,6 +149,11 @@ class TestPlanChatRouterTests(unittest.IsolatedAsyncioTestCase):
                             log.flush()
                             self.assertFalse(prepared.isError,
                                 response_text(prepared) + "\n" + (root / "stderr.log").read_text())
+                            self.assertEqual(prepared.structuredContent["family"], "runtime")
+                            prepared = await client.call_tool("open_test_plan_approval", {
+                                "project": "tossApp", "target": "tarororo-test",
+                                "operation_id": prepared.structuredContent["operation_id"]})
+                            self.assertFalse(prepared.isError, response_text(prepared))
                             self.assertEqual(prepared.structuredContent["component"], "worker")
                             self.assertEqual(prepared.structuredContent["state"], "pending")
                             secret = prepared.meta["test_plan_confirmation"]

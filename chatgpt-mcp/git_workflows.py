@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Constrained Git workflows for allowlisted host repositories.
 
-The MCP process may prepare operations. Commit requires a verified owner-confirmed
-commit-only grant or a separate one-use approval; push always requires one-use
-owner approval. Pull request and merge operations are handed
+The MCP process may prepare operations. Commit and push require a still-valid,
+pinned owner grant or a matching single-use approval receipt. Pull request and
+merge operations are handed
 off to the repository's native review workflows instead of invoking ``gh``.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -29,15 +29,13 @@ import time
 from typing import Callable, Iterable
 
 from workspace_paths import WorkspaceError
+from host_runtime_config import HostRuntimeError
 
 
 GIT = "/usr/bin/git"
 GH = "/usr/bin/gh"
-AUTOMATION_REPO = Path("/home/jhw/ai/opencode/projects/automation")
-CHANGE_EVIDENCE_VALIDATOR = AUTOMATION_REPO / "scripts/validate_change_evidence.py"
+CHANGE_EVIDENCE_VALIDATOR = Path(__file__).with_name("validate_change_evidence.py")
 CHANGE_EVIDENCE_VALIDATOR_BLOB = "4c07bbd2d36da0e626e8ac8d82ef8336f0272f5f"
-JHW_PR_SKILL = Path("/home/jhw/.codex/skills/jhw-pr/SKILL.md")
-PRE_PR_TRIBUNAL_SKILL = Path("/home/jhw/.codex/skills/pre-pr-tribunal/SKILL.md")
 MAX_CAPTURE = 512 * 1024
 MAX_OPERATIONS = 1000
 MAX_TEXT_BYTES = 64 * 1024
@@ -46,6 +44,7 @@ MAX_PUSH_COMMITS = 128
 MAX_PUSH_PATHS = 128
 MAX_LARGE_PUSH_PATHS = 2048
 COMMAND_TIMEOUT = 60.0
+PLAN_TTL_SECONDS = 7 * 24 * 60 * 60
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 PROTECTED_BRANCHES = frozenset({"main", "master"})
 CHANGE_URL_RE = re.compile(
@@ -59,6 +58,16 @@ BRANCH_RE = re.compile(r"^(?![./])(?!.*(?:\.\.|//|@\{|\\|[ ~^:?*\[]))(?!.*[/.]$)
 
 class _GitResultUnavailable(ValueError):
     """A Git mutation returned successfully, but its result could not be read."""
+
+
+def _native_workflow_skills() -> tuple[dict[str, Path], list[str]]:
+    skills = {
+        "jhw-pr": Path.home() / ".codex/skills/jhw-pr/SKILL.md",
+        "pre-pr-tribunal": Path.home() / ".codex/skills/pre-pr-tribunal/SKILL.md",
+    }
+    missing = [name for name, path in skills.items()
+               if not path.is_file() or path.is_symlink()]
+    return skills, missing
 
 
 def _tool(name: str, title: str, description: str, properties: dict, required=(), *, read_only=False):
@@ -105,10 +114,10 @@ GIT_TOOL_SPECS = [
     ),
     _tool(
         "prepare_git_operation", "Git 작업 준비",
-        "Prepare an exact commit, push, PR, or merge plan. A commit covered by a still-valid "
-        "owner-confirmed repository-and-branch grant returns approval_required=false and next_action; "
-        "follow it without another approval when execution was requested. Other commits and all pushes "
-        "require exact one-use chat approval (host TTY fallback). PR/merge return native-workflow handoffs.",
+        "Prepare an exact commit, push, PR, or merge plan. Commit and push reuse only an "
+        "explicit pinned owner Git grant when its exact scope remains valid; otherwise review their "
+        "one-use chat approval card. Large pushes always require exact one-use approval. "
+        "PR and merge return a native-workflow handoff.",
         {
             "project": _PROJECT,
             "action": {"type": "string", "enum": ["commit", "push", "pr", "merge"]},
@@ -125,9 +134,9 @@ GIT_TOOL_SPECS = [
     ),
     _tool(
         "execute_git_operation", "승인된 Git 작업 실행",
-        "Execute one prepared commit under its matching active commit-only grant or exact one-use "
-        "owner receipt. Push may reuse an explicitly approved origin/feature-branch/push-count grant; otherwise exact one-use approval is required. Revalidate scope and the prepared snapshot "
-        "at execution; PR/merge return their required native-workflow handoffs.",
+        "Execute one exact commit or push under its still-valid pinned owner Git grant or matching "
+        "single-use approval. Revalidate grant scope, outgoing history, and the prepared snapshot; "
+        "PR and merge return their native-workflow handoff.",
         {"project": _PROJECT, "operation_id": {"type": "string", "minLength": 1}},
         ("project", "operation_id"),
     ),
@@ -383,6 +392,7 @@ class GitWorkflows:
         reference_checker: Callable[[str], None] | None = None,
         remote_adapter: Callable[[Path, str, str], tuple[str, bool, str | None]] | None = None,
         workspace=None,
+        host_access=None,
     ):
         if not projects or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", name) for name in projects):
             raise ValueError("Git workflow projects require simple allowlisted names")
@@ -392,6 +402,7 @@ class GitWorkflows:
         self.reference_checker = reference_checker or _default_reference_checker
         self.remote_adapter = remote_adapter or _default_remote_adapter
         self.workspace = workspace
+        self.host_access = host_access
         self._ensure_state_dir()
         from git_commit_access import CommitAccess
         self.commit_access = CommitAccess(self)
@@ -569,6 +580,72 @@ class GitWorkflows:
         }
         if observed != expected:
             raise ValueError("Prepared Git push history changed")
+
+    def _compact_push_preview(
+        self, snapshot, project: str, root: Path, comparison: tuple[str, str],
+        *, max_paths: int = MAX_PUSH_PATHS,
+    ) -> str:
+        """Reviewable metadata fallback for a patch larger than the capture limit.
+
+        The outgoing history and path-policy checks still run independently.
+        Neither a truncated patch nor a partial path list can authorize a push.
+        """
+        if type(max_paths) is not int or not 1 <= max_paths <= MAX_LARGE_PUSH_PATHS:
+            raise ValueError("Outgoing Git path limit is invalid")
+        if snapshot is not None:
+            paths, omitted, truncated = self._safe_changed_paths(
+                snapshot, project, root, comparison=comparison,
+            )
+            if omitted or truncated:
+                raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED")
+            pathspecs = paths
+        else:
+            paths = None
+            pathspecs = [":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*"]
+
+        command = [
+            "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+            "--numstat", "-z", *comparison, "--", *pathspecs,
+        ]
+        output = _git(root, *command, literal=snapshot is not None).stdout
+        records = output.split(b"\0")
+        if not records or records[-1] != b"":
+            raise ValueError("Outgoing diff metadata is malformed")
+        allowed = set(paths) if paths is not None else None
+        seen: set[str] = set()
+        rows: list[str] = []
+        for record in records[:-1]:
+            fields = record.split(b"\t", 2)
+            if len(fields) != 3:
+                raise ValueError("Outgoing diff metadata is malformed")
+            added, deleted, encoded_path = fields
+            if any(value != b"-" and not value.isdigit() for value in (added, deleted)):
+                raise ValueError("Outgoing diff statistics are malformed")
+            relative = encoded_path.decode("utf-8", errors="surrogateescape")
+            if relative in seen:
+                raise ValueError("Outgoing diff metadata contains duplicate paths")
+            self._paths(root, [relative], required=True)
+            if allowed is not None and relative not in allowed:
+                raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED")
+            seen.add(relative)
+            rows.append(
+                f"{added.decode('ascii')}\t{deleted.decode('ascii')}\t"
+                + json.dumps(relative, ensure_ascii=True)
+            )
+            if len(rows) > max_paths:
+                raise ValueError("Outgoing Git history exceeds the path limit")
+        if not rows or (allowed is not None and seen != allowed):
+            raise ValueError("Outgoing diff summary does not match verified changed paths")
+        preview = (
+            "OUTGOING_DIFF_SUMMARY_ONLY: full patch exceeds the 512 KiB capture limit.\n"
+            "Content is identified by the immutable Git source/remote commit IDs; "
+            "this summary is not a substitute for source review.\n"
+            f"BASE:{comparison[0]} HEAD:{comparison[1]} FILES:{len(rows)}\n"
+            + "\n".join(rows) + "\n"
+        )
+        if len(preview.encode("utf-8")) > MAX_TEXT_BYTES:
+            raise ValueError("Outgoing diff summary exceeds the 64 KiB preview limit")
+        return preview
 
     def _safe_diff(
         self, snapshot, project: str, root: Path, *, staged=False,
@@ -1022,6 +1099,7 @@ class GitWorkflows:
         if _git(root, "diff", "--cached", "--quiet", check=False).returncode != 0:
             raise ValueError("Commit preparation requires an empty pre-existing Git index")
         _reject_dangerous_git_config(root)
+        commit_identity = self._commit_identity(root)
         changed = _decode(_git(root, "status", "--porcelain=v1", "--", *paths).stdout)
         if not changed.strip():
             raise ValueError("None of the explicitly selected files has a change to commit")
@@ -1037,6 +1115,7 @@ class GitWorkflows:
                 self.reference_checker(url)
             snapshot = self._snapshot(root, paths)
             preview = self._commit_preview(root, paths)
+            authorization = self._prepare_authorization(project, "commit")
             immutable = {
                 "operation_id": operation_id, "project": project, "action": "commit",
                 "paths": paths, "message_path": str(message_path), "message_sha256": _sha256(message.encode()),
@@ -1044,10 +1123,14 @@ class GitWorkflows:
                 "display_command": f"git commit --file <approved-message> -- {' '.join(paths)}",
                 "head_target": snapshot["head"], "preview": preview,
                 "approval_nonce": secrets.token_hex(32),
+                "commit_identity": commit_identity,
+                "authorization": authorization,
+                "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=PLAN_TTL_SECONDS)).isoformat(),
             }
-            binding = self.commit_access.preparation_binding(project)
-            if binding is not None:
-                immutable["development_grant_id"] = binding
+            if authorization == {"mode": "per_operation"}:
+                binding = self.commit_access.preparation_binding(project)
+                if binding is not None:
+                    immutable["development_grant_id"] = binding
             plan = {
                 "version": 1, "operation_id": operation_id, "project": project,
                 "action": "commit", "status": "pending_host_approval", "created_at": _utcnow(),
@@ -1107,22 +1190,16 @@ class GitWorkflows:
                     or _git(root, "merge-base", "--is-ancestor", remote_head,
                             snapshot["head"], check=False).returncode != 0):
                 raise ValueError("Large push requires an existing remote branch that is an ancestor of HEAD")
-            preview = _decode(_git(
-                root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--raw", "--no-abbrev",
-                comparison, snapshot["head"], "--",
-                ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*", literal=False,
-            ).stdout)
-        elif workspace_snapshot is None:
-            preview = _decode(_git(
+        if workspace_snapshot is None:
+            exact_preview = _decode(_git(
                 root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--raw", "--no-abbrev",
                 comparison, snapshot["head"], "--",
                 ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*", literal=False,
             ).stdout)
         else:
-            preview, omitted, truncated = self._safe_diff(
+            exact_preview, omitted, truncated = self._safe_diff(
                 workspace_snapshot, project, root,
-                comparison=(comparison, snapshot["head"]),
-                raw=True,
+                comparison=(comparison, snapshot["head"]), raw=True,
             )
             if omitted or truncated:
                 raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED")
@@ -1132,15 +1209,42 @@ class GitWorkflows:
             f"Path manifest SHA-256: {history['path_manifest_sha256']}\n"
             if large_push else ""
         )
-        preview = (
+        prefix = (
             large_notice
             + (f"Verified already-published origin/main base: {base_head}\n" if base_head else "")
             + f"Outgoing committed changes: {comparison} -> {snapshot['head']}\n"
             + "Changed paths, modes and complete old/new blob IDs:\n"
-            + preview
+            + exact_preview
         )
+        try:
+            if workspace_snapshot is None:
+                detail = _decode(_git(
+                    root, "diff", "--no-ext-diff", "--no-textconv", "--binary",
+                    comparison, snapshot["head"], "--",
+                    ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*", literal=False,
+                ).stdout)
+            else:
+                detail, omitted, truncated = self._safe_diff(
+                    workspace_snapshot, project, root,
+                    comparison=(comparison, snapshot["head"]),
+                )
+                if omitted or truncated:
+                    raise WorkspaceError("WORKSPACE_SOURCE_EXCLUDED")
+            if len((prefix + detail).encode("utf-8")) > MAX_CAPTURE:
+                raise ValueError("Command stdout exceeded the 512 KiB safety limit")
+        except ValueError as exc:
+            if str(exc) != "Command stdout exceeded the 512 KiB safety limit":
+                raise
+            detail = self._compact_push_preview(
+                workspace_snapshot, project, root,
+                comparison=(comparison, snapshot["head"]),
+                max_paths=MAX_LARGE_PUSH_PATHS if large_push else MAX_PUSH_PATHS,
+            )
+        preview = prefix + detail
         if len(preview.encode("utf-8")) > MAX_CAPTURE:
             raise ValueError("Push preview exceeded the 512 KiB safety limit")
+        authorization = ({"mode": "per_operation"} if large_push
+                         else self._prepare_authorization(project, "push"))
         immutable = {
             "action": "push", "branch": branch, "new_branch": new_branch,
             "large_push": large_push,
@@ -1153,8 +1257,10 @@ class GitWorkflows:
             "head_target": f"refs/heads/{branch} -> {snapshot['head']}",
             "preview": preview,
             "approval_nonce": secrets.token_hex(32),
+            "authorization": authorization,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=PLAN_TTL_SECONDS)).isoformat(),
         }
-        if not large_push:
+        if not large_push and authorization == {"mode": "per_operation"}:
             binding = self.commit_access.preparation_binding(project)
             if binding is not None:
                 immutable["development_grant_id"] = binding
@@ -1165,6 +1271,7 @@ class GitWorkflows:
 
     def _prepare_native_handoff(self, project: str, root: Path, action: str, args: dict) -> dict:
         snapshot = self._snapshot(root)
+        skills, missing_prerequisites = _native_workflow_skills()
         artifact = None
         details: dict[str, object] = {}
         operation_id = secrets.token_hex(16)
@@ -1193,9 +1300,15 @@ class GitWorkflows:
             "preview": display, **details,
             "handoff": {
                 "code": "NATIVE_WORKFLOW_REQUIRED",
-                "jhw_pr_skill": str(JHW_PR_SKILL),
-                "pre_pr_tribunal_skill": str(PRE_PR_TRIBUNAL_SKILL),
-                "reason": "This MCP cannot prove or execute the required native review workflow.",
+                "jhw_pr_skill": str(skills["jhw-pr"]),
+                "pre_pr_tribunal_skill": str(skills["pre-pr-tribunal"]),
+                "missing_prerequisites": missing_prerequisites,
+                "reason": (
+                    "Install the listed current-user workflow prerequisites explicitly "
+                    "before continuing; this MCP does not download skills or create PRs."
+                    if missing_prerequisites else
+                    "This MCP cannot prove or execute the required native review workflow."
+                ),
             },
         }
         plan = {
@@ -1206,6 +1319,111 @@ class GitWorkflows:
         with self._lock(project):
             self._save_plan(plan)
         return self._public(plan)
+
+    def _commit_identity(self, root: Path) -> dict:
+        """Preflight with the same restricted Git environment used by commit."""
+        identities = {}
+        for kind in ("AUTHOR", "COMMITTER"):
+            result = _git(root, "var", "GIT_" + kind + "_IDENT", check=False)
+            match = re.fullmatch(r"(.+ <[^<>\r\n]+>) [0-9]+ [+-][0-9]{4}",
+                                 _decode(result.stdout).strip())
+            if result.returncode or match is None:
+                raise ValueError(
+                    f"Git {kind.lower()} identity is missing or invalid; configure the repository identity before approval"
+                )
+            identities[kind.lower()] = match.group(1)
+        return identities
+
+    def _prepare_authorization(self, project: str, action: str) -> dict:
+        if self.host_access is None:
+            return {"mode": "per_operation"}
+        try:
+            grant = self.host_access.require_git(project, action)
+        except HostRuntimeError as exc:
+            if exc.code in {"HOST_ACCESS_REQUIRED", "HOST_ACCESS_EXPIRED",
+                            "HOST_ACCESS_REVOKED", "HOST_ACCESS_GIT_DENIED",
+                            "HOST_ACCESS_RUNTIME_CHANGED", "HOST_ACCESS_BOOT_CHANGED"}:
+                return {"mode": "per_operation"}
+            raise ValueError("Git development grant unavailable: " + exc.code) from None
+        return self._grant_binding(grant)
+
+    @staticmethod
+    def _grant_binding(grant: dict) -> dict:
+        revision = grant.get("grant_state_revision")
+        lifetime = grant.get("lifetime", "timed")
+        if (grant.get("allow_git") is not True
+                or not isinstance(grant.get("grant_id"), str)
+                or re.fullmatch(r"[0-9a-f]{32}", grant["grant_id"]) is None
+                or (revision is not None and (type(revision) is not int or revision < 0))
+                or lifetime not in {"timed", "until_revoked"}):
+            raise ValueError("Git development grant is invalid")
+        if lifetime == "timed" and _timestamp(grant.get("expires_at")) <= datetime.now(timezone.utc):
+            raise ValueError("Git development grant expired")
+        return {"mode": "host_access", "grant_id": grant["grant_id"],
+                "grant_state_revision": revision, "lifetime": lifetime,
+                "expires_at": grant.get("expires_at")}
+
+    def _grant_verified(self, plan: dict, *, verified_grant=None) -> bool:
+        authorization = plan["immutable"].get("authorization", {"mode": "per_operation"})
+        if authorization == {"mode": "per_operation"}:
+            return False
+        if authorization.get("mode") != "host_access" or self.host_access is None:
+            raise ValueError("Git development grant is unavailable")
+        try:
+            current = self._grant_binding(
+                verified_grant if verified_grant is not None else
+                self.host_access.require_git(plan["project"], plan["action"]))
+        except HostRuntimeError as exc:
+            raise ValueError("Git development grant unavailable: " + exc.code) from None
+        if current != authorization:
+            raise ValueError("Git development grant changed after preparation")
+        return True
+
+    def _receipt_verified(self, plan: dict, *, required=False) -> bool:
+        path = self._receipt_path(plan["project"], plan["operation_id"])
+        if not path.exists() and not path.is_symlink():
+            if required:
+                raise ValueError("Git operation requires a matching host approval receipt")
+            return False
+        _read_approval_receipt(path, plan)
+        return True
+
+    def _validate_pending_locked(self, plan: dict, root: Path, workspace_snapshot=None):
+        if plan["status"] != "pending_host_approval" or plan["action"] not in {"commit", "push"}:
+            raise ValueError(f"Git operation is not executable in state {plan['status']!r}")
+        immutable = plan["immutable"]
+        if immutable.get("expires_at") is not None:
+            if _timestamp(immutable["expires_at"]) <= datetime.now(timezone.utc):
+                raise ValueError("Prepared Git operation expired")
+        if plan["action"] == "commit":
+            self._workspace_paths(workspace_snapshot, plan["project"], immutable.get("paths", ()), "write")
+            identity = self._commit_identity(root)
+            if immutable.get("commit_identity", identity) != identity:
+                raise ValueError("Git identity changed after preparation")
+            self._verify_private(Path(immutable["message_path"]))
+            if _sha256(Path(immutable["message_path"]).read_bytes()) != immutable["message_sha256"]:
+                raise ValueError("Approved commit message changed after preparation")
+        elif plan["action"] == "push":
+            self._revalidate_prepared_push_history(
+                workspace_snapshot, plan["project"], root, immutable)
+        if self._snapshot(root, immutable.get("paths", ())) != immutable["snapshot"]:
+            raise ValueError("Prepared Git operation is stale because HEAD or working state changed")
+
+    def approve_web(self, project: str, *, operation_id: str, plan_digest: str,
+                    confirmation: str) -> dict:
+        """Receipt issuer for the trusted app callback; never exposed as a model tool."""
+        root = self._project(project)
+        with self._lock(project):
+            with self._workspace_access(project, write=True) as snapshot:
+                plan = self._load_plan(project, operation_id)
+                self._validate_pending_locked(plan, root, snapshot)
+                if confirmation != operation_id or plan_digest != plan["plan_digest"]:
+                    raise ValueError("Git approval does not match the exact prepared plan")
+                if self._grant_verified(plan):
+                    return self._public(plan)
+                if not self._receipt_verified(plan):
+                    _issue_approval_receipt(self._project_dir(project), plan)
+                return self._public(plan)
 
     def _public(self, plan: dict) -> dict:
         immutable = plan["immutable"]
@@ -1223,18 +1441,30 @@ class GitWorkflows:
                 outgoing_path_manifest_sha256=immutable.get("outgoing_path_manifest_sha256"),
             )
         if plan["status"] == "pending_host_approval":
-            result["approval_command"] = shlex.join([
-                "/usr/bin/python3", str(Path(__file__).with_name("approve-git-operation.py")),
-                "--state-dir", str(self.state_dir), "--project", plan["project"],
-                "--operation-id", plan["operation_id"],
-            ])
-        access = self.commit_access.public_plan(plan)
-        if access is not None:
-            result.pop("approval_command", None)
-            result.update(approval_required=False, authorization=access, next_action={
-                "tool": "execute_git_operation",
-                "arguments": {"project": plan["project"], "operation_id": plan["operation_id"]},
-            })
+            grant_verified = self._grant_verified(plan)
+            receipt_verified = False if grant_verified else self._receipt_verified(plan)
+            access = None if grant_verified or receipt_verified else self.commit_access.public_plan(plan)
+            authorization_verified = grant_verified or access is not None
+            result.update(
+                plan_digest=plan["plan_digest"],
+                expires_at=immutable.get("expires_at"),
+                authorization=(immutable.get("authorization", {"mode": "per_operation"})
+                               if access is None else access),
+                authorization_verified=authorization_verified,
+                receipt_verified=receipt_verified,
+                approval_required=not (authorization_verified or receipt_verified),
+            )
+            if authorization_verified or receipt_verified:
+                result["next_action"] = {"tool": "execute_git_operation", "arguments": {
+                    "project": plan["project"], "operation_id": plan["operation_id"]}}
+            else:
+                result["approval_card"] = {"tool": "open_git_operation_approval", "arguments": {
+                    "project": plan["project"], "operation_id": plan["operation_id"]}}
+                result["approval_command"] = shlex.join([
+                    "/usr/bin/python3", str(Path(__file__).with_name("approve-git-operation.py")),
+                    "--state-dir", str(self.state_dir), "--project", plan["project"],
+                    "--operation-id", plan["operation_id"],
+                ])
         if plan.get("authorization"):
             result["authorization"] = plan["authorization"]
         if "handoff" in immutable:
@@ -1261,40 +1491,30 @@ class GitWorkflows:
                 plan = self._load_plan(project, operation_id)
                 if plan["status"] == "waiting_native_workflow":
                     return self._public(plan)
-                if plan["status"] != "pending_host_approval":
-                    raise ValueError(f"Git operation is not executable in state {plan['status']!r}")
+                self._validate_pending_locked(plan, root, workspace_snapshot)
                 immutable = plan["immutable"]
-                if plan["action"] == "commit":
-                    self._workspace_paths(
-                        workspace_snapshot, project, immutable.get("paths", ()), "write",
-                    )
-                elif plan["action"] == "push":
-                    self._revalidate_prepared_push_history(
-                        workspace_snapshot, project, root, immutable,
-                    )
-                current = self._snapshot(root, immutable.get("paths", ()))
-                if current != immutable["snapshot"]:
-                    raise ValueError("Prepared Git operation is stale because HEAD or working state changed")
-                authorization = self.commit_access.begin_locked(plan)
-                if authorization is None:
-                    receipt_path = self._receipt_path(project, operation_id)
-                    self._verify_private(receipt_path)
+                commit_authorization = None
+                prepared_authorization = immutable.get("authorization", {"mode": "per_operation"})
+                if prepared_authorization.get("mode") == "host_access":
+                    if self.host_access is None:
+                        raise ValueError("Git development grant is unavailable")
                     try:
-                        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError) as exc:
-                        raise ValueError("Host approval receipt is unreadable") from exc
-                    expected = {
-                        "operation_id": operation_id,
-                        "plan_digest": plan["plan_digest"],
-                        "approval_nonce": immutable["approval_nonce"],
-                    }
-                    if any(receipt.get(key) != value for key, value in expected.items()):
-                        raise ValueError("Host approval receipt does not match the full prepared plan")
-                    receipt_path.unlink()
+                        with self.host_access.guard_git(project, plan["action"]) as grant:
+                            self._grant_verified(plan, verified_grant=grant)
+                            plan["status"] = "executing"
+                            self._save_plan(plan)
+                    except HostRuntimeError as exc:
+                        raise ValueError("Git development grant unavailable: " + exc.code) from None
                 else:
-                    plan["authorization"] = authorization
-                plan["status"] = "executing"
-                self._save_plan(plan)
+                    self._grant_verified(plan)  # Reject unknown authority modes.
+                    commit_authorization = self.commit_access.begin_locked(plan)
+                    if commit_authorization is None:
+                        self._receipt_verified(plan, required=True)
+                        self._receipt_path(project, operation_id).unlink()
+                    else:
+                        plan["authorization"] = commit_authorization
+                    plan["status"] = "executing"
+                    self._save_plan(plan)
                 operation_result = None
                 try:
                     if plan["action"] == "commit":
@@ -1304,13 +1524,13 @@ class GitWorkflows:
                     else:
                         raise ValueError("Only commit and push may execute through this MCP")
                     operation_result = result
-                    if authorization is not None:
+                    if commit_authorization is not None:
                         self.commit_access.finish_locked(plan, result)
                     plan["status"] = "completed"
                     plan["result"] = result
                     self._save_plan(plan)
                 except BaseException as exc:
-                    if authorization is not None:
+                    if commit_authorization is not None:
                         try:
                             self.commit_access.fail_locked(plan)
                         except Exception:
@@ -1445,6 +1665,59 @@ class GitWorkflows:
             ) from result_error
 
 
+def _timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.utcoffset() is None:
+            raise ValueError("timezone required")
+        return parsed
+    except (TypeError, ValueError):
+        raise ValueError("Git approval timestamp is invalid") from None
+
+
+def _read_approval_receipt(path: Path, plan: dict) -> dict:
+    try:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+                or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):
+            raise ValueError("Host approval receipt is not a safe owner-only file")
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        expected = {"operation_id": plan["operation_id"], "plan_digest": plan["plan_digest"],
+                    "approval_nonce": plan["immutable"]["approval_nonce"]}
+        if (not isinstance(receipt, dict) or set(receipt) != {*expected, "approved_at"}
+                or any(receipt.get(key) != value for key, value in expected.items())
+                or _timestamp(receipt["approved_at"]) < _timestamp(plan["created_at"])
+                or _timestamp(receipt["approved_at"]) > datetime.now(timezone.utc) + timedelta(minutes=1)):
+            raise ValueError("Host approval receipt does not match the full prepared plan")
+        return receipt
+    except (OSError, json.JSONDecodeError, TypeError, KeyError):
+        raise ValueError("Host approval receipt is unreadable") from None
+
+
+def _issue_approval_receipt(project_dir: Path, plan: dict) -> dict:
+    """Shared issuer reached only after a genuine terminal or trusted app confirmation."""
+    operation_id = plan["operation_id"]
+    receipt_path = project_dir / f"{operation_id}.approval.json"
+    if receipt_path.exists() or receipt_path.is_symlink():
+        _read_approval_receipt(receipt_path, plan)
+        return {"operation_id": operation_id, "status": "approved_once"}
+    receipt = {"operation_id": operation_id, "plan_digest": plan["plan_digest"],
+               "approval_nonce": plan["immutable"]["approval_nonce"], "approved_at": _utcnow()}
+    temporary = project_dir / f".{operation_id}.{secrets.token_hex(8)}.approval.tmp"
+    output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(output, "wb") as handle:
+            handle.write(_json_bytes(receipt))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, receipt_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {"operation_id": operation_id, "status": "approved_once"}
+
+
 def approve_operation(state_dir: Path, project: str, operation_id: str) -> dict:
     """Create a single-use receipt after an exact interactive terminal confirmation."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -1480,7 +1753,12 @@ def approve_operation(state_dir: Path, project: str, operation_id: str) -> dict:
             raise ValueError("Operation plan is not a safe owner-only regular file")
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         immutable = plan.get("immutable", {})
-        if (plan.get("status") != "pending_host_approval"
+        if (plan.get("operation_id") != operation_id or plan.get("project") != project
+                or immutable.get("operation_id") != operation_id
+                or immutable.get("project") != project
+                or plan.get("action") not in {"commit", "push"}
+                or immutable.get("action") != plan.get("action")
+                or plan.get("status") != "pending_host_approval"
                 or plan.get("plan_digest") != _sha256(_json_bytes(immutable))):
             raise ValueError("Operation is not pending approval or failed integrity validation")
         print(f"Project: {_terminal_safe(project)}")
@@ -1505,24 +1783,4 @@ def approve_operation(state_dir: Path, project: str, operation_id: str) -> dict:
         typed = input(f"Type exactly '{expected}' to grant one execution: ")
         if typed != expected:
             raise ValueError("Approval text did not match; no receipt was created")
-        receipt = {
-            "operation_id": operation_id,
-            "plan_digest": plan["plan_digest"],
-            "approval_nonce": immutable["approval_nonce"],
-            "approved_at": _utcnow(),
-        }
-        receipt_path = project_dir / f"{operation_id}.approval.json"
-        temporary = project_dir / f".{operation_id}.{secrets.token_hex(8)}.approval.tmp"
-        receipt_bytes = _json_bytes(receipt)
-        output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        try:
-            with os.fdopen(output, "wb") as handle:
-                handle.write(receipt_bytes)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, receipt_path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-        return {"operation_id": operation_id, "status": "approved_once"}
+        return _issue_approval_receipt(project_dir, plan)

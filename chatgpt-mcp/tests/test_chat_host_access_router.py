@@ -18,7 +18,7 @@ from mcp.client.stdio import stdio_client
 
 
 MODULE_DIR = Path(__file__).resolve().parents[1]
-CARD_URI = "ui://host-access/approval-v2.html"
+CARD_URI = "ui://host-access/approval-v3.html"
 CALLBACKS = {"update_host_access_approval", "confirm_host_access_approval",
              "cancel_host_access_approval"}
 WRAPPER = """
@@ -55,6 +55,10 @@ class ChatHostAccessRouterTests(unittest.IsolatedAsyncioTestCase):
                             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
                             self.assertIn("open_host_access_approval", tools)
                             opener = tools["open_host_access_approval"]
+                            self.assertEqual(
+                                opener.inputSchema["properties"]["lifetime"],
+                                {"type": "string", "enum": ["timed", "until_revoked"]},
+                            )
                             self.assertEqual(opener.meta["ui"], {
                                 "resourceUri": CARD_URI, "visibility": ["model"]})
                             self.assertFalse(opener.meta["openai/widgetAccessible"])

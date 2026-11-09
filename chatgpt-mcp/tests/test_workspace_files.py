@@ -95,6 +95,33 @@ class WorkspaceFilesTest(unittest.TestCase):
         self.assertNotIn("must-not-leak", json.dumps(denied))
         self.assertNotIn("content", payload)
 
+    def test_text_artifact_directory_stays_reserved_from_ordinary_file_tools(self):
+        document = json.loads(self.config.read_text())
+        document["version"] = 2
+        document["artifacts"][0].update(content_mode="text", fields=[])
+        self.config.write_text(json.dumps(document))
+        tools = WorkspaceTools(
+            {"alpha": self.project}, self.owner / "authority-v2",
+            config_path=self.config,
+        )
+        snapshot = tools.policy.load(required=True)
+        tools.authority.initialize(snapshot.digest, allowed_releases={"b" * 64: 3})
+        files = WorkspaceFiles(tools)
+        artifact = self.project / "build/results/report.txt"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("ignored report content")
+
+        denied = files.call(
+            "read_file", {
+                "project": "alpha", "relative_path": "build/results/report.txt",
+            },
+        )
+        payload = denied.get("structuredContent", {})
+
+        self.assertTrue(denied["isError"])
+        self.assertNotIn("ignored report content", json.dumps(denied))
+        self.assertNotIn("content", payload)
+
     def test_recursive_list_find_and_search_skip_ignored_sensitive_and_links(self):
         (self.project / ".gitignore").write_text("ignored/\n")
         (self.project / "visible").mkdir()

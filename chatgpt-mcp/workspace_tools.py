@@ -1,4 +1,4 @@
-"""Explicit workspace access and registered, bounded JSON artifact reads.
+"""Explicit workspace access and registered projected JSON or UTF-8 artifact reads.
 
 Confirmation capabilities belong to the trusted MCP app host, not model text.
 An installation is the authority boundary; a project/session label is not a
@@ -28,6 +28,13 @@ MAX_FILE_BYTES = 1048576
 MAX_LIST_ENTRIES = 2000
 _SECRET_KEYS = re.compile(r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|private[_-]?key|client[_-]?secret)\Z", re.I)
 _SECRET_TEXT = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer\s+[A-Za-z0-9._~-]{12,}|\bsk-[A-Za-z0-9_-]{16,}")
+_SECRET_ASSIGNMENT = re.compile(
+    r'''(?:^|[\s,{;])["']?'''
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|"
+    r'''private[_-]?key|client[_-]?secret)["']?\s*[:=]\s*'''
+    r'''(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;}]+)''',
+    re.I | re.M,
+)
 
 
 def result(payload, *, error=False, meta=None):
@@ -47,6 +54,16 @@ def _contains_secret(value):
     return isinstance(value, str) and bool(_SECRET_TEXT.search(value))
 
 
+def _contains_text_secret(text: str) -> bool:
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        value = None
+    if value is not None and _contains_secret(value):
+        return True
+    return bool(_SECRET_TEXT.search(text) or _SECRET_ASSIGNMENT.search(text))
+
+
 def _properties(extra, required=()):
     return {"type": "object", "properties": {"project": {"type": "string"}, **extra},
             "required": ["project", *required], "additionalProperties": False}
@@ -59,7 +76,7 @@ def tool_specs(projects):
     paging = {"max_bytes": {"type": "integer", "minimum": 4, "maximum": PAGE_BYTES},
               "cursor": cursor}
     definitions = [
-        ("read_registered_artifact", "등록 산출물 읽기", "Read only owner-registered JSON fields, preserving Git ignore. Bounded signed pages; no regeneration or model call.",
+        ("read_registered_artifact", "등록 산출물 읽기", "Read owner-registered projected JSON fields or UTF-8 text, preserving Git ignore. Bounded signed pages; no regeneration or model call.",
          {"relative_path": path, "grant_id": grant, **paging}, ("relative_path",), True, False),
         ("list_registered_artifacts", "등록 산출물 목록", "List metadata only for a registered directory with list permission. Listing never grants content read.",
          {"relative_path": path, "grant_id": grant}, ("relative_path",), True, False),
@@ -188,7 +205,8 @@ class WorkspaceTools:
         from workspace_files import WorkspaceFiles
         return WorkspaceFiles(self).call(name, arguments)
 
-    def _page(self, project, path, file, data, binding, *, max_bytes=PAGE_BYTES, cursor=None):
+    def _page(self, project, path, file, data, binding, *, policy_version=1,
+              max_bytes=PAGE_BYTES, cursor=None):
         if type(max_bytes) is not int or not 4 <= max_bytes <= PAGE_BYTES:
             raise WorkspaceError("WORKSPACE_PAGE_LIMIT")
         key = self.authority.cursor_key(binding["policy_digest"])
@@ -233,7 +251,7 @@ class WorkspaceTools:
                 "file_sha256": file.sha256, "content_sha256": expected["content_sha256"],
                 "file_size": file.size, "total_bytes": len(data), "offset": offset,
                 "next_offset": end, "next_cursor": next_cursor, "has_more": more,
-                "truncated": more, "policy_version": 1, **binding}
+                "truncated": more, "policy_version": policy_version, **binding}
 
     def _artifact(self, snapshot, binding, project, arguments):
         relative = arguments["relative_path"]
@@ -243,20 +261,31 @@ class WorkspaceTools:
         self._target(snapshot, project, str(self.projects[project] / relative), "read", arguments.get("grant_id"))
         file = read_file(self.projects[project], relative,
                          max_bytes=min(rule["max_file_bytes"], MAX_FILE_BYTES))
-        try:
-            value = json.loads(file.data.decode("utf-8"))
-            if not isinstance(value, dict):
-                raise ValueError
-            selected = {key: value[key] for key in rule["fields"] if key in value}
-            if not selected:
-                raise ValueError
-        except (ValueError, UnicodeError, RecursionError):
-            raise WorkspaceError("WORKSPACE_ARTIFACT_FORMAT") from None
-        if _contains_secret(selected):
-            raise WorkspaceError("WORKSPACE_SENSITIVE_CONTENT")
-        data = json.dumps(selected, ensure_ascii=False, allow_nan=False,
-                          separators=(",", ":")).encode()
+        content_mode = rule.get("content_mode", "json_fields")
+        if content_mode == "text":
+            try:
+                text = file.data.decode("utf-8")
+            except UnicodeError:
+                raise WorkspaceError("WORKSPACE_BINARY_FILE") from None
+            if _contains_text_secret(text):
+                raise WorkspaceError("WORKSPACE_SENSITIVE_CONTENT")
+            data = file.data
+        else:
+            try:
+                value = json.loads(file.data.decode("utf-8"))
+                if not isinstance(value, dict):
+                    raise ValueError
+                selected = {key: value[key] for key in rule["fields"] if key in value}
+                if not selected:
+                    raise ValueError
+            except (ValueError, UnicodeError, RecursionError):
+                raise WorkspaceError("WORKSPACE_ARTIFACT_FORMAT") from None
+            if _contains_secret(selected):
+                raise WorkspaceError("WORKSPACE_SENSITIVE_CONTENT")
+            data = json.dumps(selected, ensure_ascii=False, allow_nan=False,
+                              separators=(",", ":")).encode()
         return self._page(project, relative, file, data, binding,
+                          policy_version=snapshot.version,
                           max_bytes=arguments.get("max_bytes", PAGE_BYTES), cursor=arguments.get("cursor"))
 
     def _listing(self, project, target, snapshot, *, artifact=False, grant_id=None):
@@ -333,6 +362,7 @@ class WorkspaceTools:
                     if _SECRET_TEXT.search(file.data.decode("utf-8")):
                         raise WorkspaceError("WORKSPACE_SENSITIVE_CONTENT")
                     payload = self._page(project, str(target), file, file.data, binding,
+                                         policy_version=snapshot.version,
                                          max_bytes=args.get("max_bytes", PAGE_BYTES), cursor=args.get("cursor"))
                 elif operation == "list":
                     payload = self._listing(project, target, snapshot)

@@ -27,11 +27,11 @@ class FakeAccess:
         self.request_calls = 0
         self.get_calls = 0
 
-    def request(self, project):
+    def request(self, project, *, lifetime="timed"):
         self.request_calls += 1
         if self.error is not None:
             raise self.error
-        return {**self.request_result, "project": project}
+        return {**self.request_result, "project": project, "lifetime": lifetime}
 
     def get(self, project):
         self.get_calls += 1
@@ -81,6 +81,10 @@ class HostExecutionToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(schema["additionalProperties"])
             self.assertNotIn("approved", schema["properties"])
             self.assertNotIn("grant_id", schema["properties"])
+        by_name = {item["name"]: item for item in HOST_EXECUTION_TOOL_SPECS}
+        for name in ("request_host_access", "start_host_execution", "cancel_host_execution"):
+            self.assertFalse(by_name[name]["annotations"]["readOnlyHint"])
+            self.assertTrue(by_name[name]["annotations"]["destructiveHint"])
         start = next(item for item in HOST_EXECUTION_TOOL_SPECS
                      if item["name"] == "start_host_execution")["inputSchema"]
         self.assertNotIn("task_label", start["required"])
@@ -90,6 +94,11 @@ class HostExecutionToolTests(unittest.IsolatedAsyncioTestCase):
         )}, {"type": "string", "minLength": 1, "maxLength": 160})
         self.assertIsInstance(task_label.get("description"), str)
         self.assertTrue(task_label["description"])
+        request_access = next(item for item in HOST_EXECUTION_TOOL_SPECS
+                              if item["name"] == "request_host_access")["inputSchema"]
+        self.assertEqual(request_access["properties"]["lifetime"], {
+            "type": "string", "enum": ["timed", "until_revoked"],
+        })
 
     async def test_start_prepares_and_executes_with_strict_arguments(self):
         result = await self.tools.call("start_host_execution", {
@@ -109,10 +118,19 @@ class HostExecutionToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_request_does_not_advertise_a_second_request(self):
         result = await self.tools.call("request_host_access", {"project": "demo"})
 
-        self.assertEqual(result, {"project": "demo", "state": "requested"})
+        self.assertEqual(result, {
+            "project": "demo", "state": "requested", "lifetime": "timed",
+        })
         self.assertEqual(self.tools.access().request_calls, 1)
         self.assertNotIn("approval_card", result)
         self.assertNotIn("approval_url", result)
+
+    async def test_request_host_access_forwards_optional_lifetime(self):
+        result = await self.tools.call("request_host_access", {
+            "project": "demo", "lifetime": "until_revoked",
+        })
+
+        self.assertEqual(result["lifetime"], "until_revoked")
 
     async def test_advertised_card_flow_has_one_request_and_leaves_none(self):
         for decision in ("confirm", "cancel"):

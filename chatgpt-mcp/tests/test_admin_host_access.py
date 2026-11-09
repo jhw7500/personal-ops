@@ -117,6 +117,40 @@ class AdminHostAccessTest(unittest.TestCase):
         self.assertTrue(self.access.get("demo")["active"])
         self.assertEqual(self.execution.cancelled, [])
 
+    def test_owner_api_accepts_optional_lifetime_but_legacy_rejects_durable_grant(self):
+        endpoint = "/api/host-access-approve?project=demo"
+        body = self.body(lifetime="timed")
+        self.assertEqual(self.request("POST", endpoint, body)[0], 200)
+
+        replacement = self.access.request("demo")
+        durable = self.body(
+            request_id=replacement["request_id"], lifetime="until_revoked",
+            duration_seconds=None,
+        )
+        self.assertEqual(self.request("POST", endpoint, durable)[0], 400)
+
+    def test_owner_can_explicitly_enable_git_with_the_same_authenticated_confirmation(self):
+        code, grant = self.request(
+            "POST", "/api/host-access-approve?project=demo",
+            self.body(allow_git=True))
+        self.assertEqual(code, 200)
+        self.assertTrue(grant["allow_git"])
+        self.assertTrue(self.access.get("demo")["allow_git"])
+        self.assertEqual(self.execution.cancelled, [])
+
+    def test_git_opt_in_is_strict_and_cannot_skip_fresh_authentication(self):
+        endpoint = "/api/host-access-approve?project=demo"
+        self.assertEqual(self.request(
+            "POST", endpoint, self.body(allow_git=True), origin=False)[0], 403)
+        for value in ("true", 1, None, {}):
+            with self.subTest(value=value):
+                self.assertEqual(self.request(
+                    "POST", endpoint, self.body(allow_git=value))[0], 400)
+                self.assertFalse(self.access.get("demo")["active"])
+        code, grant = self.request("POST", endpoint, self.body(allow_git=False))
+        self.assertEqual(code, 200)
+        self.assertFalse(grant["allow_git"])
+
     def test_cancel_requires_fresh_owner_authentication(self):
         body = {"operation_id": "a" * 32, "confirmation": "demo", "admin_token": self.token}
         route = "/api/host-execution-cancel?project=demo"
