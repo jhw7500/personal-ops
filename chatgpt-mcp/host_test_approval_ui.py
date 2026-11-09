@@ -8,11 +8,9 @@ Schema 014 retains its separately reviewed dedicated approval card.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import hmac
 import json
 import os
-import re
 import secrets
 import sys
 import uuid
@@ -22,8 +20,9 @@ from host_operation_ui import Schema014Approvals, _ID, _DIGEST, _digest
 from host_runtime_config import HostRuntimeError, PROJECT, TARGET, private_dir
 from host_runtime_operations import _lock, _read_private_json, _save_private_json, _timestamp
 
-UI_URI = "ui://host-operations/test-plan-approval-v1.html"
-COMPONENTS = frozenset({"api", "worker", "migration", "predecessor_migration", "schema_update"})
+LEGACY_UI_URI = "ui://host-operations/test-plan-approval-v1.html"
+UI_URI = "ui://host-operations/test-plan-approval-v2.html"
+COMPONENTS = frozenset({"api", "worker", "migration", "predecessor_migration", "schema_update", "schema015016"})
 _STATES = frozenset({"pending", "spent", "approved", "cancelled"})
 _FIELDS = frozenset({
     "version", "project", "target", "operation_id", "component", "mode",
@@ -36,6 +35,7 @@ _NEXT_TOOLS = {
     "migration": "execute_db_migration",
     "predecessor_migration": "execute_predecessor_migration",
     "schema_update": "execute_db_migration",
+    "schema015016": "execute_schema015016_migration",
 }
 NAMES = frozenset({
     "open_test_plan_approval",
@@ -158,8 +158,10 @@ class TestPlanApprovals(Schema014Approvals):
                         next_action=next_action)
             public["next_action"] = next_action
             public["guidance"] = (
-                "One-use receipt verified. Approval alone does not execute. "
-                "Use next_action only if the user also requested execution."
+                "One-use receipt verified; no execution has started. The user may "
+                "withdraw this unused approval through the fresh in-chat cancellation "
+                "button. Never execute or revoke it automatically. Use next_action "
+                "only if the user explicitly requested this exact execution."
             )
         if approved is not None:
             public["approved"] = approved
@@ -167,6 +169,10 @@ class TestPlanApprovals(Schema014Approvals):
 
     def _result(self, card, state, *, token=None, approved=None):
         public = self._public(card, state, approved=approved)
+        # Only the actual MCP App receives this fresh, one-use cancellation token.
+        # An approved-but-unexecuted plan remains cancellable without reapproving it.
+        public["cancellation_available"] = (token is not None and
+                                            card["state"] in ("pending", "approved"))
         response = {
             "content": [{"type": "text", "text": json.dumps(public, ensure_ascii=False)}],
             "structuredContent": public,
@@ -182,7 +188,9 @@ class TestPlanApprovals(Schema014Approvals):
                     project, target, operation_id, allow_already_approved=True)
                 immutable = state["immutable"]
                 approved = self._receipt_exists_locked(state)
-                token = None if approved else secrets.token_hex(32)
+                # Even an already approved plan needs a fresh, user-operated
+                # capability so its unused receipt can be safely withdrawn.
+                token = secrets.token_hex(32)
                 card = {
                     "version": 1, "project": PROJECT, "target": TARGET,
                     "operation_id": operation_id,
@@ -203,7 +211,7 @@ class TestPlanApprovals(Schema014Approvals):
                                     approved=True if approved else None)
 
     def _checked(self, project, target, operation_id, card_id, confirmation_token, *,
-                 allow_already_approved=False):
+                 allow_already_approved=False, allow_approved_cancel=False):
         self._scope(project, target, operation_id)
         if (not isinstance(card_id, str) or not _ID.fullmatch(card_id)
                 or not isinstance(confirmation_token, str)
@@ -213,7 +221,8 @@ class TestPlanApprovals(Schema014Approvals):
         if (card["card_id"] != card_id
                 or not hmac.compare_digest(card["token_digest"], _digest(confirmation_token))):
             raise HostRuntimeError("TEST_PLAN_CARD_DENIED")
-        if card["state"] != "pending":
+        if card["state"] != "pending" and not (allow_approved_cancel and
+                                                   card["state"] == "approved"):
             raise HostRuntimeError("TEST_PLAN_CARD_SPENT")
         if _timestamp(card["expires_at"]) <= host_access._utcnow():
             raise HostRuntimeError("TEST_PLAN_CARD_EXPIRED")
@@ -231,6 +240,42 @@ class TestPlanApprovals(Schema014Approvals):
                 or card["expires_at"] != immutable["expires_at"]):
             raise HostRuntimeError("TEST_PLAN_CARD_STALE")
         return card, state
+
+    def cancel(self, project, target, operation_id, *, card_id, confirmation_token):
+        """Owner-operated withdrawal of an unexecuted TEST plan, including its receipt.
+
+        Cancellation is a separate one-use MCP App callback. It can never stop
+        queued/running work or reuse the plan's former execution authorization.
+        """
+        with _lock(self._lock_path(operation_id)):
+            card, _state = self._checked(
+                project, target, operation_id, card_id, confirmation_token,
+                allow_already_approved=True, allow_approved_cancel=True)
+            with _lock(self.operations.lock_path):
+                latest = self.operations._load(project, target, operation_id)
+                if (latest["plan_digest"] != card["plan_digest"]
+                        or latest["immutable"]["source_digest"] != card["source_digest"]
+                        or latest["immutable"]["component"] != card["component"]
+                        or latest["immutable"]["mode"] != card["mode"]):
+                    raise HostRuntimeError("TEST_PLAN_CARD_STALE")
+                if latest["state"] != "pending_host_approval":
+                    raise HostRuntimeError("TEST_PLAN_OPERATION_STARTED")
+                receipt_verified = self._receipt_exists_locked(latest)
+                if card["state"] == "approved" and not receipt_verified:
+                    raise HostRuntimeError("TEST_PLAN_CARD_STALE")
+                # Unlink only the receipt whose digest and nonce were validated.
+                # A crash before the terminal state write is fail-closed: the
+                # plan stays pending without a receipt and can be cancelled again.
+                if receipt_verified:
+                    (self.operations.operations_dir /
+                     (operation_id + ".approval.json")).unlink()
+                latest.update(
+                    state="rejected", phase="APPROVAL", code="USER_CANCELLED",
+                    finished_at=host_access._utcnow().isoformat())
+                self.operations._save(latest)
+                card["state"] = "cancelled"
+                _save_private_json(self._path(operation_id), card)
+                return self._result(card, latest, approved=False)
 
 
 def tool_specs():
@@ -257,10 +302,11 @@ def tool_specs():
             "name": name, "title": (
                 "TEST 배포·마이그레이션 승인 카드" if opener else "TEST 계획 승인 응답"),
             "description": (
-                "Open the exact pending API/Worker/001-013 TEST plan in a one-use "
+                "Open the exact pending API/Worker/001-013 or separately reviewed 015/016 TEST plan in a one-use "
                 "chat confirmation card. No build, Docker operation, migration or "
                 "service restart happens on open or approve. Already approved "
-                "plans return a verified receipt and next execution step."
+                "plans offer owner-operated withdrawal of the unused receipt. "
+                "A completed, queued or running operation cannot be withdrawn."
                 if opener else "App-only callback requiring the hidden one-use TEST plan capability."),
             "inputSchema": {
                 "type": "object",

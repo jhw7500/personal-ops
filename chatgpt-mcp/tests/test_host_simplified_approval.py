@@ -248,7 +248,7 @@ class SimplifiedApprovalTest(unittest.TestCase):
         manager, _runtime = self.manager("policy")
         self.assertEqual(manager.planning_policy(PROJECT, TARGET), {
             "mode": "reviewed_snapshot",
-            "components": ["api", "worker", "migration", "predecessor_migration", "schema014"],
+            "components": ["api", "worker", "migration", "predecessor_migration", "schema014", "schema015016"],
             "commit_required": False,
             "approval": "per_operation",
         })

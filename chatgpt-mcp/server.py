@@ -408,7 +408,8 @@ async def serve(projects):
             "them to the management web again. Do not execute a plan for a planning-only request. "
             "Expired plans need a new request_id, not another approval. A missing, revoked or "
             "changed target grant does not gain authority from a prompt. "
-            "TEST API/Worker and 001-013 per-operation plans also use an exact inline "
+            "TEST API/Worker, 001-013 and separately reviewed Schema 015/016 per-operation "
+            "plans also use an exact inline "
             "approval card. The prepare tool opens it automatically when no fixed-target grant "
             "is active. For an existing pending plan, call open_test_plan_approval with the exact "
             "operation ID. Approve/cancel callbacks are app-only, require the hidden one-use "
@@ -464,7 +465,10 @@ async def serve(projects):
                   if schema014_approvals is not None else []),
                 *([types.Resource(uri=host_test_approval_ui.UI_URI,
                                   name="test-plan-approval",
-                                  title="TEST 배포 계획 승인", mimeType=UI_MIME)]
+                                  title="TEST 계획 승인 및 미실행 승인 철회", mimeType=UI_MIME),
+                    types.Resource(uri=host_test_approval_ui.LEGACY_UI_URI,
+                                   name="test-plan-approval-v1-compat",
+                                   title="기존 TEST 승인 카드 호환", mimeType=UI_MIME)]
                   if test_plan_approvals is not None else []),
                 *([types.Resource(uri=host_registered_approval_ui.UI_URI,
                                   name="registered-host-approval",
@@ -482,7 +486,8 @@ async def serve(projects):
         uri = str(request.params.uri)
         known = uri in ({runtime_rollout_ui.UI_URI} if rollout_approvals is not None else set()) | {UI_URI, host_access_ui.UI_URI, host_command_ui.UI_URI} | (
             {host_operation_ui.UI_URI} if schema014_approvals is not None else set()) | (
-            {host_test_approval_ui.UI_URI} if test_plan_approvals is not None else set()) | (
+            {host_test_approval_ui.UI_URI, host_test_approval_ui.LEGACY_UI_URI}
+            if test_plan_approvals is not None else set()) | (
             {host_registered_approval_ui.UI_URI} if registered_approvals is not None else set()) | {
             git_approval_ui.UI_URI, git_commit_access.UI_URI}
         known = known or (workspace.enabled and uri == workspace_tools.UI_URI)
@@ -491,7 +496,8 @@ async def serve(projects):
             raise ValueError("Unknown resource")
         access_approval = uri == host_access_ui.UI_URI
         schema014_approval = uri == host_operation_ui.UI_URI
-        test_plan_approval = uri == host_test_approval_ui.UI_URI
+        test_plan_approval = uri in {
+            host_test_approval_ui.UI_URI, host_test_approval_ui.LEGACY_UI_URI}
         registered_approval = uri == host_registered_approval_ui.UI_URI
         git_approval = uri == git_approval_ui.UI_URI
         commit_access_approval = uri == git_commit_access.UI_URI
@@ -525,8 +531,9 @@ async def serve(projects):
                        "카드를 열기만 해서는 승인되지 않습니다." if access_approval else
                        "고정된 Schema 014 계획과 digest를 확인하고 1회 승인하는 카드. "
                        "승인만으로 DB 변경은 실행되지 않습니다." if schema014_approval else
-                       "고정된 TEST API·Worker·001-013 계획을 확인하고 1회 승인하는 카드. "
-                       "승인만으로 빌드·DB 변경·서비스 재시작을 실행하지 않습니다." if test_plan_approval else
+                       "TEST API·Worker·001-016 계획 승인 카드입니다. "
+                       "이미 승인됐지만 실행하지 않은 계획은 '미실행 승인 철회'로 취소할 수 있습니다. "
+                       "승인이나 철회만으로 빌드·DB 변경·서비스 재시작을 실행하지 않습니다." if test_plan_approval else
                        "등록된 호스트의 정확한 계획과 영향을 확인하는 1회 승인 카드. "
                        "승인만으로 해당 작업을 실행하지 않습니다." if registered_approval else
                        "고정된 Git 커밋·푸시 계획을 1회 승인하는 카드. "
@@ -584,7 +591,7 @@ async def serve(projects):
                 "openai/toolInvocation/invoked": descriptor["title"] + " 응답을 받았습니다",
             }
             if descriptor["name"] in {"prepare_test_deploy", "prepare_db_migration",
-                                       "prepare_predecessor_migration"}:
+                                       "prepare_predecessor_migration", "prepare_schema015016_migration"}:
                 descriptor["_meta"]["ui"]["resourceUri"] = host_test_approval_ui.UI_URI
                 descriptor["_meta"]["openai/outputTemplate"] = host_test_approval_ui.UI_URI
             if descriptor["name"] == "prepare_schema014_migration":
@@ -1016,10 +1023,11 @@ async def serve(projects):
             if name == "prepare_test_deploy":
                 expected |= {"component", "mode", "request_id"}
             elif name in {"prepare_db_migration", "prepare_predecessor_migration",
-                              "prepare_schema014_migration"}:
+                              "prepare_schema014_migration", "prepare_schema015016_migration"}:
                 expected |= {"request_id"}
             elif name in {"execute_test_deploy", "execute_db_migration",
                           "execute_predecessor_migration", "execute_schema014_migration",
+                          "execute_schema015016_migration",
                           "get_host_operation"}:
                 expected |= {"operation_id"}
             if set(arguments) != expected:
@@ -1035,6 +1043,10 @@ async def serve(projects):
                     from host_schema014 import schema014_status
                     payload = await asyncio.to_thread(
                         schema014_status, host_ops.runtime, "tossApp", "tarororo-test")
+                elif name == "get_schema015016_migration_status":
+                    from host_schema015016 import schema015016_status
+                    payload = await asyncio.to_thread(
+                        schema015016_status, host_ops.runtime, "tossApp", "tarororo-test")
                 elif name == "compare_deployment":
                     payload = await asyncio.to_thread(host_ops.compare, "tossApp", "tarororo-test")
                 elif name == "prepare_test_deploy":
@@ -1063,6 +1075,13 @@ async def serve(projects):
                             "project": "tossApp", "target": "tarororo-test",
                             "operation_id": payload["operation_id"],
                         })))
+                elif name == "prepare_schema015016_migration":
+                    if project_locks["tossApp"].locked():
+                        raise HostRuntimeError("PROJECT_BUSY")
+                    async with project_locks["tossApp"]:
+                        payload = await asyncio.to_thread(
+                            host_ops.prepare, "tossApp", "tarororo-test",
+                            "schema015016", "disabled", arguments["request_id"])
                 elif name == "prepare_predecessor_migration":
                     if project_locks["tossApp"].locked():
                         raise HostRuntimeError("PROJECT_BUSY")
@@ -1086,6 +1105,10 @@ async def serve(projects):
                     payload = await host_ops.execute(
                         "tossApp", "tarororo-test", arguments["operation_id"],
                         expected_component={"schema014"})
+                elif name == "execute_schema015016_migration":
+                    payload = await host_ops.execute(
+                        "tossApp", "tarororo-test", arguments["operation_id"],
+                        expected_component={"schema015016"})
                 elif registered is not None:
                     # Routed by the verified backend of the stored ID (legacy or registered).
                     payload = await asyncio.to_thread(registered.route_get, host_ops,
@@ -1094,7 +1117,7 @@ async def serve(projects):
                     payload = await asyncio.to_thread(
                         host_ops.get, "tossApp", "tarororo-test", arguments["operation_id"])
                 if (name in {"prepare_test_deploy", "prepare_db_migration",
-                             "prepare_predecessor_migration"}
+                             "prepare_predecessor_migration", "prepare_schema015016_migration"}
                         and payload.get("state") == "pending_host_approval"
                         and payload.get("approval_required") is True
                         and payload.get("authorization", {}).get("mode") == "per_operation"):

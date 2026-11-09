@@ -125,17 +125,18 @@ def _restore_check(runtime, path, operation_id, *, expected_history=12,
 
     if not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id):
         raise HostRuntimeError("INVALID_OPERATION_ID")
-    if type(expected_history) is not int or expected_history not in (5, 12, 13):
+    if type(expected_history) is not int or expected_history not in (5, 12, 13, 14):
         raise HostRuntimeError("BACKUP_RESTORE_INVALID")
+    allowed_names = (*PREDECESSOR_NAMES, "014_person_relationship_detail.sql")[:expected_history]
     if expected_checksums is not None and (
             not isinstance(expected_checksums, dict)
             or len(expected_checksums) != expected_history
             or any(not isinstance(k, str)
-                   or k not in PREDECESSOR_NAMES[:expected_history]
+                   or k not in allowed_names
                    or not isinstance(v, str)
                    or not re.fullmatch(r"[0-9a-f]{64}", v)
                    for k, v in expected_checksums.items())
-            or set(expected_checksums) != set(PREDECESSOR_NAMES[:expected_history])):
+            or set(expected_checksums) != set(allowed_names)):
         raise HostRuntimeError("BACKUP_RESTORE_INVALID")
     private_file(path)
     database = "tarororo_restore_" + operation_id

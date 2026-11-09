@@ -725,6 +725,7 @@ globalThis.HostOperationsView = (() => {
         : plan.component === 'predecessor_migration' ? '006~012만 실행 · 013 제외'
         : plan.component === 'migration' ? '013만 실행 · 006~012 제외'
         : plan.component === 'schema014' ? '014만 실행 · 백업·복원 검증 후 적용 · 서비스 재시작 없음'
+        : plan.component === 'schema015016' ? '015·016만 하나의 트랜잭션으로 적용 · 백업·복원 검증 필요 · 서비스 재시작 없음'
         : 'DB 스키마 변경 없음',
       execution_effect: activeTargetAuthorizedPlan(plan)
         ? '대상 사전 허용 적용 · 실행은 채팅의 명시적 MCP 호출'
@@ -732,6 +733,7 @@ globalThis.HostOperationsView = (() => {
         ? '대상 권한이 변경되어 이 계획은 사용할 수 없음 · 새 계획 필요'
         : '승인 영수증만 발급 · 실행은 별도 MCP 호출',
       migration_checksums: plan.migration_checksums || null,
+      migration015016_checksums: plan.migration015016_checksums || null,
       database_generation: plan.database_generation || null,
       high_risk_changes: plan.high_risk_changes,
       changed_path_count: plan.changed_path_count,
@@ -1055,7 +1057,8 @@ globalThis.HostOperationsView = (() => {
       const executeTool = {api: 'execute_test_deploy', worker: 'execute_test_deploy',
         migration: 'execute_db_migration', schema_update: 'execute_db_migration',
         predecessor_migration: 'execute_predecessor_migration',
-        schema014: 'execute_schema014_migration'}[plan.component];
+        schema014: 'execute_schema014_migration',
+        schema015016: 'execute_schema015016_migration'}[plan.component];
       decisionStatus = `승인 완료: ${approved.operation_id}. ${executeTool
         ? '별도 실행 승인된 도구: ' + executeTool : '실행 도구를 채팅에서 확인하세요.'}`;
     } catch (error) {

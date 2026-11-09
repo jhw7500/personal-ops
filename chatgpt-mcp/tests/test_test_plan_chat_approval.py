@@ -91,9 +91,12 @@ class TestPlanChatApprovalTests(TargetAuthorizationFixture):
         self.cards.confirm(PROJECT, TARGET, self.plan["operation_id"],
                            **self.callback_args(second))
         reopened = self.open()
-        self.assertNotIn("_meta", reopened)
+        self.assertIn("_meta", reopened)  # fresh cancellation-only capability
         self.assertEqual(reopened["structuredContent"]["state"], "approved")
         self.assertTrue(reopened["structuredContent"]["receipt_verified"])
+        self.assertTrue(reopened["structuredContent"]["cancellation_available"])
+        self.assertNotIn(self.callback_args(reopened)["confirmation_token"],
+                         json.dumps(reopened["structuredContent"]))
 
     def test_wrong_scope_component_and_changed_runtime_fail_closed(self):
         opened = self.open()
@@ -124,7 +127,7 @@ class TestPlanChatApprovalTests(TargetAuthorizationFixture):
         self.assertFalse((self.ops.operations_dir /
                           (self.plan["operation_id"] + ".approval.json")).exists())
 
-    def test_cancel_after_admin_receipt_preserves_approval(self):
+    def test_cancel_after_admin_receipt_withdraws_unexecuted_approval(self):
         opened = self.open()
         approve_web(self.ops, operation_id=self.plan["operation_id"],
                     plan_digest=self.plan["plan_digest"],
@@ -132,8 +135,68 @@ class TestPlanChatApprovalTests(TargetAuthorizationFixture):
                     confirmation=self.plan["operation_id"])
         result = self.cards.cancel(
             PROJECT, TARGET, self.plan["operation_id"], **self.callback_args(opened))
-        self.assertEqual(result["structuredContent"]["state"], "approved")
-        self.assertTrue(result["structuredContent"]["receipt_verified"])
+        self.assertEqual(result["structuredContent"]["state"], "cancelled")
+        self.assertFalse(result["structuredContent"]["receipt_verified"])
+        self.assertEqual(self.ops.get(PROJECT, TARGET, self.plan["operation_id"])["state"],
+                         "rejected")
+        self.assertFalse((self.ops.operations_dir /
+                          (self.plan["operation_id"] + ".approval.json")).exists())
+        self.assert_code("TEST_PLAN_CARD_SPENT", lambda: self.cards.cancel(
+            PROJECT, TARGET, self.plan["operation_id"], **self.callback_args(opened)))
+
+    def test_approved_old_plan_withdrawal_unblocks_new_component_plan(self):
+        # Regression: previously approved API-only plans kept TARGET_BUSY forever.
+        approved_card = self.open()
+        self.cards.confirm(PROJECT, TARGET, self.plan["operation_id"],
+                           **self.callback_args(approved_card))
+        with self.assertRaisesRegex(HostRuntimeError, "TARGET_BUSY"):
+            self.ops.prepare(PROJECT, TARGET, "api", "toss-demo", "new-blocked")
+
+        cancel_card = self.open()
+        self.assertEqual(cancel_card["structuredContent"]["state"], "approved")
+        self.assertTrue(cancel_card["structuredContent"]["cancellation_available"])
+        cancelled = self.cards.cancel(PROJECT, TARGET, self.plan["operation_id"],
+                                      **self.callback_args(cancel_card))
+        self.assertEqual(cancelled["structuredContent"]["state"], "cancelled")
+        self.assertFalse(cancelled["structuredContent"]["receipt_verified"])
+        self.assertEqual(cancelled["structuredContent"]["plan"]["state"], "rejected")
+        self.assertFalse((self.ops.operations_dir /
+                          (self.plan["operation_id"] + ".approval.json")).exists())
+        # New plan must have an independent source-bound approval; old receipt gone.
+        next_plan = self.ops.prepare(PROJECT, TARGET, "api", "toss-demo", "new-blocked")
+        self.assertNotEqual(next_plan["operation_id"], self.plan["operation_id"])
+        self.assertEqual(next_plan["state"], "pending_host_approval")
+        self.assertFalse((self.ops.operations_dir /
+                          (next_plan["operation_id"] + ".approval.json")).exists())
+
+    def test_old_token_or_started_operation_cannot_be_cancelled(self):
+        first = self.open()
+        self.cards.confirm(PROJECT, TARGET, self.plan["operation_id"],
+                           **self.callback_args(first))
+        reopened = self.open()
+        self.assert_code("TEST_PLAN_CARD_DENIED", lambda: self.cards.cancel(
+            PROJECT, TARGET, self.plan["operation_id"], **self.callback_args(first)))
+        state = self.ops._load(PROJECT, TARGET, self.plan["operation_id"])
+        state["state"] = "queued"
+        self.ops._save(state)
+        self.assert_code("TEST_PLAN_CARD_NOT_PENDING", lambda: self.cards.cancel(
+            PROJECT, TARGET, self.plan["operation_id"], **self.callback_args(reopened)))
+        self.assertTrue((self.ops.operations_dir /
+                         (self.plan["operation_id"] + ".approval.json")).exists())
+
+    def test_tampered_approved_receipt_prevents_plan_withdrawal(self):
+        first = self.open()
+        self.cards.confirm(PROJECT, TARGET, self.plan["operation_id"],
+                           **self.callback_args(first))
+        reopened = self.open()
+        receipt_path = self.ops.operations_dir / (self.plan["operation_id"] + ".approval.json")
+        receipt = json.loads(receipt_path.read_text())
+        receipt["nonce"] = "1" * 64
+        receipt_path.write_text(json.dumps(receipt))
+        self.assert_code("INVALID_HOST_APPROVAL", lambda: self.cards.cancel(
+            PROJECT, TARGET, self.plan["operation_id"], **self.callback_args(reopened)))
+        self.assertEqual(self.ops.get(PROJECT, TARGET, self.plan["operation_id"])["state"],
+                         "pending_host_approval")
 
     def test_api_and_legacy_migration_exact_routing(self):
         plans = (

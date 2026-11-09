@@ -28,6 +28,14 @@ class TTY(io.StringIO):
 
 
 class RolloutTest(unittest.TestCase):
+    def test_schema015016_source_and_regressions_are_delivered(self):
+        installer = module._import_installer()
+        self.assertIn("chatgpt-mcp/host_schema015016.py", module.inventory(installer))
+        for name in ("test_host_schema015016_status.py",
+                     "test_host_schema015016_migration.py"):
+            with self.subTest(name=name):
+                self.assertIn("tests/" + name, module.control_inventory())
+
     def test_approval_browser_fixture_is_pinned_with_preflight_inputs(self):
         for path in ("tests/check_host_access_approval_ui.py",
                      "tests/check_schema014_approval_ui.py",
@@ -402,9 +410,11 @@ class RolloutTest(unittest.TestCase):
         expected = {
             "get_runtime_status", "compare_deployment", "get_db_migration_status",
             "get_predecessor_migration_status", "get_schema014_migration_status",
+            "get_schema015016_migration_status",
             "get_toss_test_console_status", "get_toss_ux019_test_console_status",
             "get_toss_20261026_test_console_status",
             "prepare_schema014_migration", "execute_schema014_migration",
+            "prepare_schema015016_migration", "execute_schema015016_migration",
             "prepare_db_migration", "prepare_predecessor_migration",
             "execute_db_migration", "execute_predecessor_migration",
             "prepare_test_deploy", "execute_test_deploy", "get_host_operation",

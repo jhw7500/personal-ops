@@ -251,7 +251,8 @@ class ProjectStateTest(unittest.TestCase):
 
     def test_schema_and_rollout_activity_is_recorded_without_execution_inputs(self):
         tools = ['get_db_migration_status', 'get_predecessor_migration_status',
-                 'get_schema014_migration_status', 'prepare_db_migration',
+                 'get_schema014_migration_status', 'get_schema015016_migration_status',
+                 'prepare_db_migration',
                  'prepare_predecessor_migration', 'prepare_schema014_migration',
                  'execute_db_migration', 'execute_predecessor_migration',
                  'execute_schema014_migration', 'prepare_runtime_rollout',

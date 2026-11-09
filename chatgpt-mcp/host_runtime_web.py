@@ -89,11 +89,11 @@ def pending_operations(operations):
                 "source_digest": immutable["source_digest"],
                 "expires_at": immutable["expires_at"],
                 "impact": {"recreate": None if immutable["component"] in (
-                                           "migration", "predecessor_migration", "schema_update", "schema014")
+                                           "migration", "predecessor_migration", "schema_update", "schema014", "schema015016")
                                       else immutable["component"],
                            "preserve": (["api", "worker"]
                                         if immutable["component"] in (
-                                            "migration", "predecessor_migration", "schema_update", "schema014")
+                                            "migration", "predecessor_migration", "schema_update", "schema014", "schema015016")
                                         else [x for x in ("api", "worker", "db")
                                               if x != immutable["component"]]),
                            "schema_change": ("013_staged_reading_access.sql"
@@ -103,17 +103,23 @@ def pending_operations(operations):
                                             if immutable["component"] == "schema_update"
                                             else "014_person_relationship_detail.sql"
                                             if immutable["component"] == "schema014"
+                                            else "015+016_fixed_sources"
+                                            if immutable["component"] == "schema015016"
                                             else None)},
                 "high_risk_changes": immutable["high_risk_changes"],
                 "changed_path_count": len(immutable["changed_paths"]),
                 "migration_range": (["006", "012"]
                                     if immutable["component"] == "predecessor_migration" else
                                     ["006", "013"]
-                                    if immutable["component"] == "schema_update" else None),
+                                    if immutable["component"] == "schema_update" else
+                                    ["015", "016"]
+                                    if immutable["component"] == "schema015016" else None),
                 "migration_checksums": immutable.get("migration_checksums")
-                    if immutable["component"] in ("predecessor_migration", "schema_update", "schema014") else None,
+                    if immutable["component"] in ("predecessor_migration", "schema_update", "schema014", "schema015016") else None,
+                "migration015016_checksums": immutable.get("migration015016_checksums")
+                    if immutable["component"] == "schema015016" else None,
                 "database_generation": immutable.get("database_generation")
-                    if immutable["component"] in ("predecessor_migration", "schema_update", "schema014") else None,
+                    if immutable["component"] in ("predecessor_migration", "schema_update", "schema014", "schema015016") else None,
                 "authorization": _safe_authorization(immutable),
             }
             source_review = _safe_source_review(immutable)

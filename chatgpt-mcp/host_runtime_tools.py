@@ -37,6 +37,10 @@ HOST_RUNTIME_TOOL_SPECS = [
     _tool("get_schema014_migration_status", "DB 014 마이그레이션 진단",
           "Read only the fixed Schema 014 history, 001-013 prerequisites, column and constraint "
           "presence and aggregate counts in tarororo-test. Never returns record content."),
+    _tool("get_schema015016_migration_status", "DB 015–016 마이그레이션 이력·객체 확인",
+          "Read-only, exact-source-pinned Schema 015–016 history and fixed table/index "
+          "existence on tarororo-test. Never returns business rows, writes SQL, or "
+          "authorizes a migration. Not a full DDL/compatibility verification."),
     _tool("compare_deployment", "테스트 배포 상태 비교",
           "Read approved build inputs and image identities. Never claim source parity "
           "unless matching prior deployment attestation can be verified."),
@@ -68,6 +72,12 @@ HOST_RUNTIME_TOOL_SPECS = [
           "Existing fixed-target grants never authorize this new migration. Approval only issues "
           "a receipt and never writes the database or starts execution.",
           {"request_id": _REQUEST}, ("request_id",), readonly=False),
+    _tool("prepare_schema015016_migration", "DB Schema 015/016 전용 승인 계획",
+          "Prepare a reviewed, immutable, exact-SHA two-file 015+016 TEST DB migration. "
+          "Requires already-matched 001-014 history, no 015/016 objects, a pinned DB generation "
+          "and a separate one-use in-chat approval. Planning performs no SQL writes, backups "
+          "or deployment. Prior fixed-target grants and API-only approval never apply.",
+          {"request_id": _REQUEST}, ("request_id",), readonly=False),
     _tool("prepare_predecessor_migration", "DB 006~012 전용 계획",
           "Prepare only exact 006-012 migrations with 005-matched baseline, source pinning, "
           "backup+disposable restore check. Excludes 013. An active fixed-target authorization "
@@ -91,6 +101,11 @@ HOST_RUNTIME_TOOL_SPECS = [
           "Execute only a prepared and separately approved exact-source Schema 014 migration "
           "after backup, disposable restore and database generation verification. No service restart.",
           {"operation_id": _ID}, ("operation_id",), readonly=False),
+    _tool("execute_schema015016_migration", "승인된 TEST DB 015/016 적용",
+          "Execute only the separately approved exact-source Schema 015+016 plan after "
+          "a full backup, disposable restore of 001-014 and DB generation validation. "
+          "The two DDL files and history writes are one transaction; no service restart.",
+          {"operation_id": _ID}, ("operation_id",), readonly=False),
     _tool("execute_test_deploy", "승인된 테스트 API 배포",
           "Start only a previously planned API-or-Worker deploy under its still-valid pinned "
           "target grant or separate one-use host approval. "
@@ -102,6 +117,8 @@ HOST_RUNTIME_TOOL_SPECS = [
           "the user requested execution; do not request another web approval. Expired plans "
           "need a new request_id, not approval. For a pending Schema 014 plan, open its exact "
           "inline card with open_schema014_approval; use the admin page only as fallback. "
+          "For a pending schema015016 plan, use open_test_plan_approval with its exact "
+          "operation_id; the authenticated admin page is an explicitly requested fallback. "
           "Queued, running or unknown "
           "outcomes are never reported as success.",
           {"operation_id": _ID}, ("operation_id",)),

@@ -42,7 +42,7 @@ button:disabled {opacity:.55;cursor:default}
 <div><dt>소스 SHA-256</dt><dd><code id="source">불러오는 중…</code></dd></div>
 <div><dt>승인 만료</dt><dd id="expiry">불러오는 중…</dd></div>
 </dl>
-<div class="notice">승인은 검증된 1회용 영수증만 발급합니다. <strong>이 카드에서 실제 빌드·배포·DB 작업은 실행하지 않습니다.</strong> Worker의 disabled 모드는 API의 toss-demo 설정을 변경한다는 뜻이 아닙니다.</div>
+<div class="notice">승인은 검증된 1회용 영수증만 발급합니다. 승인된 미실행 계획은 별도의 <strong>미실행 승인 철회</strong>로 영수증을 무효화할 수 있습니다. <strong>이 카드에서 실제 빌드·배포·DB 작업은 실행하지 않습니다.</strong> Worker의 disabled 모드는 API의 toss-demo 설정을 변경한다는 뜻이 아닙니다.</div>
 <div class="actions">
 <button type="button" class="primary" id="approve" disabled>이 계획 승인</button>
 <button type="button" class="secondary" id="cancel" disabled>취소</button>
@@ -58,7 +58,7 @@ let card=null, token=null, busy=false, locked=false, seq=0, frame=null, lastSize
 const pending=new Map();
 const ids=/^[0-9a-f]{32}$/;
 const sha=/^[0-9a-f]{64}$/;
-const kinds=["api","worker","migration","predecessor_migration","schema_update"];
+const kinds=["api","worker","migration","predecessor_migration","schema_update","schema015016"];
 function sizeChanged(){
   if(frame!==null) return;
   frame=requestAnimationFrame(()=>{
@@ -92,6 +92,7 @@ function valid(x){
     ids.test(x.operation_id||"")&&ids.test(x.card_id||"")&&
     kinds.includes(x.component)&&["disabled","toss-demo"].includes(x.mode)&&
     ["pending","approved","cancelled"].includes(x.state)&&
+    (x.cancellation_available===undefined||typeof x.cancellation_available==="boolean")&&
     sha.test(x.plan_digest||"")&&sha.test(x.source_digest||"")&&
     x.executes_on_approval===false&&
     Number.isInteger(x.changed_path_count)&&x.changed_path_count>=0&&
@@ -100,11 +101,15 @@ function valid(x){
 }
 function sync(){
   const expired=card?Date.now()>=Date.parse(card.expires_at):true;
-  if(expired&&card?.state==="pending"){
+  if(expired&&["pending","approved"].includes(card?.state)){
     locked=true;token=null;status("이 카드가 만료됐습니다. 동일 계획 상태를 다시 확인하세요.",true);
   }
-  const disabled=!card||card.state!=="pending"||!token||busy||locked||expired;
-  el.approve.disabled=disabled;el.cancel.disabled=disabled;
+  const canApprove=card?.state==="pending";
+  const canCancel=card?.state==="pending"||
+    (card?.state==="approved"&&card.cancellation_available===true);
+  el.approve.disabled=!canApprove||!token||busy||locked||expired;
+  el.cancel.disabled=!canCancel||!token||busy||locked||expired;
+  el.cancel.textContent=card?.state==="approved"?"미실행 승인 철회":"취소";
 }
 function impactText(x){
   const impact=x?.impact;
@@ -121,7 +126,7 @@ function render(){
   el.scope.textContent=card.project+" / "+card.target;
   el.component.textContent=({
     api:"TEST API",worker:"TEST Worker",migration:"Schema 013",
-    predecessor_migration:"Schema 006~012",schema_update:"Schema 006~013"
+    predecessor_migration:"Schema 006~012",schema_update:"Schema 006~013",schema015016:"Schema 015+016 (DB)"
   })[card.component]||card.component;
   el.mode.textContent=card.mode;
   el.impact.textContent=impactText(card);
@@ -138,13 +143,14 @@ function accept(result){
   const next=result.structuredContent;
   if(card&&(next.operation_id!==card.operation_id||next.card_id!==card.card_id))return false;
   const hidden=result?._meta?.test_plan_confirmation;
-  if(next.state==="pending"&&!sha.test(hidden||"")){
+  const requiresToken=next.state==="pending"||next.cancellation_available===true;
+  if(requiresToken&&!sha.test(hidden||"")){
     card=next;token=null;locked=true;render();
     status("확인 정보가 없습니다. 채팅에서 카드를 다시 여세요.",true);
-    return true;
+    return false;
   }
-  card=next;token=next.state==="pending"?hidden:null;
-  if(next.state!=="pending")locked=true;
+  card=next;token=requiresToken?hidden:null;
+  locked=next.state==="cancelled"||!token;
   render();return true;
 }
 async function publish(){
@@ -156,16 +162,18 @@ async function publish(){
   catch(_){try{window.openai?.setWidgetState?.({modelContent:data.structuredContent});}catch(_){}}
 }
 async function submit(action){
-  if(!card||!token||busy||locked)return;
-  busy=true;sync();status(action==="confirm"?"승인 기록 발급 중…":"승인 취소 중…");
+  if(!card||!token||busy||locked||
+      (action==="confirm"&&card.state!=="pending")||
+      (action==="cancel"&&!(["pending","approved"].includes(card.state))))return;
+  busy=true;sync();status(action==="confirm"?"승인 기록 발급 중…":"미실행 계획 철회 중…");
   const args={project:card.project,target:card.target,operation_id:card.operation_id,
     card_id:card.card_id,confirmation_token:token};
   try{
     const result=await request("tools/call",{name:action+"_test_plan_approval",arguments:args});
     if(!accept(result))throw new Error("card mismatch");
     await publish();
-    if(card.state==="approved")status("승인 영수증이 확인됐습니다. 실제 배포는 채팅에서 별도 실행합니다.");
-    else status("승인 계획을 취소했습니다.");
+    if(card.state==="approved")status("승인 영수증이 확인됐습니다. 철회하려면 카드를 다시 여세요. 실제 작업은 별도 실행입니다.");
+    else status("미실행 계획과 승인 영수증을 철회했습니다. DB 또는 서비스 변경은 없습니다.");
   }catch(_){
     locked=true;token=null;
     status("승인 결과가 불확실합니다. 같은 작업 ID의 상태를 다시 확인하거나 카드를 다시 여세요.",true);
@@ -180,7 +188,9 @@ window.addEventListener("message",event=>{
     data.error?item.reject(new Error("host failure")):item.resolve(data.result);return;
   }
   if(data.method==="ui/notifications/tool-result"){
-    try{accept(data.params);status("계획을 확인한 후 승인하세요.");}
+    try{if(accept(data.params))status(card?.state==="approved"?
+      "기존에 승인된 미실행 계획입니다. 원치 않으면 승인 철회를 선택하세요.":
+      "계획을 확인한 후 승인하세요.");}
     catch(_){locked=true;sync();status("카드 검증 실패",true);}
   }
 });
@@ -191,9 +201,11 @@ if(typeof ResizeObserver==="function"){
 window.addEventListener("resize",sizeChanged);sizeChanged();
 try{
   if(window.openai?.toolOutput){
-    accept({structuredContent:window.openai.toolOutput,
-      _meta:window.openai.toolResponseMetadata||{}});
-    status("계획을 확인한 후 승인하세요.");
+    if(accept({structuredContent:window.openai.toolOutput,
+      _meta:window.openai.toolResponseMetadata||{}}))
+      status(card?.state==="approved"?
+        "기존에 승인된 미실행 계획입니다. 원치 않으면 승인 철회를 선택하세요.":
+        "계획을 확인한 후 승인하세요.");
   }else if(typeof window.openai?.callTool!=="function"&&window.parent===window){
     locked=true;sync();status("ChatGPT 승인 카드에서 열어야 합니다.",true);
   }

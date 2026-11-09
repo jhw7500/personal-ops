@@ -234,7 +234,9 @@ class ConfigAndInventoryTest(unittest.TestCase):
                                       "get_host_operation", "get_predecessor_migration_status",
                                       "prepare_predecessor_migration", "execute_predecessor_migration",
                                       "execute_db_migration", "get_schema014_migration_status",
-                                      "prepare_schema014_migration", "execute_schema014_migration"})
+                                      "get_schema015016_migration_status",
+                                      "prepare_schema014_migration", "execute_schema014_migration",
+                                      "prepare_schema015016_migration", "execute_schema015016_migration"})
         for spec in specs.values():
             schema = spec["inputSchema"]
             self.assertFalse(schema["additionalProperties"])

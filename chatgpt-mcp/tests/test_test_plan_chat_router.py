@@ -5,7 +5,6 @@ Synthetic host manager: does not execute, grant authority, touch Docker or SQL.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from pathlib import Path
 import sys
@@ -16,7 +15,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 MODULE_DIR = Path(__file__).resolve().parents[1]
-UI_URI = "ui://host-operations/test-plan-approval-v1.html"
+UI_URI = "ui://host-operations/test-plan-approval-v2.html"
+LEGACY_UI_URI = "ui://host-operations/test-plan-approval-v1.html"
 LAUNCHER = r'''
 import asyncio, hashlib, json, sys
 from datetime import datetime, timedelta, timezone
@@ -24,6 +24,11 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import host_access, server
 from host_runtime_config import private_dir
+from host_runtime_config import HostRuntimeError
+import host_schema015016
+
+host_schema015016.schema015016_status = lambda runtime, project, target: {
+    "project": project, "target": target, "state": "fixture_read_only"}
 
 host_access._installed_runtime_identity = lambda: "a" * 64
 
@@ -43,6 +48,10 @@ class FakeOperations:
     def _require_trusted_runtime(self): pass
     def _verify(self, immutable): return Path(sys.argv[2])
     def _load(self, project, target, operation_id): return self.states[operation_id]
+    async def execute(self, project, target, operation_id, *, expected_component):
+        if expected_component != {"schema015016"}:
+            raise ValueError("unexpected execution component")
+        raise HostRuntimeError("FIXTURE_EXECUTION_NOT_AUTHORIZED")
     def _result(self, state):
         imm=state["immutable"]
         return {
@@ -104,7 +113,8 @@ class TestPlanChatRouterTests(unittest.IsolatedAsyncioTestCase):
                 async with asyncio.timeout(70):
                     async with stdio_client(params, errlog=log) as (read, write):
                         async with ClientSession(read, write) as client:
-                            await client.initialize()
+                            initialized = await client.initialize()
+                            self.assertIn("Schema 015/016", initialized.instructions)
                             tools = {x.name: x for x in (await client.list_tools()).tools}
                             self.assertEqual(
                                 tools["prepare_test_deploy"].meta["ui"],
@@ -115,8 +125,13 @@ class TestPlanChatRouterTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(tools["open_test_plan_approval"].meta["ui"]["resourceUri"],
                                              UI_URI)
                             resources = await client.list_resources()
-                            self.assertIn(UI_URI, {str(r.uri) for r in resources.resources})
+                            resource_uris = {str(r.uri) for r in resources.resources}
+                            self.assertIn(UI_URI, resource_uris)
+                            self.assertIn(LEGACY_UI_URI, resource_uris)
                             ui = (await client.read_resource(UI_URI)).contents[0]
+                            legacy_ui = (await client.read_resource(LEGACY_UI_URI)).contents[0]
+                            self.assertEqual(legacy_ui.text, ui.text)
+                            self.assertIn("미실행 승인 철회", ui.text)
                             self.assertEqual(ui.mimeType, "text/html;profile=mcp-app")
                             self.assertEqual(ui.meta["ui"]["csp"], {
                                 "connectDomains": [], "resourceDomains": []})
@@ -156,6 +171,36 @@ class TestPlanChatRouterTests(unittest.IsolatedAsyncioTestCase):
                             self.assertNotEqual(secret, reopened.meta["test_plan_confirmation"])
                             receipt = root / "state/chatgpt-coding-mcp/host-runtime/operations" / (
                                 identity + ".approval.json")
+                            self.assertFalse(receipt.exists())
+
+                            schema_tools = {
+                                "get_schema015016_migration_status",
+                                "prepare_schema015016_migration",
+                                "execute_schema015016_migration",
+                            }
+                            self.assertTrue(schema_tools <= tools.keys())
+                            self.assertEqual(
+                                tools["prepare_schema015016_migration"].meta["ui"],
+                                {"resourceUri": UI_URI, "visibility": ["model"]})
+                            scope = {"project": "tossApp", "target": "tarororo-test"}
+                            observed = await client.call_tool(
+                                "get_schema015016_migration_status", scope)
+                            self.assertFalse(observed.isError, response_text(observed))
+                            self.assertEqual(observed.structuredContent["state"],
+                                             "fixture_read_only")
+                            schema_plan = await client.call_tool(
+                                "prepare_schema015016_migration",
+                                dict(scope, request_id="schema015016-router"))
+                            self.assertFalse(schema_plan.isError, response_text(schema_plan))
+                            self.assertEqual(schema_plan.structuredContent["component"],
+                                             "schema015016")
+                            self.assertEqual(schema_plan.structuredContent["state"], "pending")
+                            execution = await client.call_tool(
+                                "execute_schema015016_migration",
+                                dict(scope, operation_id=schema_plan.structuredContent["operation_id"]))
+                            self.assertTrue(execution.isError)
+                            self.assertEqual(response_text(execution),
+                                             "FIXTURE_EXECUTION_NOT_AUTHORIZED")
                             self.assertFalse(receipt.exists())
 
 

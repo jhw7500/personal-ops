@@ -16,6 +16,7 @@ from server import CONFIG, load_projects
 FILES = ("server.py", "catalog_refresh.py", "runtime_verification.py", "verify-runtime-rollout.py", "project_resume.py", "serena_backend.py", "execution.py", "jobs.py", "job_tools.py",
          "host_runtime_config.py", "host_runtime.py", "host_runtime_operations.py",
          "host_runtime_tools.py", "host_runtime_web.py", "host_db_migration.py", "host_schema014.py",
+         "host_schema015016.py",
          "toss_console_evidence.py", "toss_console_tools.py", "toss_console_sdk_bridge.py",
          "toss_console_codex.py",
          "runtime_rollout_web.py", "runtime_rollout_scoped_source.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py", "runtime_rollout_ui.py", "runtime-rollout-approval.html",

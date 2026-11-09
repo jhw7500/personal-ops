@@ -52,6 +52,7 @@ VERIFIED_RUNTIME_FILES = (
     "server.py", "host_runtime.py", "host_runtime_config.py",
     "host_runtime_operations.py", "host_runtime_tools.py",
     "approve-host-operation.py", "host_runtime_web.py", "host_db_migration.py", "host_schema014.py",
+    "host_schema015016.py",
     "toss_console_evidence.py", "toss_console_tools.py", "toss_console_sdk_bridge.py",
     "toss_console_codex.py",
     "runtime_rollout_web.py", "runtime_rollout_worker.py", "runtime_rollout_tools.py", "runtime_rollout_ui.py", "runtime-rollout-approval.html",
@@ -167,7 +168,7 @@ def observed_legacy_operation_blocks_host(path: Path) -> bool:
             or immutable.get("target") != state.get("target")
             or immutable.get("mode") not in ("toss-demo", "disabled")
             or immutable.get("component", "api") not in (
-                "api", "worker", "migration", "predecessor_migration", "schema_update", "schema014")):
+                "api", "worker", "migration", "predecessor_migration", "schema_update", "schema014", "schema015016")):
         raise HostRuntimeError("PLAN_INVALID")
     expires_at = _timestamp(immutable.get("expires_at"))
     return state["state"] in {"queued", "running"} or expires_at > datetime.now(timezone.utc)
@@ -318,7 +319,7 @@ class HostRuntimeOperations:
                 or immutable.get("target") != target
                 or immutable.get("mode") not in ("toss-demo", "disabled")
                 or immutable.get("component", "api") not in (
-                    "api", "worker", "migration", "predecessor_migration", "schema_update", "schema014")):
+                    "api", "worker", "migration", "predecessor_migration", "schema_update", "schema014", "schema015016")):
             raise HostRuntimeError("PLAN_INVALID")
         return state
 
@@ -582,22 +583,26 @@ class HostRuntimeOperations:
                        if state.get("backup_sha256") else None),
             "postcommit_counts_changed": state.get("postcommit_counts_changed"),
             "impact": {"recreates": [] if component in (
-                           "migration", "predecessor_migration", "schema_update", "schema014") else [component],
+                           "migration", "predecessor_migration", "schema_update", "schema014", "schema015016") else [component],
                        "preserves": (["api", "worker"] if component in (
-                           "migration", "predecessor_migration", "schema_update", "schema014")
+                           "migration", "predecessor_migration", "schema_update", "schema014", "schema015016")
                                      else [part for part in ("api", "worker", "db")
                                            if part != component]),
                        "schema_change": ("013_staged_reading_access.sql" if component == "migration"
                                          else "006-012_only" if component == "predecessor_migration"
                                          else "006-013_combined" if component == "schema_update"
                                          else "014_person_relationship_detail.sql" if component == "schema014"
+                                         else "015+016_fixed_sources" if component == "schema015016"
                                          else None)},
             "migration_range": (["006", "012"] if component == "predecessor_migration"
-                                else ["006", "013"] if component == "schema_update" else None),
+                                else ["006", "013"] if component == "schema_update"
+                                else ["015", "016"] if component == "schema015016" else None),
             "migration_checksums": (state["immutable"].get("migration_checksums")
-                                    if component in ("predecessor_migration", "schema_update", "schema014") else None),
+                                    if component in ("predecessor_migration", "schema_update", "schema014", "schema015016") else None),
             "database_generation": (state["immutable"].get("database_generation")
-                                    if component in ("predecessor_migration", "schema_update", "schema014") else None),
+                                    if component in ("predecessor_migration", "schema_update", "schema014", "schema015016") else None),
+            "migration015016_checksums": (state["immutable"].get("migration015016_checksums")
+                                           if component == "schema015016" else None),
             "changed_paths": state["immutable"]["changed_paths"],
             "high_risk_changes": state["immutable"]["high_risk_changes"],
             "source_review": copy.deepcopy(state["immutable"].get(
@@ -652,7 +657,8 @@ class HostRuntimeOperations:
                             "migration": "execute_db_migration",
                             "schema_update": "execute_db_migration",
                             "predecessor_migration": "execute_predecessor_migration",
-                            "schema014": "execute_schema014_migration"}[
+                            "schema014": "execute_schema014_migration",
+                            "schema015016": "execute_schema015016_migration"}[
                                 payload["component"]]
                     payload.update(state="ready_to_execute", phase="READY")
                     payload["next_action"] = {
@@ -710,7 +716,7 @@ class HostRuntimeOperations:
         if reviewed is not None:
             active = self._active_target_authorization(project, target)
             result = {"mode": "reviewed_snapshot",
-                    "components": ["api", "worker", "migration", "predecessor_migration", "schema014"],
+                    "components": ["api", "worker", "migration", "predecessor_migration", "schema014", "schema015016"],
                     "commit_required": False,
                     "approval": "target" if active else "per_operation"}
             if active:
@@ -827,6 +833,22 @@ class HostRuntimeOperations:
                     or observed["generation"] != immutable.get("database_generation")
                     or observed["predecessor_checksums"] != immutable.get("migration_checksums")):
                 raise HostRuntimeError("SCHEMA_NOT_SAFE_TO_MIGRATE")
+        if immutable.get("component") == "schema015016":
+            if (immutable.get("authorization") != {"mode": "per_operation"}
+                    or review_meta is None):
+                raise HostRuntimeError("SCHEMA015016_APPROVAL_REQUIRED")
+            from host_schema015016 import expected_sources, schema015016_status, FIXED_SOURCES
+            checks = expected_sources(context)
+            pinned_predecessors = {name: checks[name] for name in checks if name not in FIXED_SOURCES}
+            pinned_pair = {name: checks[name] for name in FIXED_SOURCES}
+            observed = schema015016_status(self.runtime, PROJECT, TARGET)
+            if (pinned_predecessors != immutable.get("migration_checksums")
+                    or pinned_pair != immutable.get("migration015016_checksums")
+                    or not observed["ready_for_plan"]
+                    or observed["generation"] != immutable.get("database_generation")
+                    or observed["predecessor_checksums"] != pinned_predecessors
+                    or observed["expected_source_sha256"] != pinned_pair):
+                raise HostRuntimeError("SCHEMA_NOT_SAFE_TO_MIGRATE")
         if (check_expiration and
                 _timestamp(immutable["expires_at"]) <= datetime.now(timezone.utc)):
             raise HostRuntimeError("PLAN_EXPIRED")
@@ -876,17 +898,19 @@ class HostRuntimeOperations:
         root = self.runtime.guard(project, target)
         reviewed = self._registered_reviewed_snapshot(project, target)
         requested_component = component
-        authorization = ({"mode": "per_operation"} if component == "schema014" else
+        authorization = ({"mode": "per_operation"} if component in ("schema014", "schema015016") else
                          (self._active_target_authorization(project, target)
                           or {"mode": "per_operation"}))
-        if (component not in ("api", "worker", "migration", "predecessor_migration", "schema014") or mode not in ("toss-demo", "disabled")
-                or (component in ("worker", "migration", "predecessor_migration", "schema014") and mode != "disabled")
+        if (component not in ("api", "worker", "migration", "predecessor_migration", "schema014", "schema015016") or mode not in ("toss-demo", "disabled")
+                or (component in ("worker", "migration", "predecessor_migration", "schema014", "schema015016") and mode != "disabled")
                 or not isinstance(request_id, str) or not REQUEST_PATTERN.fullmatch(request_id)):
             raise HostRuntimeError("UNSUPPORTED_SCOPE")
         # Schema 014 always requires the registered, explicitly reviewed TEST source.
         # Legacy/git_head deployments and old target grants cannot authorize it.
         if component == "schema014" and reviewed is None:
             raise HostRuntimeError("SCHEMA014_REVIEWED_SOURCE_REQUIRED")
+        if component == "schema015016" and reviewed is None:
+            raise HostRuntimeError("SCHEMA015016_REVIEWED_SOURCE_REQUIRED")
         if reviewed is None and component in ("worker", "migration", "predecessor_migration"):
             scope_config = self.runtime.config_path or Path.home() / ".config/chatgpt-coding-mcp/host-runtime.json"
             if not extended_enabled(scope_config):
@@ -956,6 +980,12 @@ class HostRuntimeOperations:
                 schema014 = schema014_status(self.runtime, project, target)
                 if not schema014["ready_to_prepare"]:
                     raise HostRuntimeError("SCHEMA_NOT_SAFE_TO_MIGRATE")
+            schema015016 = None
+            if component == "schema015016":
+                from host_schema015016 import schema015016_status
+                schema015016 = schema015016_status(self.runtime, project, target)
+                if not schema015016["ready_for_plan"]:
+                    raise HostRuntimeError("SCHEMA_NOT_SAFE_TO_MIGRATE")
             operation_id = secrets.token_hex(16)
             context = self.context_dir / operation_id
             try:
@@ -988,6 +1018,9 @@ class HostRuntimeOperations:
                         high_risk |= PREDECESSOR_SQL_INPUTS
                     if component == "schema014":
                         high_risk.add("server/migrations/014_person_relationship_detail.sql")
+                    if component == "schema015016":
+                        high_risk.update(("server/migrations/015_public_demo_video_unlocks.sql",
+                                          "server/migrations/016_rewarded_ad_attempts.sql"))
                     frozen = freeze_source(
                         root, context, review_policy="reviewed_snapshot",
                         inputs=self._legacy_source_inputs(), high_risk_inputs=sorted(high_risk))
@@ -1035,8 +1068,12 @@ class HostRuntimeOperations:
                          for name in PREDECESSOR_NAMES}
                         if component == "schema_update" else
                         schema014["predecessor_checksums"] if schema014 else
+                        schema015016["predecessor_checksums"] if schema015016 else
                         predecessor["checksums"] if predecessor else None),
+                    "migration015016_checksums": (
+                        schema015016["expected_source_sha256"] if schema015016 else None),
                     "database_generation": (schema014["generation"] if schema014 else
+                                            schema015016["generation"] if schema015016 else
                                             predecessor["generation"] if predecessor else None),
                     "nonce": secrets.token_hex(32),
                     "expires_at": (datetime.now(timezone.utc) +
@@ -1044,11 +1081,16 @@ class HostRuntimeOperations:
                 }
                 if source_review is not None:
                     immutable["source_review"] = source_review
-                    if component in ("predecessor_migration", "schema_update", "schema014"):
+                    if component in ("predecessor_migration", "schema_update", "schema014", "schema015016"):
                         for name, expected in immutable["migration_checksums"].items():
                             if hashlib.sha256((frozen_root / "server/migrations" / name)
                                               .read_bytes()).hexdigest() != expected:
                                 raise HostRuntimeError("STALE_PLAN")
+                    if component == "schema015016":
+                        from host_schema015016 import expected_sources
+                        actual = expected_sources(frozen_root)
+                        if {name: actual[name] for name in immutable["migration015016_checksums"]} != immutable["migration015016_checksums"]:
+                            raise HostRuntimeError("STALE_PLAN")
                 state = {
                     "version": 1, "project": project, "target": target,
                     "operation_id": operation_id, "request_id": request_id,
@@ -1096,6 +1138,13 @@ class HostRuntimeOperations:
             for name, sha in sorted(immutable["migration_checksums"].items()):
                 print("  " + name + " SHA-256 " + sha, file=out)
             print("No automatic rollback, restore, or retry on failure.", file=out)
+        elif component == "schema015016":
+            print("Impact: TWO fixed SQL sources 015+016 in ONE tarororo-test transaction "
+                  "after full backup and disposable restore checks.", file=out)
+            print("Requires a distinct, one-use approval, not any prior 001-014 grant.", file=out)
+            print("No API/Worker/DB restart, automatic restore, retry, or rollback.", file=out)
+            print("DB generation: " + json.dumps(immutable["database_generation"]), file=out)
+            print("Exact 015/016 SQL SHA-256: " + json.dumps(immutable["migration015016_checksums"]), file=out)
         elif component == "schema014":
             print("Impact: ONE reviewed Schema 014 SQL to tarororo-test after "
                   "full backup, verified disposable restore and exact 001-013 checks.", file=out)
@@ -1300,6 +1349,18 @@ class HostRuntimeOperations:
             # A target grant is revocable. Revalidate it at the final boundary
             # immediately before any backup, SQL, build, tag or container change.
             self._verify_target_authorization(immutable)
+            if immutable["component"] == "schema015016":
+                phase = "BACKUP_AND_MIGRATE_015_016"
+                self._record(operation_id, phase=phase)
+                side_effects_possible = True
+                from host_schema015016 import migrate_schema015016
+                outcome = migrate_schema015016(
+                    self.runtime, self.state_dir, immutable, context, operation_id)
+                self._record(
+                    operation_id, state="succeeded", phase="COMPLETE", code=None,
+                    backup_sha256=outcome["backup_sha256"],
+                    backup_bytes=outcome["backup_bytes"], finished_at=utc_now())
+                return
             if immutable["component"] == "schema014":
                 phase = "BACKUP_AND_MIGRATE_014"
                 self._record(operation_id, phase=phase)
