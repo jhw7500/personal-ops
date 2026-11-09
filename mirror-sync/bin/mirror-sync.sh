@@ -1302,8 +1302,12 @@ EOF
     msg "내용을 확인한 뒤, 다른 커밋을 만들기 전에 이 커밋 메시지를 실제 코드 수정 내역으로 다시 써라"
     msg "(회사 GitLab 커밋 메시지 규칙, README 'GitLab 최소화 (2026-11-06)' 절):"
     msg "  git -C $MI_REPO commit --amend"
+    # 확인 패턴은 위 커밋 메시지 템플릿의 문단마다 있는 표지(제목, 범위 줄의 upstream sha, ASSERT_ 이름,
+    # AXES_INTENTIONALLY_EMPTY, --allow-new, KEEP_MIRROR, mirror-sync)를 하나씩 잡는다. 그래야 일부 문단만
+    # 다시 쓴 메시지도 걸린다. 템플릿에 문단을 더하면 표지도 더한다(테스트가 문단별로 검사한다).
+    local push_check_pattern='sync curated mirror|mirror-sync|upstream [0-9a-f]{7,}\.\.[0-9a-f]{7,}|ASSERT_[A-F]_|AXES_INTENTIONALLY_EMPTY|KEEP_MIRROR|--allow-new'
     msg "push 직전에는 아직 push 하지 않은 커밋에 자동 메시지가 남지 않았는지 확인해라(아무것도 안 나와야 한다):"
-    msg "  git -C $MI_REPO log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync'"
+    msg "  git -C $MI_REPO log --format=%B @{u}..HEAD | grep -nE '$push_check_pattern'"
     msg "남아 있으면 git -C $MI_REPO rebase -i @{u} 에서 그 커밋을 reword 로 고친다."
     msg "그다음 사람이 직접 push 해라:  git -C $MI_REPO push"
 

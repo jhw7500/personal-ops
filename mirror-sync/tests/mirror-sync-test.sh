@@ -756,7 +756,8 @@ else
     pass "push 검증: git push 를 한 번도 실행하지 않았다 ($(wc -l < "$GIT_LOG")회 git 호출 관측)"
 fi
 # --apply 가 안내한 push 직전 확인 명령. 아래에서 이 명령 자체가 남은 자동 메시지를 잡는지 본다.
-PUSH_CHECK_CMD="git -C $W_MI log --format=%B @{u}..HEAD | grep -nE 'sync curated mirror|mirror-sync'"
+PUSH_CHECK_PATTERN='sync curated mirror|mirror-sync|upstream [0-9a-f]{7,}\.\.[0-9a-f]{7,}|ASSERT_[A-F]_|AXES_INTENTIONALLY_EMPTY|KEEP_MIRROR|--allow-new'
+PUSH_CHECK_CMD="git -C $W_MI log --format=%B @{u}..HEAD | grep -nE '$PUSH_CHECK_PATTERN'"
 check_out_has "push 검증: push 직전 확인 명령을 안내한다" "  $PUSH_CHECK_CMD"
 
 run_sync --pair mock --from "$W_FROM" --to "$W_TO" --push
@@ -775,16 +776,43 @@ if printf '%s\n' "$PUSH_CHECK_OUT" | grep -qF "sync curated mirror"; then
 else
     fail "push 직전 확인: 다시 쓰지 않은 싱크 커밋의 자동 메시지를 잡는다" "sync curated mirror 포함" "$PUSH_CHECK_OUT"
 fi
+# 확인 패턴은 자동 메시지의 문단(빈 줄로 나뉜 덩어리)마다 적어도 한 줄을 잡아야 한다. 그래야 제목만 고치고
+# 나머지 문단을 남긴 메시지도 걸린다. 템플릿에 문단을 더하면 이 검사가 패턴에 표지를 더하라고 알린다.
+AUTO_MSG="$(git -C "$W_MI" log -1 --format=%B)"
+UNCOVERED=""
+PARA=""
+while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+        PARA+="$line"$'\n'
+        continue
+    fi
+    if [[ -n "$PARA" ]] && ! printf '%s' "$PARA" | grep -qE -- "$PUSH_CHECK_PATTERN"; then
+        UNCOVERED+="${PARA%%$'\n'*} | "
+    fi
+    PARA=""
+done <<< "$AUTO_MSG"$'\n'
+check_eq "push 직전 확인: 자동 메시지의 문단마다 확인 패턴에 걸리는 줄이 있다" "" "$UNCOVERED"
+# 제목과 mirror-sync 줄만 다시 쓰고 나머지 템플릿을 남긴 메시지도 잡아야 한다.
+PARTIAL_MSG="$(printf 'Update sources\n\n%s\n' "$(printf '%s\n' "$AUTO_MSG" | sed '1,3d')")"
+git -C "$W_MI" commit -q --amend -m "$PARTIAL_MSG"
+PUSH_CHECK_OUT="$(bash -c "$PUSH_CHECK_CMD" 2>&1)"
+if ! git -C "$W_MI" log -1 --format=%B | grep -qE 'sync curated mirror|mirror-sync' \
+    && printf '%s\n' "$PUSH_CHECK_OUT" | grep -qE 'ASSERT_[A-F]_|upstream [0-9a-f]'; then
+    pass "push 직전 확인: 제목과 mirror-sync 줄만 다시 쓴 메시지의 나머지 템플릿을 잡는다"
+else
+    fail "push 직전 확인: 제목과 mirror-sync 줄만 다시 쓴 메시지의 나머지 템플릿을 잡는다" \
+        "ASSERT_ 또는 범위 줄 포함" "$PUSH_CHECK_OUT"
+fi
 wfile "$W_MI" "docs/ported-note.md" <<'EOF'
 수동 이식분 (테스트용)
 EOF
 commit_all "$W_MI" "port: mirror note"
 git -C "$W_MI" commit -q --amend -m "Update the mirror note"
 PUSH_CHECK_OUT="$(bash -c "$PUSH_CHECK_CMD" 2>&1)"
-if printf '%s\n' "$PUSH_CHECK_OUT" | grep -qF "sync curated mirror"; then
+if printf '%s\n' "$PUSH_CHECK_OUT" | grep -qE 'ASSERT_[A-F]_'; then
     pass "push 직전 확인: 이식 커밋만 amend 해도 그 아래 싱크 커밋의 자동 메시지를 잡는다"
 else
-    fail "push 직전 확인: 이식 커밋만 amend 해도 그 아래 싱크 커밋의 자동 메시지를 잡는다" "sync curated mirror 포함" "$PUSH_CHECK_OUT"
+    fail "push 직전 확인: 이식 커밋만 amend 해도 그 아래 싱크 커밋의 자동 메시지를 잡는다" "ASSERT_ 포함" "$PUSH_CHECK_OUT"
 fi
 git -C "$W_MI" reset -q --soft '@{u}'
 git -C "$W_MI" commit -q -m "Update sources and the mirror note"
