@@ -4,6 +4,20 @@
 작업트리, 의존성, 설치 런타임, 설정, 키, workspace authority와 상태는 각각 유지한다.
 공유 폴더와 심볼릭 링크로 두 호스트의 소스 작업트리를 연결하지 않는다.
 
+새 코딩 세션과 배포·검증 세션의 기본 소스 경로는 다음과 같다.
+
+| 용도 | 호스트 | 기본 소스 경로 | 웹 MCP 연결 |
+|---|---|---|---|
+| 공통 소스 편집 | WSL PC | `/home/jhw/projects/.worktrees/personal-ops-common-source-wsl-20261109` | `personal-ops-coding-wsl-pc1` |
+| 빌드서버 배포·검증 | 빌드서버 | `/home/jhw/ai/opencode/projects/.worktrees/personal-ops-buildserver-source-20261109` | `personal-ops-coding` |
+
+이 경로들은 새 세션의 기본값이며 현재 웹 MCP 프로젝트 등록을 자동으로 변경하지 않는다.
+세션을 시작할 때 해당 연결에서 프로젝트 목록과 등록된 실제 경로를 조회하고, 기본 소스
+경로와 일치하는지 확인한다. 일치하지 않으면 다른 경로로 자동 전환하거나 기존 작업트리를
+정리하지 않는다. WSL의 `/home/jhw/projects/personal-ops`와 빌드서버의
+`/home/jhw/ai/opencode/projects/personal-ops`는 기존 미커밋 작업을 보존하며 새 세션의
+기본 소스로 사용하지 않는다.
+
 ```text
 WSL development commit
           |
@@ -48,5 +62,11 @@ Git 전달은 소스 동기화다. 런타임 설치·서비스 전환과 웹 연
 서로 다른 연결이다. MCP가 등록한 실제 프로젝트 경로와 편집할 작업트리가 일치하는지
 확인한다. 별도 통합 작업트리를 만들었다고 기존 웹 연결의 프로젝트 경로가 바뀌지는 않는다.
 프로젝트 등록 경로나 실행 릴리스 변경이 필요하면 해당 호스트의 공식 반영 절차를 따른다.
+
+웹에서 공통 소스를 편집할 때는 `personal-ops-coding-wsl-pc1`에서
+`/home/jhw/projects/.worktrees/personal-ops-common-source-wsl-20261109`가 실제 프로젝트
+경로로 등록됐는지 먼저 확인한다. 빌드서버 배포·검증 작업은 `personal-ops-coding`에서
+`/home/jhw/ai/opencode/projects/.worktrees/personal-ops-buildserver-source-20261109`의
+등록 여부를 별도로 확인한다. 한 연결의 확인 결과를 다른 연결에 적용하지 않는다.
 
 소스·Git 작업 승인은 런타임, DB, 권한 변경이나 Yocto/BitBake 실행 승인을 대신하지 않는다.

@@ -3,14 +3,20 @@
 <!-- PROJECT_ENVIRONMENT:START -->
 ## WSL·빌드서버 작업 경계
 
-| 환경 | 이 프로젝트의 소스 경로 | MCP 터널 프로필 |
+| 환경 | 새 세션의 기본 소스 경로 | MCP 터널 프로필 |
 |---|---|---|
-| WSL PC | `/home/jhw/projects/personal-ops` | `personal-ops-coding-wsl-pc1` |
-| 빌드서버 | `/home/jhw/ai/opencode/projects/personal-ops` | `personal-ops-coding` |
+| WSL PC | `/home/jhw/projects/.worktrees/personal-ops-common-source-wsl-20261109` | `personal-ops-coding-wsl-pc1` |
+| 빌드서버 | `/home/jhw/ai/opencode/projects/.worktrees/personal-ops-buildserver-source-20261109` | `personal-ops-coding` |
 
 작업 시작 시 실제 실행 호스트, 작업 디렉터리, 연결된 MCP의 프로젝트 경로,
 브랜치·HEAD·미커밋 변경을 확인한다. 같은 프로젝트 이름이나 서비스 이름만으로
-작업 대상을 판단하지 않는다. 표와 현재 설정이 다르면 실제 대상을 확인한 뒤 진행한다.
+작업 대상을 판단하지 않는다. 표의 기본 경로는 MCP 등록 경로가 자동으로 바뀌었다는
+뜻이 아니다. 새 기본 소스 경로와 등록된 프로젝트의 실제 경로가 일치하는지 확인하고,
+다르면 자동 전환하거나 정리하지 말고 현재 대상을 확인한 뒤 진행한다.
+
+WSL의 `/home/jhw/projects/personal-ops`와 빌드서버의
+`/home/jhw/ai/opencode/projects/personal-ops`는 기존 미커밋 작업을 보존하는 경로다.
+새 세션의 기본 경로로 사용하거나 내용을 자동 병합·삭제·정리하지 않는다.
 
 소스·Git 작업 트리·의존성·설치 런타임·키·권한·상태 저장소는 호스트별로 유지한다.
 이 구성에서 공유하는 것은 `project-handoffs`의 인계 문서와 검증 산출물이다.
